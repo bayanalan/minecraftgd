@@ -39,25 +39,26 @@ func _add(text: String, cb: Callable, row: int, col: int) -> Button:
 	return b
 
 
-## Java: FrameLayout.alignInRectangle(grid, 0, 0, width, height, 0.5, 0.25); rows 24 apart (4 padding + 20).
+## Java PauseScreen.createPauseMenu: GridLayout with cell padding (4, 4, 4, 0) except Back to Game's paddingTop(50),
+## FrameLayout.alignInRectangle(grid, 0, 0, width, height, 0.5, 0.25) (Mth.lerpInt: floor), rows 24 apart; the title
+## is a StringWidget at y 40. Grid height = 50 + 20 + 4 x 24 = 166.
 func _layout() -> void:
 	var s := float(UiKit.scale())
 	var gw := size.x / s
 	var gh := size.y / s
 	var rows := 5
 	var grid_w := 212.0
-	var grid_h := rows * 24.0
+	var grid_h := 50.0 + 20.0 + float(rows - 1) * 24.0
 	var gx := floorf((gw - grid_w) * 0.5)
-	# 26.3 centres the title + button grid block vertically (the title sits 12 above the first row)
-	var gy := floorf((gh - (grid_h + 16.0)) * 0.5) + 16.0
+	var gy := floorf((gh - grid_h) * 0.25)
 	for e in _buttons:
 		var b: Button = e[0]
 		var col: int = e[2]
 		var x := gx + 4.0 + (0.0 if col <= 0 else 106.0)
-		var y := gy + 4.0 + float(e[1]) * 24.0
+		var y := gy + 50.0 + float(e[1]) * 24.0
 		b.position = Vector2(x, y) * s
 		b.size = Vector2(204 if col < 0 else 98, 20) * s
-	_title.position = Vector2(0, gy - 16.0) * s
+	_title.position = Vector2(0, 40.0) * s
 	_title.size = Vector2(gw, 9) * s
 
 ## Statistics / Advancements replace the Game Menu (Java opens them with the pause screen as parent).

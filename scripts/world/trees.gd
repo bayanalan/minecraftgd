@@ -847,45 +847,54 @@ static func _try_ext(f: Features, c: Features.FCtx, cf: Dictionary, chance: floa
 
 
 # ---------------------------------------------------------------- poplar (26.x; Java code not public: APPROXIMATION)
-# Built from the configured feature parameters only: a straight trunk, branch_amount short side branches below the
-# top trunk_height_above_branches logs, and a tall narrow crown (radius = crown height in layers, at most two blocks
-# wide, round ends) with side_hole_chance holes in its outer ring.
+# From the configured feature and the Minecraft Wiki's description: a straight trunk; branch_amount branches "by the
+# start of the foliage" (trunk_height_above_branches logs below the top log); "an especially large canopy" in "a
+# rhombus shape in one of two possible directions", `height` layers tall (5-6) ending one block above the top log
+# (so it starts at the branches), sized by `radius` (5-8, the widest of any tree). Modelled as a lens: every layer a
+# rhombus with half-diagonals w along the tree's random long axis and w / 2 across it, w peaking at `radius` in the
+# middle layers; side_hole_chance holes in each layer's rim (the dappled light). APPROXIMATE until compared with
+# vanilla.
 
 static func _poplar_trunk(f: Features, c: Features.FCtx, cf: Dictionary, tp: Dictionary, p: Vector3i, h: int, atts: Array) -> void:
 	for y in h:
 		_log(f, c, cf, p + Vector3i(0, y, 0))
 	atts.append([p + Vector3i(0, h, 0), 0, false])
 	var above := int(tp.get("trunk_height_above_branches", 4))
+	var by := clampi(h - 1 - above, 1, h - 1)
 	var n := f.sample_int(c, tp.get("branch_amount", 1))
+	var used := {}
 	for b in n:
-		var by := maxi(2, h - above - c.r.next_int_bound(3))
 		var dir: Vector3i = _HORIZ[c.r.next_int_bound(4)]
-		var tip := p + Vector3i(0, by, 0) + dir
-		_log(f, c, cf, tip, "x" if dir.x != 0 else "z")
-		# leaf lobe around the branch end (3 x 2 x 3 without corners, a cap on top)
-		for dy in [0, 1]:
-			for dx in range(-1, 2):
-				for dz in range(-1, 2):
-					if absi(dx) == 1 and absi(dz) == 1:
-						continue
-					_leaf(f, c, cf, tip + Vector3i(dx, dy, dz))
-		_leaf(f, c, cf, tip + Vector3i(0, 2, 0))
+		if used.has(dir):
+			continue
+		used[dir] = true
+		# one log out from the trunk, a second diagonally up into the canopy
+		_log(f, c, cf, p + Vector3i(0, by, 0) + dir, "x" if dir.x != 0 else "z")
+		_log(f, c, cf, p + Vector3i(0, by + 1, 0) + dir * 2, "x" if dir.x != 0 else "z")
 
 
-static func _poplar_foliage(f: Features, c: Features.FCtx, cf: Dictionary, fp: Dictionary, top: Vector3i, crown: int, wide: int, dbl: bool) -> void:
+static func _poplar_foliage(f: Features, c: Features.FCtx, cf: Dictionary, fp: Dictionary, top: Vector3i, radius: int, layers: int, dbl: bool) -> void:
 	var hole := float(fp.get("side_hole_chance", 0.15))
 	var e := 1 if dbl else 0
-	for l in range(1, -crown, -1):
-		var d := 1 - l   # 0 at the tip
-		var rr := 0 if d == 0 else (1 if d == 1 or d >= crown - 1 else 2)
-		if rr == 2 and (d < 3 or d > wide + 1):
-			rr = 1
-		for j in range(-rr, rr + e + 1):
-			for k in range(-rr, rr + e + 1):
-				var ax := mini(absi(j), absi(j - 1)) if dbl else absi(j)
-				var az := mini(absi(k), absi(k - 1)) if dbl else absi(k)
-				if rr > 0 and ax == rr and az == rr:
+	var along_x := c.r.next_int_bound(2) == 0   # the rhombus' long axis
+	layers = maxi(layers, 3)
+	var mid := float(layers - 1) / 2.0
+	for i in layers:
+		var t := 1.0 - absf(float(i) - mid) / (mid + 1.0)
+		var wl := maxf(1.0, roundf(float(radius) * t))
+		var ws := maxf(1.0, roundf(float(radius) * t * 0.5))
+		var ri := int(wl)
+		for j in range(-ri, ri + e + 1):
+			for k in range(-ri, ri + e + 1):
+				var a := float(mini(absi(j), absi(j - 1)) if dbl else absi(j))
+				var b := float(mini(absi(k), absi(k - 1)) if dbl else absi(k))
+				if not along_x:
+					var tmp := a
+					a = b
+					b = tmp
+				var q := a / wl + b / ws
+				if q > 1.0:
 					continue
-				if rr > 0 and (ax == rr or az == rr) and c.r.next_float() < hole:
-					continue
-				_leaf(f, c, cf, top + Vector3i(j, l, k))
+				if q > 1.0 - 1.0 / ws and c.r.next_float() < hole:
+					continue   # rim hole
+				_leaf(f, c, cf, top + Vector3i(j, -i, k))

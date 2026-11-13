@@ -46,6 +46,7 @@ var target: Dictionary = {}
 var mining_pos := Vector3i(0, -999, 0)
 var mining_progress := 0.0
 var mining_cooldown := 0
+var _attack_on_entity := false   # the held attack hit an entity: no block mining until the button is released
 var use_cooldown := 0
 var auto_use := 0     # probes: ticks to keep the use button "held"
 var third_person := 0
@@ -2760,6 +2761,10 @@ func sky_darken() -> float:
 
 
 ## Per frame: Java 26.3 sky / fog / light state (SkyState) -> sky shader, stars, vanilla fog globals, lightmap inputs.
+const CLOUD_MODES := {"off": 0, "fast": 1, "fancy": 2}
+const DIM_SKY_MODES := {"the_nether": 1, "the_end": 2}
+
+
 func _update_sky(alpha: float) -> void:
 	var cam_w := camera.global_position + Vector3(cm.origin)
 	var look := -camera.global_transform.basis.z
@@ -2789,19 +2794,23 @@ func _update_sky(alpha: float) -> void:
 	var strength := 0.0 if Settings.get_v("fog") == "off" and not fluid else 1.0
 	ShaderGlobals.put_v("mc_fog_color", Vector4(fogc.r, fogc.g, fogc.b, strength))
 	ShaderGlobals.put_v("mc_fog_dist", Vector4(env_f.x, env_f.y, rd_f.x, rd_f.y))
-	sky_mat.set_shader_parameter("fog_color", Vector4(fogc.r, fogc.g, fogc.b, 1.0))
-	sky_mat.set_shader_parameter("sky_color", Vector3(ss.sky_color.r, ss.sky_color.g, ss.sky_color.b))
-	sky_mat.set_shader_parameter("sky_end", minf(rd_f.y, env_f.y) if fluid else rd_f.y)
 	var overworld := dimension == "overworld"
+	if sky_rd == null:
+		# Godot sky material path (no RenderingDevice sky): sky_rd.update below takes the same values otherwise; ~10
+		# set_shader_parameter calls per frame were spent on this unused material
+		sky_mat.set_shader_parameter("fog_color", Vector4(fogc.r, fogc.g, fogc.b, 1.0))
+		sky_mat.set_shader_parameter("sky_color", Vector3(ss.sky_color.r, ss.sky_color.g, ss.sky_color.b))
+		sky_mat.set_shader_parameter("sky_end", minf(rd_f.y, env_f.y) if fluid else rd_f.y)
 	if overworld:
-		# dark disc while the camera is below the horizon height (sea level; flat worlds: the bottom)
-		var horizon := 63.0 if gen == null or gen.generator_id != "flat" else float(dim_type.get("min_y", -64.0))
-		sky_mat.set_shader_parameter("dark_disc", cam_w.y - horizon < 0.0)
-		sky_mat.set_shader_parameter("sunrise", Vector4(ss.sunrise.r, ss.sunrise.g, ss.sunrise.b, ss.sunrise.a))
-		sky_mat.set_shader_parameter("sunrise_side", -1.0 if sin(ss.sun_angle) < 0.0 else 1.0)
-		sky_mat.set_shader_parameter("sun_angle", ss.sun_angle)
-		sky_mat.set_shader_parameter("moon_angle", ss.moon_angle)
-		sky_mat.set_shader_parameter("celestial_alpha", 1.0 - rain)
+		if sky_rd == null:
+			# dark disc while the camera is below the horizon height (sea level; flat worlds: the bottom)
+			var horizon := 63.0 if gen == null or gen.generator_id != "flat" else float(dim_type.get("min_y", -64.0))
+			sky_mat.set_shader_parameter("dark_disc", cam_w.y - horizon < 0.0)
+			sky_mat.set_shader_parameter("sunrise", Vector4(ss.sunrise.r, ss.sunrise.g, ss.sunrise.b, ss.sunrise.a))
+			sky_mat.set_shader_parameter("sunrise_side", -1.0 if sin(ss.sun_angle) < 0.0 else 1.0)
+			sky_mat.set_shader_parameter("sun_angle", ss.sun_angle)
+			sky_mat.set_shader_parameter("moon_angle", ss.moon_angle)
+			sky_mat.set_shader_parameter("celestial_alpha", 1.0 - rain)
 		if ss.moon_phase != _moon_shown:
 			_moon_shown = ss.moon_phase
 			var mt := _moon_texture(ss.moon_phase)
@@ -2810,10 +2819,11 @@ func _update_sky(alpha: float) -> void:
 				if sky_rd != null:
 					sky_rd.moon_tex = mt
 	if sky_rd != null:
-		env.background_color = fogc
+		if env.background_color != fogc:
+			env.background_color = fogc
 		var cdist := int(Settings.get_v("cloud_distance"))
-		var cmode := {"off": 0, "fast": 1, "fancy": 2}.get(str(Settings.get_v("clouds")), 2)
-		var mode := {"the_nether": 1, "the_end": 2}.get(dimension, 0)
+		var cmode: int = CLOUD_MODES.get(str(Settings.get_v("clouds")), 2)
+		var mode: int = DIM_SKY_MODES.get(dimension, 0)
 		var horizon2 := 63.0 if gen == null or gen.generator_id != "flat" else float(dim_type.get("min_y", -64.0))
 		var cc := ss.cloud_color
 		sky_rd.update(camera, cm.origin, mode, ss.sky_color, fogc, minf(rd_f.y, env_f.y) if fluid else rd_f.y,
@@ -3323,7 +3333,12 @@ func _attack() -> void:
 		entities.player_attack(target["entity"])
 		player.exhaustion += 0.1
 		player.attack_ticks = 0
+		# a one-hit entity (cushion, painting, item frame ...) leaves the block behind it targeted: holding the button
+		# must not go on to mine it (creative broke the block under a cushion 5 ticks later)
+		_attack_on_entity = true
+		mining_progress = 0.0
 		return
+	_attack_on_entity = false
 	player.attack_ticks = 0   # Java resetAttackStrengthTicker on every swing
 	if target.is_empty() or player.is_spectator():
 		return
@@ -3336,6 +3351,12 @@ func _attack() -> void:
 func _mining_tick() -> void:
 	if mining_cooldown > 0:
 		mining_cooldown -= 1
+	if _attack_on_entity:
+		if Input.is_action_pressed("attack"):
+			mining_progress = 0.0
+			mining_pos = Vector3i(0, -999, 0)
+			return
+		_attack_on_entity = false
 	if player.is_creative() and Input.is_action_pressed("attack") and screen == null and mouse_captured and not target.is_empty() and not target.has("entity"):
 		# Java continueAttack -> continueDestroyBlock (true every tick, a break every 5): the arm swings continuously
 		swing_hand()

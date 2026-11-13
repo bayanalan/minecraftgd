@@ -8,6 +8,8 @@ static var values := {"sky_light_factor": 1.0, "gamma_boost": 0.5, "night_vision
 
 
 static func put(name: StringName, v: float) -> void:
+	if values.get(name) == v:
+		return   # unchanged: global_shader_parameter_set re-uploads the globals buffer
 	values[name] = v
 	RenderingServer.global_shader_parameter_set(name, v)
 

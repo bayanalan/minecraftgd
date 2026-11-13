@@ -288,7 +288,8 @@ static func use_item(world, held: ItemStack, tgt: Dictionary) -> bool:
 				for o in em.ents:
 					if o.kind == "cushion" and not o.dead and Vector3i(o.pos.floor()) == cell:
 						return false
-				ok = spawn_cushion(em, Vector3(cell) + Vector3(0.5, 0.0, 0.5), world.player.yaw + 180.0, nm) != null
+				# grid-aligned: centred in the cell, facing one of the four horizontal directions
+				ok = spawn_cushion(em, Vector3(cell) + Vector3(0.5, 0.0, 0.5), snappedf(world.player.yaw + 180.0, 90.0), nm) != null
 				if ok:
 					Audio.play("entity.cushion.place", Vector3(cell) + Vector3(0.5, 0.1, 0.5), "Blocks")
 	if ok and not world.player.is_creative():
