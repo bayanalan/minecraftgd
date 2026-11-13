@@ -727,11 +727,17 @@ bool fn_rt_leaf_filter(const Args &a, void *ret) {
 	const int32_t *CRD = ncrd ? i32(cv) : nullptr;
 	int64_t ntab = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY, tv);
 	const uint8_t *tab = ntab ? bytes(tv) : nullptr;
-	struct Sec { bool init = false; const int32_t *pal = nullptr; int64_t np = 0; const uint8_t *idx = nullptr; const int32_t *wide = nullptr; };
+	// buffers reused across calls (main thread only) and invalidated by a generation stamp: allocating and zeroing
+	// ~(2 sim + 3)^2 x 24 section records (~700 KB at sim 12) on every per-frame call cost more than the searches
+	struct Sec { uint32_t gen = 0; const int32_t *pal = nullptr; int64_t np = 0; const uint8_t *idx = nullptr; const int32_t *wide = nullptr; };
 	const int64_t ng = gw * gw;
-	std::vector<Sec> secs((size_t)ng * 24);
-	std::vector<const void *> carr((size_t)ng, nullptr);
-	std::vector<uint8_t> cinit((size_t)ng, 0);
+	static thread_local std::vector<Sec> secs;
+	static thread_local std::vector<const void *> carr;
+	static thread_local std::vector<uint32_t> cgen;
+	static thread_local uint32_t gen = 0;
+	if (++gen == 0) { gen = 1; for (auto &x : secs) x.gen = 0; std::fill(cgen.begin(), cgen.end(), 0u); }
+	if (secs.size() < (size_t)ng * 24) secs.resize((size_t)ng * 24);
+	if (carr.size() < (size_t)ng) { carr.resize((size_t)ng, nullptr); cgen.resize((size_t)ng, 0u); }
 	auto get_packed = [](const void *arr, int64_t k, GDExtensionVariantType t) -> const void * {
 		const void *e = array_get(arr, k);
 		if (!e || variant_get_type((GDExtensionConstVariantPtr)e) != t) return nullptr;
@@ -741,8 +747,8 @@ bool fn_rt_leaf_filter(const Args &a, void *ret) {
 		int64_t gi = cx - gx0, gj = cz - gz0;
 		if (gi < 0 || gj < 0 || gi >= gw || gj >= gw) return -1;
 		int64_t k = gj * gw + gi;
-		if (!cinit[k]) {
-			cinit[k] = 1;
+		if (cgen[k] != gen) {
+			cgen[k] = gen;
 			const void *e = array_get(gv, k);
 			const void *ca = (e && variant_get_type((GDExtensionConstVariantPtr)e) == GDEXTENSION_VARIANT_TYPE_ARRAY) ? internal(GDEXTENSION_VARIANT_TYPE_ARRAY)((GDExtensionVariantPtr)e) : nullptr;
 			if (ca && size_of(GDEXTENSION_VARIANT_TYPE_ARRAY, ca) < 72) ca = nullptr;
@@ -756,8 +762,8 @@ bool fn_rt_leaf_filter(const Args &a, void *ret) {
 		if (y < -64 || y >= 320) return 0;
 		int s = (int)((y + 64) >> 4);
 		Sec &sc = secs[(size_t)k * 24 + s];
-		if (!sc.init) {
-			sc.init = true;
+		if (sc.gen != gen) {
+			sc.gen = gen;
 			const void *pv = get_packed(carr[k], s * 3, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY);
 			const void *iv = get_packed(carr[k], s * 3 + 1, GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY);
 			const void *wv = get_packed(carr[k], s * 3 + 2, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY);

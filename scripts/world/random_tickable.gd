@@ -71,7 +71,7 @@ static func random_tick(world, p: Vector3i, st: int, rng: RandomNumberGenerator)
 		kt.resize(blocks.total_states)
 		for s0 in blocks.total_states:
 			var n0 := blocks.names[blocks.st_block[s0]]
-			kt[s0] = 1 if (n0 == "grass_block" or n0 == "mycelium") else (2 if n0.ends_with("_leaves") else 0)
+			kt[s0] = 1 if (n0 == "grass_block" or n0 == "mycelium") else (2 if n0.ends_with("_leaves") else (3 if n0 == "snow" else (4 if n0 == "ice" else 0)))
 		_kind = kt
 		_dirt = blocks.default_state("dirt")
 	var kd := _kind[st]
@@ -91,6 +91,20 @@ static func random_tick(world, p: Vector3i, st: int, rng: RandomNumberGenerator)
 		return
 	if kd == 1:
 		_grass_tick(world, p, st, rng)
+		return
+	if kd == 3 or kd == 4:
+		# Java SnowLayerBlock / IceBlock.randomTick: melt when the BLOCK light at the block itself exceeds 11 (ice: 11 - its
+		# light block 1); nearly every tick is a no-op, so no name lookup / match here
+		var bl: int = world.cm.get_light(p.x, p.y, p.z) & 15
+		if bl > (11 if kd == 3 else 10):
+			if kd == 3:
+				world.set_block(p.x, p.y, p.z, 0)
+				for s3 in Loot.block_drops(st, null, world, p):
+					world.entities.spawn_item(Vector3(p) + Vector3(0.5, 0.5, 0.5), s3)
+			else:
+				# IceBlock.melt: evaporates where water evaporates (Nether), else water
+				var evap: bool = bool((world.dim_type.get("attributes", {}) as Dictionary).get("minecraft:gameplay/water_evaporates", false))
+				world.set_block(p.x, p.y, p.z, 0 if evap else Res.blocks.WATER)
 		return
 	var n := blocks.name_of(st)
 	var light: int = world.cm.get_light(p.x, p.y + 1, p.z)
