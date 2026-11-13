@@ -16,8 +16,8 @@ simulation distance 12, default graphics, V-Sync off, no FPS cap.
 Benchmarks run borderless fullscreen at native resolution unless `--res=WxH` is given. An on-screen readout shows
 FPS with the run's 1% and 0.1% lows. Results go to `user://perf/fps_<stamp>/summary.json`.
 
-Builds: release export `build/windows-arm64/Recraft2.exe` (export preset "Windows ARM64"; official 4.7.2 templates),
-`build/windows-x86_64/` (preset "Windows x86_64"). The editor binaries are debug builds; they are not used for the
+Builds: release export `builds/windows-arm64/Recraft2.exe` (export preset "Windows ARM64"; official 4.7.2 templates),
+`builds/windows-x86_64/` (preset "Windows x86_64"). The editor binaries are debug builds; they are not used for the
 numbers below unless marked.
 
 ## Results (F flight unless noted)

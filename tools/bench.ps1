@@ -5,9 +5,9 @@ $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $root
 $editor = "$env:LOCALAPPDATA\Recraft2Tools\godot-4.7.2-arm64\Godot_v4.7.2-stable_windows_arm64_console.exe"
 $preset = if ($Arch -eq "arm64") { "Windows ARM64" } else { "Windows x86_64" }
-$exe = "build/windows-$Arch/Recraft2.exe"
+$exe = "builds/windows-$Arch/Recraft2.exe"
 if (-not $NoExport) {
-	New-Item -ItemType Directory -Force "build/windows-$Arch" | Out-Null
+	New-Item -ItemType Directory -Force "builds/windows-$Arch" | Out-Null
 	$p = Start-Process -FilePath $editor -ArgumentList "--headless --path . --export-release `"$preset`" $exe" -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\rc_exp_out.txt" -RedirectStandardError "$env:TEMP\rc_exp_err.txt"
 	if (-not $p.WaitForExit(900000)) { $p.Kill(); "EXPORT TIMEOUT"; exit 1 }
 	$errs = Get-Content "$env:TEMP\rc_exp_err.txt" | Select-String -Pattern "ERROR" | Select-Object -First 5

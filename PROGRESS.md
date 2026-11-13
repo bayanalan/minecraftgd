@@ -13,8 +13,8 @@ Assets: local MC 26.3 jar (read through the indexed JarAssetReader; private cach
 - Compile check: `powershell -ExecutionPolicy Bypass -File tools/check.ps1`
 - Tests: `tools/gd.ps1 -A "--headless --path . -- --test"` (add `--vanilla` for real-asset tests)
 - **Release builds**: export presets `Windows ARM64` / `Windows x86_64` (export_presets.cfg) →
-  `build/windows-arm64/Recraft2.exe`, `build/windows-x86_64/Recraft2.exe`
-  (`<editor> --headless --path . --export-release "Windows ARM64" build/windows-arm64/Recraft2.exe`).
+  `builds/windows-arm64/Recraft2.exe`, `builds/windows-x86_64/Recraft2.exe`
+  (`<editor> --headless --path . --export-release "Windows ARM64" builds/windows-arm64/Recraft2.exe`).
 - **FPS benchmark (main perf test)**: `powershell -File tools/bench.ps1 [-Scen F|A] [-NoExport] [-Pre "--rendering-method mobile"] [-Extra "--fsecs=40"]`
   exports the ARM64 release build and runs it. `--fpsbench=F` (default) = fresh world seed 12345, RD16/SD12, V-Sync +
   FPS caps off, **borderless fullscreen at native resolution**; after the world loads, 60 s creative **sprint-flight**
@@ -69,7 +69,7 @@ Gameplay / UI:
 - [~] Mob animation smooth + modern AI (interpolation, look / body rotation controls, A* pathfinding, arm poses):
       verify in game; probe timing split (15 ms worst step)
 Build:
-- [ ] native/bin/recraft_native.x86_64.dll is stale (locked by the running x64 Godot): rebuild with tools/build_native.ps1 -Arch x86_64 once it is closed. The 2026-11-12 x86_64 build in builds/ already has the fresh DLL (built with -OutDir)
+- [ ] native/bin/recraft_native.x86_64.dll is stale (locked by the running x64 Godot): rebuild with tools/build_native.ps1 -Arch x86_64 once it is closed. builds/windows-x86_64 already has the fresh DLL (built with -OutDir)
 Earlier, still open: vanilla template structures (shipwreck, ocean ruins, ruined portal, igloo, fossils, end city),
 hand-coded structures (desert pyramid, jungle temple, swamp hut, stronghold, fortress, monument, mansion), map zoom /
 cartography, banners, offhand, recipe book search; parched arm / leg wraps; nautilus exact model.

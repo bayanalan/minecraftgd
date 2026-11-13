@@ -1,6 +1,6 @@
 # UI smoke test: opens every out-of-game --ui route in the exported build, fails on SCRIPT ERROR or a missing
-# screenshot. Usage: powershell -File tests/ui/ui_all_routes.ps1 [-Exe build/windows-arm64/Recraft2.exe]
-param([string]$Exe = "build/windows-arm64/Recraft2.exe")
+# screenshot. Usage: powershell -File tests/ui/ui_all_routes.ps1 [-Exe builds/windows-arm64/Recraft2.exe]
+param([string]$Exe = "builds/windows-arm64/Recraft2.exe")
 $routes = @("title", "world_list", "edit_world", "delete_world", "create_world", "create_world_world", "create_world_more",
   "game_rules", "flat", "presets", "single_biome", "options", "options_video", "options_sounds", "options_controls",
   "options_keybinds", "options_language", "options_packs", "options_access", "options_online", "multiplayer")
