@@ -846,55 +846,62 @@ static func _try_ext(f: Features, c: Features.FCtx, cf: Dictionary, chance: floa
 	return _leaf(f, c, cf, q)
 
 
-# ---------------------------------------------------------------- poplar (26.x; Java code not public: APPROXIMATION)
-# From the configured feature and the Minecraft Wiki's description: a straight trunk; branch_amount branches "by the
-# start of the foliage" (trunk_height_above_branches logs below the top log); "an especially large canopy" in "a
-# rhombus shape in one of two possible directions", `height` layers tall (5-6) ending one block above the top log
-# (so it starts at the branches), sized by `radius` (5-8, the widest of any tree). Modelled as a lens: every layer a
-# rhombus with half-diagonals w along the tree's random long axis and w / 2 across it, w peaking at `radius` in the
-# middle layers; side_hole_chance holes in each layer's rim (the dappled light). APPROXIMATE until compared with
-# vanilla.
+# ---------------------------------------------------------------- poplar (26.x; the placer code is not public)
+# Shape matched to vanilla 26.3 dappled forests (reference screenshots 2026-11-13) with the 26.3 parameters: a dense,
+# rounded dome crown - circular layers on an ellipse profile centred 60 % down (domed top, rounded underside, about
+# twice as wide as tall), `height` 5-6 layers from one block above the top log, `radius` 5-8 - and branch_amount (1-4)
+# branches rising diagonally from trunk_height_above_branches below the top, each under a small crown lobe (radius - 2,
+# one layer lower): the bumps and two-lobed crowns seen from above. side_hole_chance opens holes only in layer rims.
 
 static func _poplar_trunk(f: Features, c: Features.FCtx, cf: Dictionary, tp: Dictionary, p: Vector3i, h: int, atts: Array) -> void:
 	for y in h:
 		_log(f, c, cf, p + Vector3i(0, y, 0))
 	atts.append([p + Vector3i(0, h, 0), 0, false])
 	var above := int(tp.get("trunk_height_above_branches", 4))
-	var by := clampi(h - 1 - above, 1, h - 1)
+	var by := clampi(h - above, 2, h - 1)
 	var n := f.sample_int(c, tp.get("branch_amount", 1))
 	var used := {}
 	for b in n:
-		var dir: Vector3i = _HORIZ[c.r.next_int_bound(4)]
+		var dir: Vector3i = _POPLAR_DIRS[c.r.next_int_bound(8)]
+		var ln := 2 + c.r.next_int_bound(2)
 		if used.has(dir):
 			continue
 		used[dir] = true
-		# one log out from the trunk, a second diagonally up into the canopy
-		_log(f, c, cf, p + Vector3i(0, by, 0) + dir, "x" if dir.x != 0 else "z")
-		_log(f, c, cf, p + Vector3i(0, by + 1, 0) + dir * 2, "x" if dir.x != 0 else "z")
+		var axis := "x" if absi(dir.x) >= absi(dir.z) else "z"
+		var q := p + Vector3i(0, by, 0)
+		for k in ln:
+			q += dir
+			if k > 0:
+				q.y += 1
+			if q.y - p.y >= h:
+				break
+			_log(f, c, cf, q, axis)
+		atts.append([Vector3i(q.x, p.y + h - 1, q.z), -2, false])
 
 
-static func _poplar_foliage(f: Features, c: Features.FCtx, cf: Dictionary, fp: Dictionary, top: Vector3i, radius: int, layers: int, dbl: bool) -> void:
+const _POPLAR_DIRS := [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1),
+	Vector3i(1, 0, 1), Vector3i(1, 0, -1), Vector3i(-1, 0, 1), Vector3i(-1, 0, -1)]
+
+
+static func _poplar_foliage(f: Features, c: Features.FCtx, cf: Dictionary, fp: Dictionary, top: Vector3i, radius: int, layers: int, _dbl: bool) -> void:
 	var hole := float(fp.get("side_hole_chance", 0.15))
-	var e := 1 if dbl else 0
-	var along_x := c.r.next_int_bound(2) == 0   # the rhombus' long axis
 	layers = maxi(layers, 3)
-	var mid := float(layers - 1) / 2.0
+	# ellipse centred 60 % down the crown: a domed top and a shorter rounded underside (vanilla's mushroom-cap look)
+	var cy := float(layers - 1) * 0.6
+	var at := cy + 0.75
+	var ab := float(layers - 1) - cy + 0.75
 	for i in layers:
-		var t := 1.0 - absf(float(i) - mid) / (mid + 1.0)
-		var wl := maxf(1.0, roundf(float(radius) * t))
-		var ws := maxf(1.0, roundf(float(radius) * t * 0.5))
-		var ri := int(wl)
-		for j in range(-ri, ri + e + 1):
-			for k in range(-ri, ri + e + 1):
-				var a := float(mini(absi(j), absi(j - 1)) if dbl else absi(j))
-				var b := float(mini(absi(k), absi(k - 1)) if dbl else absi(k))
-				if not along_x:
-					var tmp := a
-					a = b
-					b = tmp
-				var q := a / wl + b / ws
-				if q > 1.0:
+		var d := (cy - float(i)) / at if float(i) <= cy else (float(i) - cy) / ab
+		var rr := maxf(1.0, float(radius) * sqrt(maxf(0.0, 1.0 - d * d)))
+		var lim := rr * rr + rr * 0.6        # rounded circle: no lone corner blocks
+		var ir := rr - 1.0
+		var inner := ir * ir + ir * 0.6      # inside this the layer is solid; between it and lim is the rim
+		var ri := int(ceil(rr))
+		for dx in range(-ri, ri + 1):
+			for dz in range(-ri, ri + 1):
+				var d2 := float(dx * dx + dz * dz)
+				if d2 > lim:
 					continue
-				if q > 1.0 - 1.0 / ws and c.r.next_float() < hole:
-					continue   # rim hole
-				_leaf(f, c, cf, top + Vector3i(j, -i, k))
+				if d2 > inner and c.r.next_float() < hole:
+					continue   # dappled rim
+				_leaf(f, c, cf, top + Vector3i(dx, -i, dz))

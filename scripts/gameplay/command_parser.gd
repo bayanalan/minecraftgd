@@ -30,6 +30,7 @@ class Ctx:
 
 var world
 var feedback: Array = []         # messages produced by the current top-level command
+var feedback_click := ""       # click event of the feedback line ("copy:<text>" = COPY_TO_CLIPBOARD, else SUGGEST_COMMAND)
 var last_result := 0
 var _depth := 0
 var _functions: Dictionary = {}  # "ns:path" -> PackedStringArray (cached)
@@ -59,6 +60,7 @@ func player_ctx() -> Ctx:
 ## Chat entry point (player). Returns the feedback text.
 func execute(line: String) -> String:
 	feedback = []
+	feedback_click = ""
 	var s := line.strip_edges().trim_prefix("/")
 	if s.is_empty():
 		return ""
@@ -179,7 +181,9 @@ func _dispatch(cmd: String, a: PackedStringArray, ctx: Ctx) -> int:
 			_say(ctx, "Changed the weather")
 			return 1
 		"seed":
+			# Java SeedCommand: ComponentUtils.copyOnClickText - green brackets, click copies, hover "Click to Copy to Clipboard"
 			_say(ctx, "Seed: [%d]" % int(world.level.get("seed", 0)))
+			feedback_click = "copy:%d" % int(world.level.get("seed", 0))
 			return 1
 		"build":
 			# Recraft: which build is running (native library architecture, emulation, renderer)
@@ -1493,35 +1497,102 @@ func _bossbar(a: PackedStringArray, ctx: Ctx) -> int:
 	return 0
 
 
+## Java AdvancementCommands: grant / revoke <targets> everything | only <advancement> [<criterion>] | from | until |
+## through <advancement> (from = it + descendants, until = ancestors + it, through = both). Granting awards like
+## progress does (toast + chat announcement); messages per commands.advancement.<grant|revoke>.*.
 func _advancement(a: PackedStringArray, ctx: Ctx) -> int:
-	if world.advancements == null or a.size() < 3:
-		_say(ctx, "Usage: /advancement grant|revoke <targets> everything|only <advancement>")
+	if world.advancements == null or a.size() < 3 or not (a[0] in ["grant", "revoke"]):
+		_say(ctx, "Usage: /advancement (grant|revoke) <targets> (everything|only|from|until|through) ...")
 		return 0
 	var adv: Advancements = world.advancements
+	var grant := a[0] == "grant"
+	var mode := a[2]
 	var ids: Array = []
-	if a[2] == "everything":
-		ids = adv.defs.keys()
-	elif a[2] == "only" and a.size() > 3:
-		ids = [a[3].trim_prefix("minecraft:")]
+	var target := a[3].trim_prefix("minecraft:") if a.size() > 3 else ""
+	if mode != "everything" and not adv.defs.has(target):
+		_say(ctx, "Unknown advancement: minecraft:%s" % target)
+		return 0
+	match mode:
+		"everything":
+			ids = adv.defs.keys()
+		"only":
+			if a.size() > 4:
+				# a single criterion
+				var cn := a[4]
+				if not (adv.defs[target]["criteria"] as Dictionary).has(cn):
+					_say(ctx, "Advancement %s does not contain the criterion '%s'" % [_adv_title(adv, target), cn])
+					return 0
+				var had: bool = (adv.progress.get(target, {}) as Dictionary).has(cn)
+				if grant == had:
+					_say(ctx, "Couldn't %s criterion '%s' of advancement %s %s Player as they %s" % ["grant" if grant else "revoke", cn, _adv_title(adv, target), "to" if grant else "from", "already have it" if grant else "don't have it"])
+					return 0
+				if grant:
+					if not adv.progress.has(target):
+						adv.progress[target] = {}
+					adv.progress[target][cn] = true
+					if not adv.done.has(target) and adv._complete(target):
+						adv.done[target] = true
+						adv._award(target)
+				else:
+					(adv.progress[target] as Dictionary).erase(cn)
+					adv.done.erase(target)
+				_say(ctx, "%s criterion '%s' of advancement %s %s Player" % ["Granted" if grant else "Revoked", cn, _adv_title(adv, target), "to" if grant else "from"])
+				return 1
+			ids = [target]
+		"from", "until", "through":
+			if mode != "from":
+				var c := target
+				while c != "" and adv.defs.has(c):
+					ids.push_front(c)
+					c = str(adv.defs[c]["parent"]).trim_prefix("minecraft:")
+			else:
+				ids.append(target)
+			if mode != "until":
+				var queue: Array = [target]
+				while not queue.is_empty():
+					var cur: String = queue.pop_front()
+					for id2 in adv.defs:
+						if str(adv.defs[id2]["parent"]).trim_prefix("minecraft:") == cur and not ids.has(id2):
+							ids.append(id2)
+							queue.append(id2)
+		_:
+			_say(ctx, "Usage: /advancement (grant|revoke) <targets> (everything|only|from|until|through) ...")
+			return 0
 	var n := 0
 	for id in ids:
 		if not adv.defs.has(id):
 			continue
-		if a[0] == "grant":
+		if grant:
+			if adv.done.has(id):
+				continue
 			var crit: Dictionary = {}
-			for cn in adv.defs[id]["criteria"]:
-				crit[cn] = true
+			for cn2 in adv.defs[id]["criteria"]:
+				crit[cn2] = true
 			adv.progress[id] = crit
-			if not adv.done.has(id):
-				adv.done[id] = true
-				n += 1
+			adv.done[id] = true
+			adv._award(id)
+			n += 1
 		else:
+			var was: bool = adv.done.has(id) or adv.progress.has(id)
 			adv.progress.erase(id)
-			if adv.done.erase(id):
+			adv.done.erase(id)
+			if was:
 				n += 1
-	_say(ctx, "%s %d advancement(s)" % ["Granted" if a[0] == "grant" else "Revoked", n])
+	if n == 0:
+		if ids.size() == 1:
+			_say(ctx, "Couldn't %s advancement %s %s Player as they %s" % ["grant" if grant else "revoke", _adv_title(adv, ids[0]), "to" if grant else "from", "already have it" if grant else "don't have it"])
+		else:
+			_say(ctx, "Couldn't %s %d advancements %s Player as they %s" % ["grant" if grant else "revoke", ids.size(), "to" if grant else "from", "already have them" if grant else "don't have them"])
+		return 0
+	if ids.size() == 1:
+		_say(ctx, "%s the advancement %s %s Player" % ["Granted" if grant else "Revoked", _adv_title(adv, ids[0]), "to" if grant else "from"])
+	else:
+		_say(ctx, "%s %d advancements %s Player" % ["Granted" if grant else "Revoked", n, "to" if grant else "from"])
 	return n
 
+
+func _adv_title(adv: Advancements, id: String) -> String:
+	return "[%s]" % str(adv.defs[id].get("title", id))
 
 func _slot_index(s: String) -> int:
 	if s.begins_with("hotbar."):
@@ -1657,8 +1728,8 @@ func tick() -> void:
 ## Java PlaceCommand: /place feature <configured feature> [pos], /place template <template> [pos] [rotation]. Runs the
 ## generator's feature code on a private copy of the 3 x 3 loaded chunks around the position and applies its writes.
 func _place(a: Array, ctx: Ctx) -> int:
-	if a.size() < 2 or not (a[0] in ["feature", "template"]):
-		_say(ctx, "Usage: /place feature <feature> [pos] | /place template <template> [pos] [rotation]")
+	if a.size() < 2 or not (a[0] in ["feature", "template", "structure"]):
+		_say(ctx, "Usage: /place feature <feature> [pos] | /place structure <structure> [pos] | /place template <template> [pos] [rotation]")
 		return 0
 	var fe = world.gen.get("features") if world.gen != null else null
 	if fe == null:
@@ -1682,7 +1753,52 @@ func _place(a: Array, ctx: Ctx) -> int:
 	c.r = RandomSources.Xoroshiro.from_seed(randi())
 	var id := str(a[1]).trim_prefix("minecraft:")
 	var ok := false
-	if a[0] == "feature":
+	if a[0] == "structure":
+		# Java PlaceCommand.placeStructure: the start generated at this chunk without the biome test, its pieces placed
+		# here (this 3 x 3 chunk area)
+		var sts = world.gen.get("structures")
+		var cfg: Dictionary = sts.structures.get(id, {}) if sts != null else {}
+		if cfg.is_empty():
+			_say(ctx, "There is no structure with type \"%s\"" % id)
+			return 0
+		var t := str(cfg.get("type", "")).trim_prefix("minecraft:")
+		var sc := Vector2i(ccx, ccz)
+		var r := Structures.large_feature_seed(world.gen.seed, sc.x, sc.y)
+		var res: Dictionary = {}
+		if t == "jigsaw":
+			var stub: Dictionary = sts._jigsaw_stub(cfg, sc, r)
+			if not stub.is_empty():
+				res = sts._jigsaw_finish(cfg, stub, r)
+		elif t == "woodland_mansion":
+			res = MansionPieces.generate(sts, cfg, sc, r, true)
+		else:
+			res = StructuresLegacy.generate(sts, t, cfg, sc, r)
+		if res.is_empty():
+			_say(ctx, "Failed to generate structure \"%s\"" % id)
+			return 0
+		print("[place] structure %s centre %s box %s" % [id, str(res.get("center")), str(res.get("box"))])
+		# Java: StructureStart.placeInChunk for every chunk of the start's bounding box (loaded chunks)
+		var sbox: Array = res.get("box", [bp, bp])
+		for scz in range(sbox[0].z >> 4, (sbox[1].z >> 4) + 1):
+			for scx in range(sbox[0].x >> 4, (sbox[1].x >> 4) + 1):
+				var nine2: Array = []
+				for dz2 in [-1, 0, 1]:
+					for dx2 in [-1, 0, 1]:
+						nine2.append(world.cm.get_chunk(scx + dx2, scz + dz2))
+				if nine2[4] == null:
+					continue
+				var c2 := c if (scx == ccx and scz == ccz) else Features.FCtx.new()
+				if c2 != c:
+					var region2 := ChunkRegion.new(scx, scz, nine2)
+					c2.region = region2
+					fe._load_region(c2, nine2[4], region2)
+					c2.origin_chunk = nine2[4]
+					c2.r = RandomSources.Xoroshiro.from_seed(randi())
+				sts._place_start(c2, res, Vector3i(scx * 16, world.gen.gen_min_y, scz * 16), Vector3i(scx * 16 + 15, world.gen.gen_min_y + world.gen.gen_depth - 1, scz * 16 + 15))
+				if c2 != c:
+					_apply_place_writes(c2)
+		ok = true
+	elif a[0] == "feature":
 		var cf: Dictionary = fe._cf("minecraft:" + id)
 		if cf.is_empty():
 			_say(ctx, "There is no configured feature with type \"%s\"" % id)
@@ -1699,6 +1815,17 @@ func _place(a: Array, ctx: Ctx) -> int:
 	if not ok:
 		_say(ctx, "Failed to place feature")
 		return 0
+	_apply_place_writes(c)
+	if a[0] == "structure":
+		_say(ctx, "Generated structure \"%s\" at %d, %d, %d" % [id, bp.x, bp.y, bp.z])
+		return 1
+	_say(ctx, "Placed feature \"%s\" at %d, %d, %d" % [id, bp.x, bp.y, bp.z] if a[0] == "feature" else "Structure template %s placed at %d, %d, %d" % [id, bp.x, bp.y, bp.z])
+	return 1
+
+
+## /place: a feature context's block writes (with their placement modes), block entities and structure mobs applied
+## to the world.
+func _apply_place_writes(c: Features.FCtx) -> void:
 	var w: PackedInt32Array = c.writes
 	for k in range(0, w.size(), 5):
 		var st := w[k + 3]
@@ -1713,5 +1840,9 @@ func _place(a: Array, ctx: Ctx) -> int:
 		world.set_block(w[k], w[k + 1], w[k + 2], st, false)
 	for bpos in c.block_entities:
 		BlockEntities.set_data(world, bpos, (c.block_entities[bpos] as Dictionary).duplicate(true))
-	_say(ctx, "Placed feature \"%s\" at %d, %d, %d" % [id, bp.x, bp.y, bp.z] if a[0] == "feature" else "Structure template %s placed at %d, %d, %d" % [id, bp.x, bp.y, bp.z])
-	return 1
+	for en in c.entities:
+		var ep: Array = en.get("p", [])
+		if str(en.get("k", "")) == "mob" and ep.size() == 3:
+			var m = world.entities.spawn_mob(str(en["id"]), Vector3(ep[0], ep[1], ep[2]))
+			if m != null and en.get("pers", false):
+				m.persistent = true

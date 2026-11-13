@@ -17,6 +17,7 @@ var name_edit: LineEdit
 var loom_list: Array = []       # selectable pattern ids (Java LoomMenu.selectablePatterns)
 var loom_sel := -1
 var loom_row := 0                # first visible row of the 4x4 pattern grid
+var carto_mode := ""             # cartography table result: scale / lock / copy
 
 
 func build() -> void:
@@ -73,6 +74,14 @@ func build() -> void:
 			add_slot(Vector2(23, 45), _g.bind(2), _s.bind(2), 0, false, func(st): return st.name().ends_with("_banner_pattern"), "banner_pattern")
 			add_slot(Vector2(143, 57), func(): return result, func(_s): pass, 0, true)
 			extra_draw = _draw_loom
+		"cartography_table":
+			# Java CartographyTableMenu / Screen: map (15, 15), paper / map / glass pane (15, 52), result (145, 39)
+			bg_tex = UiKit.sprite("gui/container/cartography_table")
+			title = Res.tr_key("container.cartography_table", "Cartography Table")
+			add_slot(Vector2(15, 15), _g.bind(0), _s.bind(0), 0, false, func(st): return st.name() == "filled_map")
+			add_slot(Vector2(15, 52), _g.bind(1), _s.bind(1), 0, false, func(st): return st.name() in ["paper", "map", "glass_pane"])
+			add_slot(Vector2(145, 39), func(): return result, func(_s): pass, 0, true)
+			extra_draw = _draw_cartography
 		"stonecutter":
 			bg_tex = UiKit.sprite("gui/container/stonecutter")
 			title = "Stonecutter"
@@ -145,6 +154,27 @@ func on_changed() -> void:
 				loom_sel = -1
 			if loom_sel >= 0:
 				result = Banners.loom_result(inp[0], inp[1], str(loom_list[loom_sel]))
+		"cartography_table":
+			# CartographyTableMenu.setupResultSlot: paper zooms out (unlocked, scale < 4), a glass pane locks (unlocked),
+			# an empty map copies
+			var mp: ItemStack = inp[0]
+			var ad: ItemStack = inp[1]
+			if not mp.is_empty() and not ad.is_empty():
+				var mi := Maps.info(world, mp)
+				if not mi.is_empty():
+					var locked := bool(mi.get("locked", false))
+					if ad.name() == "paper" and not locked and int(mi.get("scale", 0)) < 4:
+						result = mp.copy()
+						result.count = 1
+						carto_mode = "scale"
+					elif ad.name() == "glass_pane" and not locked:
+						result = mp.copy()
+						result.count = 1
+						carto_mode = "lock"
+					elif ad.name() == "map":
+						result = mp.copy()
+						result.count = 2
+						carto_mode = "copy"
 		"stonecutter":
 			var src: ItemStack = inp[0]
 			stone_choices = Crafting.stonecutting.get(src.name(), []) if not src.is_empty() else []
@@ -162,6 +192,14 @@ func take_output(_i: int, all: bool) -> void:
 	if kind == "anvil" and not p.is_creative() and p.xp_level < cost:
 		return
 	var out := result.copy()
+	if kind == "cartography_table":
+		# MapItem.onCraftedPostProcess: the taken map is the zoomed-out / locked one
+		if carto_mode == "scale":
+			out = Maps.scaled_copy(world, inp[0])
+		elif carto_mode == "lock":
+			out = Maps.locked_copy(world, inp[0])
+		if out.is_empty():
+			return
 	if all:
 		if inv.add(out) > 0:
 			return
@@ -203,6 +241,12 @@ func take_output(_i: int, all: bool) -> void:
 			s2.count -= 1
 			inp[0] = s2 if s2.count > 0 else ItemStack.new()
 			Audio.play("ui.stonecutter.take_result", Vector3(pos), "Blocks")
+		"cartography_table":
+			for k2 in 2:
+				var ck: ItemStack = inp[k2]
+				ck.count -= 1
+				inp[k2] = ck if ck.count > 0 else ItemStack.new()
+			Audio.play("ui.cartography_table.take_result", Vector3(pos), "Blocks")
 	on_changed()
 
 
@@ -351,6 +395,52 @@ func _draw_flag(r: Rect2, base_color: String, layers: Array) -> void:
 		var tex = EntityRenderer.texture(Banners.texture(str(l.get("pattern", ""))))
 		if tex != null:
 			draw_texture_rect_region(tex, r, Rect2(1, 1, 20, 40), BERender.DYE.get(str(l.get("color", "white")), Color.WHITE))
+
+
+## CartographyTableScreen.renderBg / renderResultingMap: error icon (locked + paper / pane, or paper at scale 4), the
+## preview: zoomed (scaled_map frame, map at 0.226), two copies (duplicated_map frames, 0.34), locked (map + lock icon),
+## else the map at 0.45.
+func _draw_cartography(o: Vector2) -> void:
+	var mp: ItemStack = inp[0]
+	var ad: ItemStack = inp[1]
+	var copy := ad.name() == "map"
+	var paper := ad.name() == "paper"
+	var pane := ad.name() == "glass_pane"
+	var mi := Maps.info(world, mp) if not mp.is_empty() else {}
+	var bad := false
+	if not mi.is_empty():
+		if bool(mi.get("locked", false)):
+			bad = true
+			if paper or pane:
+				_spr("container/cartography_table/error", Rect2(o + Vector2(35, 31), Vector2(28, 21)))
+		if paper and int(mi.get("scale", 0)) >= 4:
+			bad = true
+			_spr("container/cartography_table/error", Rect2(o + Vector2(35, 31), Vector2(28, 21)))
+	var tex: Texture2D = Maps.texture(world, Maps.map_id(mp)) if not mi.is_empty() else null
+	var mapq := func(at: Vector2, scale: float) -> void:
+		if tex != null:
+			draw_texture_rect(tex, Rect2(at + Vector2(1, 1), Vector2(128, 128) * scale), false)
+	if paper and not bad:
+		_spr("container/cartography_table/scaled_map", Rect2(o + Vector2(67, 13), Vector2(66, 66)))
+		mapq.call(o + Vector2(85, 31), 0.226)
+	elif copy:
+		_spr("container/cartography_table/duplicated_map", Rect2(o + Vector2(83, 13), Vector2(50, 66)))
+		mapq.call(o + Vector2(86, 16), 0.34)
+		_spr("container/cartography_table/duplicated_map", Rect2(o + Vector2(67, 29), Vector2(50, 66)))
+		mapq.call(o + Vector2(70, 32), 0.34)
+	elif pane:
+		_spr("container/cartography_table/map", Rect2(o + Vector2(67, 13), Vector2(66, 66)))
+		mapq.call(o + Vector2(71, 17), 0.45)
+		_spr("container/cartography_table/locked", Rect2(o + Vector2(118, 60), Vector2(10, 14)))
+	else:
+		_spr("container/cartography_table/map", Rect2(o + Vector2(67, 13), Vector2(66, 66)))
+		mapq.call(o + Vector2(71, 17), 0.45)
+
+
+func _spr(path: String, r: Rect2) -> void:
+	var t := UiKit.sprite("gui/sprites/" + path)
+	if t != null:
+		draw_texture_rect(t, r, false)
 
 
 func _stone_rect(i: int) -> Rect2:

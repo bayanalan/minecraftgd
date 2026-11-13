@@ -9,6 +9,14 @@
 //   tg_surface_grid(cfg, gx, gz) -> [float]   (preliminary surface at grid point, shared cache)
 #include "density_core.h"
 #include "rng.h"
+#include <cstdio>
+#include <cstdlib>
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#undef CONST   // windef.h macro; clashes with the density node kind
+#endif
 
 using namespace gdx;
 using namespace rn;
@@ -139,12 +147,44 @@ static int climate_pick(const ClimateCfg &C, const int64_t *best, const int *bi,
 	return res;
 }
 
+// An INTERP node i such that "all 8 corners of i's cell < 0" implies value(n) < 0 for every block of the cell: the
+// interpolated value is a convex combination of the corners; squeeze, mul by a positive constant, min (either side)
+// and pass keep a negative input negative. Overworld final_density = min(squeeze(interpolated(...)), noodle) (+ the
+// beardifier, added separately). -1 when the graph has no such shape (the fill then evaluates every block).
+static int air_interp(const Graph &g, int n, int depth = 0) {
+	if (n < 0 || n >= (int)g.nodes.size() || depth > 8) return -1;
+	const Node &d = g.nodes[n];
+	switch (d.k) {
+		case INTERP: return (d.cxz == 4 && d.cy == 8) ? n : -1;
+		case SQUEEZE: case PASS: return air_interp(g, d.a, depth + 1);
+		case MUL: {
+			if (d.a >= 0 && g.nodes[d.a].k == CONST && g.nodes[d.a].v0 > 0.0) return air_interp(g, d.b, depth + 1);
+			if (d.b >= 0 && g.nodes[d.b].k == CONST && g.nodes[d.b].v0 > 0.0) return air_interp(g, d.a, depth + 1);
+			return -1;
+		}
+		case MIN: {
+			int r = air_interp(g, d.a, depth + 1);
+			return r >= 0 ? r : air_interp(g, d.b, depth + 1);
+		}
+		case ADD: {
+			// adding a constant <= 0 (the beardifier placeholder is ZERO here; the real beard is added in fill) keeps a
+			// negative value negative
+			auto nonpos = [&](int m) { return m >= 0 && (g.nodes[m].k == ZERO || (g.nodes[m].k == CONST && g.nodes[m].v0 <= 0.0)); };
+			if (nonpos(d.b)) return air_interp(g, d.a, depth + 1);
+			if (nonpos(d.a)) return air_interp(g, d.b, depth + 1);
+			return -1;
+		}
+		default: return -1;
+	}
+}
+
 struct Cfg {
 	ClimateCfg clim;
 	SurfCfg surf;
 	const Graph *g = nullptr;
 	int water = 0, lava = 0, sea = 63;
 	int n_barrier = -1, n_flood = -1, n_spread = -1, n_lava = -1, n_excl = -1, n_prelim = -1, n_final = -1;
+	int n_air_interp = -1;   // INTERP node whose 8 negative corners prove final density < 0 (see air_interp)
 	int gen_min_y = -64, gen_depth = 384;
 	bool aquifers = true;
 	int s_fluid = 0, s_default = 1, s_grass = 0;
@@ -418,29 +458,118 @@ struct Job {
 		return st;
 	}
 
+	// Java NoiseBasedChunkGenerator.getBaseColumn / iterateNoiseColumn: one column's noise-stage block classes from the
+	// cell-interpolated final density (no beard) and the aquifer: 0 air, 1 solid, 2 water (other fluid), 3 lava
+	void column(int x, int z, uint8_t *out) {
+		int nlo = c.gen_min_y, nhi = c.gen_min_y + c.gen_depth;
+		if (c.aquifers) aq_init();
+		int lava_y = std::min(-54, c.sea);
+		ev.mode = 1;
+		for (int y = nlo; y < nhi; y++) {
+			ev.px = x; ev.py = y; ev.pz = z;
+			ev.cur = ev.next_stamp();
+			double d = ev.ev(c.n_final, x, y, z);
+			int st;
+			if (d > 0.0) st = c.s_default;
+			else if (!c.aquifers) st = y < lava_y ? c.lava : (y < c.sea ? c.s_fluid : 0);
+			else if (y < lava_y) st = c.lava;
+			else { int s = substance(x, y, z, d); st = s < 0 ? c.s_default : s; }
+			out[y - nlo] = (uint8_t)(st == 0 ? 0 : (st == c.lava ? 3 : (st == c.s_default ? 1 : 2)));
+		}
+		ev.mode = 0;
+	}
+
 	// ------------------------------------------------------------ fill
 	int skip_above = 0;
 	void fill(int32_t *col) {
 		// density (block mode = GDScript cell path)
-		std::vector<double> dens(98304);
+		static thread_local std::vector<double> tl_dens;
+		TLBuf<double> dens_buf(tl_dens, 98304, 0.0);
+		std::vector<double> &dens = dens_buf.v;
 		int nlo = c.gen_min_y, nhi = c.gen_min_y + c.gen_depth;
+		static int prof = getenv("RC_DFPROF") ? 1 : 0;
+		LARGE_INTEGER pf0, pf1, pf2, pf3, pfq;
+		if (prof) {
+			// profiling (RC_DFPROF=1): every interpolation corner first, then the per-block pass alone
+			QueryPerformanceFrequency(&pfq);
+			QueryPerformanceCounter(&pf0);
+			ev.mode = 1;
+			for (size_t n = 0; n < c.g->nodes.size(); n++) {
+				const Node &d = c.g->nodes[n];
+				if (d.k != INTERP || d.cxz <= 0 || d.cy <= 0) continue;
+				int nx = 16 / d.cxz + 1, ny = HEIGHT / d.cy + 1;
+				for (int iy = 0; iy < ny; iy++) for (int iz = 0; iz < nx; iz++) for (int ix = 0; ix < nx; ix++) ev.corner((int)n, d, ix, iy, iz);
+			}
+			QueryPerformanceCounter(&pf1);
+		}
+		uint64_t kc[40] = {0};
+		if (prof) ev.kcount = kc;
 		ev.mode = 1;
 		int x0 = cx * 16, z0 = cz * 16;
-		for (int ly = 0; ly < HEIGHT; ly++) {
-			int y = MIN_Y + ly;
-			for (int lz = 0; lz < 16; lz++)
-				for (int lx = 0; lx < 16; lx++) {
-					int idx = (ly << 8) | (lz << 4) | lx;
-					if (y < nlo || y >= nhi) { dens[idx] = -1.0; continue; }
-					int x = x0 + lx, z = z0 + lz;
-					ev.px = x; ev.py = y; ev.pz = z;
-					ev.cur = ev.next_stamp();
-					dens[idx] = ev.ev(c.n_final, x, y, z);
-					if (!beard.empty()) dens[idx] += beard_at(x, y, z);   // final_density = add(..., beardifier)
-				}
-		}
-		ev.mode = 0;
+		// Proven-air cells are not evaluated per block: the block is air whatever the exact negative value when the cell
+		// lies wholly above the aquifer ceiling (above it the fill only tests the sign; without aquifers: above the sea
+		// and the lava level), no structure beard can add density in this chunk, and every corner of the n_air_interp
+		// cell is negative. Generated blocks are identical; ~half of a chunk's cells are open air.
 		skip_above = c.aquifers ? aquifer_ceiling() : c.gen_min_y + c.gen_depth;
+		int air_from = c.aquifers ? skip_above + 1 : std::max(c.sea, std::min(-54, c.sea));
+		const bool can_skip = c.n_air_interp >= 0 && beard.empty() && !getenv("RC_NOAIRSKIP");
+		const Node *ai = can_skip ? &c.g->nodes[c.n_air_interp] : nullptr;
+		int air_cells = 0;
+		const bool use_batch = !getenv("RC_NOBATCH") && ev.batch_ok(c.n_final);
+		// cell order (4 x 8 x 4, Java NoiseChunk's): every block of a cell reuses the interpolation nodes' cached corners
+		// (Eval::interp); each block is still evaluated on its own, so the values are the same in any order
+		for (int cy0 = 0; cy0 < HEIGHT; cy0 += 8)
+			for (int cz0 = 0; cz0 < 16; cz0 += 4)
+				for (int cx0 = 0; cx0 < 16; cx0 += 4) {
+					if (ai && MIN_Y + cy0 >= air_from && MIN_Y + cy0 >= nlo && MIN_Y + cy0 + 8 <= nhi) {
+						int ix = cx0 >> 2, iz = cz0 >> 2, iy = cy0 >> 3;
+						bool air = true;
+						for (int k = 0; k < 8 && air; k++)
+							air = ev.corner(c.n_air_interp, *ai, ix + (k & 1), iy + ((k >> 2) & 1), iz + ((k >> 1) & 1)) < 0.0;
+						if (air) {
+							air_cells++;
+							for (int ly = cy0; ly < cy0 + 8; ly++)
+								for (int lz = cz0; lz < cz0 + 4; lz++)
+									for (int lx = cx0; lx < cx0 + 4; lx++) dens[(ly << 8) | (lz << 4) | lx] = -1.0;
+							continue;
+						}
+					}
+					if (use_batch && MIN_Y + cy0 >= nlo && MIN_Y + cy0 + 8 <= nhi) {
+						// whole cell as array operations (Eval::eval_cell, bit-identical to the per-block path)
+						double lane[128];
+						ev.eval_cell(c.n_final, cx0, cy0, cz0, lane);
+						for (int i = 0; i < 128; i++) {
+							int ly = cy0 + (i >> 4), lz = cz0 + ((i >> 2) & 3), lx = cx0 + (i & 3);
+							int idx = (ly << 8) | (lz << 4) | lx;
+							dens[idx] = lane[i];
+							if (!beard.empty()) dens[idx] += beard_at(x0 + lx, MIN_Y + ly, z0 + lz);
+						}
+						continue;
+					}
+					for (int ly = cy0; ly < cy0 + 8; ly++) {
+						int y = MIN_Y + ly;
+						for (int lz = cz0; lz < cz0 + 4; lz++)
+							for (int lx = cx0; lx < cx0 + 4; lx++) {
+								int idx = (ly << 8) | (lz << 4) | lx;
+								if (y < nlo || y >= nhi) { dens[idx] = -1.0; continue; }
+								int x = x0 + lx, z = z0 + lz;
+								ev.px = x; ev.py = y; ev.pz = z;
+								ev.cur = ev.next_stamp();
+								dens[idx] = ev.ev(c.n_final, x, y, z);
+								if (!beard.empty()) dens[idx] += beard_at(x, y, z);   // final_density = add(..., beardifier)
+							}
+					}
+				}
+		ev.mode = 0;
+		ev.kcount = nullptr;
+		(void)0;
+		if (prof) {
+			QueryPerformanceCounter(&pf2);
+			static const char *KN[] = {"CONST", "ADD", "MUL", "SUB", "DIV", "MIN", "MAX", "ABS", "SQUARE", "CUBE", "HALF_NEG", "QUARTER_NEG", "SQUEEZE", "NEGATE", "CLAMP", "RANGE", "LERP", "GRADIENT", "NOISE", "SHIFT_A", "SHIFT_B", "SHIFT", "BLENDED", "INTERP", "PASS", "ONE", "ZERO", "SPLINE", "INTERVAL", "TOP_SURFACE", "END_ISLANDS", "DIST"};
+			printf("[dfprof] per-block computes / block:");
+			for (int k = 0; k < 32; k++) if (kc[k]) printf(" %s %.2f", KN[k], (double)kc[k] / 98304.0);
+			printf("\n");
+		}
 		if (c.aquifers) aq_init();
 		int gtop = c.gen_min_y + c.gen_depth;
 		int lava_y = std::min(-54, c.sea);
@@ -458,6 +587,14 @@ struct Job {
 			if (y < lava_y) { col[i] = c.lava; continue; }
 			int s = substance(x0 + (i & 15), y, z0 + ((i >> 4) & 15), d);
 			col[i] = s < 0 ? c.s_default : s;
+		}
+		if (prof) {
+			QueryPerformanceCounter(&pf3);
+			double ms = 1000.0 / (double)pfq.QuadPart;
+			int ninterp = 0;
+			for (auto &nd : c.g->nodes) ninterp += nd.k == INTERP ? 1 : 0;
+			printf("[dfprof] corners %.2f ms (%d interp nodes) | per-block %.2f ms | aquifer+fill %.2f ms | nodes %d | air cells %d / 768 (air interp %d)\n", (pf1.QuadPart - pf0.QuadPart) * ms, ninterp, (pf2.QuadPart - pf1.QuadPart) * ms, (pf3.QuadPart - pf2.QuadPart) * ms, (int)c.g->nodes.size(), air_cells, c.n_air_interp);
+			fflush(stdout);
 		}
 	}
 
@@ -909,6 +1046,7 @@ bool fn_tg_config(const Args &a, void *ret) {
 	c->s_fluid = (int)I(12); c->s_default = (int)I(13); c->aq_rand.legacy = I(14) != 0; c->aq_rand.lo = I(15); c->aq_rand.hi = I(16);
 	c->s_grass = (int)I(17); c->grass_b = (int)I(18); c->myc_b = (int)I(19); c->dirt_b = (int)I(20); c->f_liquid = (int)I(21);
 	c->n_final = (int)I(22); c->seed = I(23);
+	c->n_air_interp = air_interp(*g, c->n_final);
 	read_i32(array_get(desc, 1), c->st_block);
 	read_i32(array_get(desc, 2), c->st_flags);
 	read_u8(array_get(desc, 3), c->replaceable);
@@ -1041,7 +1179,11 @@ bool fn_tg_begin(const Args &a, void *ret) {
 	bool has_bio = c->clim.ok;
 	if (has_bio) {
 		resize(GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY, bio.ptr(), 1536);
+		static int bprof = getenv("RC_DFPROF") ? 1 : 0;
+		LARGE_INTEGER b0, b1, bq;
+		if (bprof) { QueryPerformanceFrequency(&bq); QueryPerformanceCounter(&b0); }
 		j->biomes(bytes_w(bio.ptr()));
+		if (bprof) { QueryPerformanceCounter(&b1); printf("[dfprof] biomes %.2f ms\n", (b1.QuadPart - b0.QuadPart) * 1000.0 / (double)bq.QuadPart); fflush(stdout); }
 	}
 	int64_t h;
 	{
@@ -1109,6 +1251,20 @@ bool fn_tg_end(const Args &a, void *ret) {
 	return true;
 }
 
+// tg_column(cfg, x, z) -> [PackedByteArray(gen_depth)]: Job::column (getBaseColumn) of block column (x, z)
+bool fn_tg_column(const Args &a, void *ret) {
+	const Cfg *c = cfg_of(a.i(0));
+	if (!c) return false;
+	int x = (int)a.i(1), z = (int)a.i(2);
+	Job j(*c, x >> 4, z >> 4);
+	Owned col(GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY);
+	resize(GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY, col.ptr(), c->gen_depth);
+	j.column(x, z, bytes_w(col.ptr()));
+	resize(GDEXTENSION_VARIANT_TYPE_ARRAY, ret, 1);
+	array_set_native(ret, 0, GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY, col.ptr());
+	return true;
+}
+
 bool fn_tg_surface_grid(const Args &a, void *ret) {
 	const Cfg *c = cfg_of(a.i(0));
 	if (!c) return false;
@@ -1119,13 +1275,54 @@ bool fn_tg_surface_grid(const Args &a, void *ret) {
 	return true;
 }
 
+// Java BiomeSource.getBiomesWithin(x, y, z, radius): the distinct biomes over the quart cube around the point
+// (OceanMonumentStructure's surrounding check). tg_biomes_within(cfg, x, y, z, radius) -> [PackedInt32Array ids]
+bool fn_tg_biomes_within(const Args &a, void *ret) {
+	const Cfg *c = cfg_of(a.i(0));
+	if (!c) return false;
+	int x = (int)a.i(1), y = (int)a.i(2), z = (int)a.i(3), r = (int)a.i(4);
+	const ClimateCfg &C = c->clim;
+	std::vector<int> ids;
+	if (C.single >= 0) {
+		ids.push_back(C.single);
+	} else {
+		Eval ev(*c->g, 0, 0, false);
+		ev.mode = 0;
+		int i0 = (x - r) >> 2, j0 = (y - r) >> 2, k0 = (z - r) >> 2;
+		int i1 = (x + r) >> 2, j1 = (y + r) >> 2, k1 = (z + r) >> 2;
+		std::vector<int64_t> best(C.ng);
+		std::vector<int> bi(C.ng);
+		std::vector<char> seen(4096, 0);
+		for (int qz = k0; qz <= k1; qz++)
+			for (int qx = i0; qx <= i1; qx++) {
+				double v[6];
+				for (int k = 0; k < 6; k++) v[k] = k == 4 ? 0.0 : ev.at(C.nodes[k], qx * 4, 0, qz * 4);
+				climate_column(C, v[0], v[1], v[2], v[3], v[5], best.data(), bi.data());
+				for (int qy = j0; qy <= j1; qy++) {
+					double d = ev.at(C.nodes[4], qx * 4, qy * 4, qz * 4);
+					int id = climate_pick(C, best.data(), bi.data(), d);
+					if (id >= 0 && id < 4096 && !seen[id]) { seen[id] = 1; ids.push_back(id); }
+				}
+			}
+	}
+	Owned out(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY);
+	resize(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, out.ptr(), (int64_t)ids.size());
+	int32_t *w = i32_w(out.ptr());
+	for (size_t i = 0; i < ids.size(); i++) w[i] = ids[i];
+	resize(GDEXTENSION_VARIANT_TYPE_ARRAY, ret, 1);
+	array_set_native(ret, 0, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, out.ptr());
+	return true;
+}
+
 } // namespace
 
 void register_terrain(const char *cls) {
+	register_method(cls, "tg_biomes_within", fn_tg_biomes_within, 5);
 	register_method(cls, "tg_config", fn_tg_config, 2);
 	register_method(cls, "tg_begin", fn_tg_begin, 3);
 	register_method(cls, "tg_carve", fn_tg_carve, 3);
 	register_method(cls, "tg_end", fn_tg_end, 1);
 	register_method(cls, "tg_surface", fn_tg_surface, 3);
 	register_method(cls, "tg_surface_grid", fn_tg_surface_grid, 3);
+	register_method(cls, "tg_column", fn_tg_column, 3);
 }

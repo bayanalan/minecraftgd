@@ -9,6 +9,7 @@
 //   st_block passed for the ice name test.
 #include "native.h"
 #include <vector>
+#include <unordered_map>
 #include <cstring>
 #include <cmath>
 #include "rng.h"
@@ -178,11 +179,62 @@ bool fn_chunk_decorate(const Args &a, void *ret) {
 	int64_t ntemps = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_FLOAT64_ARRAY, tv);
 	const int32_t *stb = i32(sbv);
 	int64_t nstb = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, sbv);
-	std::vector<int32_t> col(98304);
+	static thread_local std::vector<int32_t> tl_col;
+	TLBuf<int32_t> col_buf(tl_col, 98304, 0);
+	std::vector<int32_t> &col = col_buf.v;
 	expand(secs, col.data());
 	auto FL = [&](int st) { return (st >= 0 && st < nfl) ? fl[st] : 0; };
 	// Features.apply: write lists of the 3x3 origins in (cz, cx) order; modes 0 force, 1 replaceable, 2 air
 	int64_t nw = size_of(GDEXTENSION_VARIANT_TYPE_ARRAY, wl);
+	// cross-origin carving next to another origin's liquid is skipped (consts[9] = F_LIQUID, [10] = cave air): every
+	// origin's features ran on pristine terrain, so a lake carving air beside a neighbour's pool (Java: the lake sees the
+	// water and aborts, or the pool sees the air and is not placed) would leave the pool open on one side
+	int F_LIQ = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, cv) >= 11 ? k[9] : 0;
+	int CAVE_AIR = F_LIQ ? k[10] : -1;
+	// liquid writes over the chunk + 1-block border: 18 x 18 x HEIGHT cells, value = origin list index + 1 (255 = several;
+	// 0 = none). A thread-local flat array (a hash map here tripled the decorate time)
+	static thread_local std::vector<uint8_t> tl_liq;
+	static const int LW = 18, LA = 18 * 18;
+	bool any_liq = false;
+	auto lidx = [&](int x, int y, int z) -> int {
+		int lx = x - (x0 - 1), lz = z - (z0 - 1), ly = y - MIN_Y;
+		if (lx < 0 || lx >= LW || lz < 0 || lz >= LW || ly < 0 || ly >= HEIGHT) return -1;
+		return ly * LA + lz * LW + lx;
+	};
+	if (F_LIQ) {
+		for (int64_t li = 0; li < nw; li++) {
+			const void *wa = internal(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY)((GDExtensionVariantPtr)array_get(wl, li));
+			int64_t n = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, wa);
+			const int32_t *w = n ? i32(wa) : nullptr;
+			for (int64_t q = 0; q + 4 < n; q += 5) {
+				int x = w[q], z = w[q + 2];
+				if (x < x0 - 1 || x > x0 + 16 || z < z0 - 1 || z > z0 + 16) continue;
+				if (!(FL(w[q + 3]) & F_LIQ)) continue;
+				int ci = lidx(x, w[q + 1], z);
+				if (ci < 0) continue;
+				if (!any_liq) {
+					any_liq = true;
+					if (tl_liq.size() != (size_t)LA * HEIGHT) tl_liq.assign((size_t)LA * HEIGHT, 0);
+					else std::memset(tl_liq.data(), 0, tl_liq.size());
+				}
+				uint8_t v = tl_liq[ci];
+				uint8_t me = (uint8_t)(li + 1);
+				if (v == 0) tl_liq[ci] = me;
+				else if (v != me) tl_liq[ci] = 255;
+			}
+		}
+	}
+	auto other_liquid = [&](int x, int y, int z, int li) {
+		static const int D[7][3] = {{0, 0, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+		uint8_t me = (uint8_t)(li + 1);
+		for (int d = 0; d < 7; d++) {
+			int ci = lidx(x + D[d][0], y + D[d][1], z + D[d][2]);
+			if (ci < 0) continue;
+			uint8_t v = tl_liq[ci];
+			if (v != 0 && v != me) return true;
+		}
+		return false;
+	};
 	for (int64_t li = 0; li < nw; li++) {
 		const void *wa = internal(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY)((GDExtensionVariantPtr)array_get(wl, li));
 		int64_t n = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, wa);
@@ -192,6 +244,7 @@ bool fn_chunk_decorate(const Args &a, void *ret) {
 			int x = w[q], y = w[q + 1], z = w[q + 2], st = w[q + 3], mode = w[q + 4];
 			if (x < x0 || x >= x0 + 16 || z < z0 || z >= z0 + 16) continue;
 			if (y < MIN_Y || y >= MIN_Y + HEIGHT) continue;
+			if (any_liq && (st == 0 || st == CAVE_AIR) && other_liquid(x, y, z, (int)li)) continue;
 			int i = ((y - MIN_Y) << 8) | ((z & 15) << 4) | (x & 15);
 			if (mode != 0) {
 				int cur = col[i];

@@ -80,6 +80,19 @@ func build() -> void:
 		for i in 5:
 			add_slot(Vector2(44 + i * 18, 20), _g.bind(i), _s.bind(i), 0)
 		add_player_inventory(8, 51)
+	elif kind == "crafter":
+		# Java CrafterMenu / CrafterScreen: 3 x 3 grid at (26, 17), clicking an empty slot disables / enables it, the
+		# result preview at (134, 35) cannot be taken, the redstone indicator at (97, 35)
+		bg_tex = UiKit.sprite("gui/container/crafter")
+		bg_size = Vector2(176, 166)
+		for r in 3:
+			for c in 3:
+				var si := r * 3 + c
+				add_slot(Vector2(26 + c * 18, 17 + r * 18), _g.bind(si), _s.bind(si), 0, false, func(_st): return not Crafter.disabled(data, si))
+				slots[slots.size() - 1]["toggle"] = true
+		add_player_inventory(8, 84)
+		slot_toggle = _crafter_toggle
+		extra_draw = _draw_crafter
 	elif kind in ["dispenser", "dropper"]:
 		bg_tex = UiKit.sprite("gui/container/dispenser")
 		bg_size = Vector2(176, 166)
@@ -138,6 +151,41 @@ func _draw_furnace(o: Vector2) -> void:
 
 func on_changed() -> void:
 	_commit()
+
+
+func _crafter_toggle(si: int) -> void:
+	if si >= 9:
+		return
+	Crafter.set_disabled(data, si, not Crafter.disabled(data, si))
+	_commit()
+	Audio.play_ui("ui.button.click")
+
+
+var _cr_key := ""
+var _cr_result := ItemStack.new()
+
+
+func _draw_crafter(o: Vector2) -> void:
+	var dis := UiKit.sprite("gui/sprites/container/crafter/disabled_slot")
+	for si in 9:
+		if Crafter.disabled(data, si):
+			draw_texture_rect(dis, Rect2(o + Vector2(25 + (si % 3) * 18, 16 + (si / 3) * 18), Vector2(18, 18)), false)
+	var st: int = world.state_at(pos.x, pos.y, pos.z)
+	var powered := Res.blocks.get_prop(st, "triggered") == "true"
+	draw_texture_rect(UiKit.sprite("gui/sprites/container/crafter/powered_redstone" if powered else "gui/sprites/container/crafter/unpowered_redstone"), Rect2(o + Vector2(97, 35), Vector2(16, 16)), false)
+	var key := str(_commit_key())
+	if key != _cr_key:
+		_cr_key = key
+		_cr_result = Crafter.result(items)
+	if not _cr_result.is_empty():
+		_draw_stack(_cr_result, o + Vector2(134, 35), UiKit.font())
+
+
+func _commit_key() -> int:
+	var h := 0
+	for it in items:
+		h = hash([h, (it as ItemStack).to_dict()])
+	return h
 
 
 func _commit() -> void:

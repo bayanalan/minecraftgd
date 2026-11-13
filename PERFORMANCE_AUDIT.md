@@ -8,7 +8,7 @@ simulation distance 12, default graphics, V-Sync off, no FPS cap.
 
 | Name | Command | Measures |
 |---|---|---|
-| F (flight, default) | `Recraft2.exe -- --autoplay --gen=java_26_3 --fresh --seed=12345 --fpsbench=F` | after the world loads: 60 s creative sprint-flight (21.6 blocks/s, real controls) >= y 120 / 32 blocks above the terrain ahead, pitch 6 degrees down, through fresh terrain; FPS avg/median/1%/0.1% lows, frames > 16.7/33/50 ms, holes within rings 2/4/8, chunk waits, distance, frozen time; slow-frame attribution (main-thread parts, frame phases, uploads, mesh frees, pipeline compilations) |
+| F (flight, default) | `minecraftgd.exe -- --autoplay --gen=java_26_3 --fresh --seed=12345 --fpsbench=F` | after the world loads: 60 s creative sprint-flight (21.6 blocks/s, real controls) >= y 120 / 32 blocks above the terrain ahead, pitch 6 degrees down, through fresh terrain; FPS avg/median/1%/0.1% lows, frames > 16.7/33/50 ms, holes within rings 2/4/8, chunk waits, distance, frozen time; slow-frame attribution (main-thread parts, frame phases, uploads, mesh frees, pipeline compilations) |
 | A (static) | `--fpsbench=A` | fully loaded world, stationary, 4 fixed views: steady-state rendering cost |
 | E (loading) | `--loadtest=1` (load_test.gd) | world entry per ring, walking, flying, teleport, gen/s |
 | Function profile | `tools/profile.ps1 -A "--autoplay ... --fpsbench=F --fsecs=40"` | GDScript self/total time per function (debug build only; via the remote-debugger protocol, tools/profiler_server.gd) |
@@ -16,7 +16,7 @@ simulation distance 12, default graphics, V-Sync off, no FPS cap.
 Benchmarks run borderless fullscreen at native resolution unless `--res=WxH` is given. An on-screen readout shows
 FPS with the run's 1% and 0.1% lows. Results go to `user://perf/fps_<stamp>/summary.json`.
 
-Builds: release export `builds/windows-arm64/Recraft2.exe` (export preset "Windows ARM64"; official 4.7.2 templates),
+Builds: release export `builds/windows-arm64/minecraftgd.exe` (export preset "Windows ARM64"; official 4.7.2 templates),
 `builds/windows-x86_64/` (preset "Windows x86_64"). The editor binaries are debug builds; they are not used for the
 numbers below unless marked.
 

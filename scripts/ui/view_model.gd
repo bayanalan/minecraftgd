@@ -158,6 +158,7 @@ func _process(_d: float) -> void:
 	var light: int = world.cm.get_light(int(floor(p.pos.x)), int(floor(p.eye_pos().y)), int(floor(p.pos.z)))
 	var lv := Vector2((light >> 4) / 15.0, (light & 15) / 15.0)
 	_update_offhand(p, bob_t, lv)
+	_update_map_marker(p)
 	if held.is_empty():
 		var g := sqrt(swing)
 		var t := bob_t
@@ -278,6 +279,104 @@ func _process(_d: float) -> void:
 
 ## Offhand item: Java renderArmWithItem for the off arm: applyItemArmTransform(-0.56, -0.52, -0.72) and the model's
 ## firstperson_lefthand display (shield: item/shield or item/shield_blocking while blocking).
+## Java MapItemSavedData player decoration: position (world - centre) / 2^scale map pixels (inside +-63: the arrow, rotated
+## by (yRot +- 8) * 16 / 360; outside within 320: the off-map dot at the edge; farther: the small off-limits dot;
+## the Nether spins the arrow), drawn by MapRenderer at x / 2 + 64 on the 128 px map.
+func _update_map_marker(p: Player) -> void:
+	var dq := item_root.get_node_or_null("map_player") as MeshInstance3D
+	if dq == null:
+		return
+	_update_map_decos(int(dq.get_meta("map_id", -1)))
+	var md: Dictionary = (world.level.get("maps", {}) as Dictionary).get(str(dq.get_meta("map_id", -1)), {})
+	if md.is_empty() or str(md.get("dim", "overworld")) != world.dimension:
+		dq.visible = false
+		return
+	var sc := 1 << int(md.get("scale", 0))
+	var fx := (p.pos.x - float(md["x"])) / sc
+	var fz := (p.pos.z - float(md["z"])) / sc
+	var spr := "map/decorations/player"
+	var rot := 0
+	if fx >= -63.0 and fz >= -63.0 and fx <= 63.0 and fz <= 63.0:
+		if world.dimension == "the_nether":
+			var i := int(world.day_time / 10)
+			rot = ((i * i * 34187121 + i * 121) >> 15) & 15
+		else:
+			var yr: float = p.yaw
+			var d0 := yr - 8.0 if yr < 0.0 else yr + 8.0
+			rot = int(d0 * 16.0 / 360.0)
+	elif absf(fx) < 320.0 and absf(fz) < 320.0:
+		spr = "map/decorations/player_off_map"
+	else:
+		spr = "map/decorations/player_off_limits"
+	var bx := clampi(int(fx * 2.0 + 0.5), -128, 127)
+	var bz := clampi(int(fz * 2.0 + 0.5), -128, 127)
+	if str(dq.get_meta("spr", "")) != spr:
+		dq.set_meta("spr", spr)
+		# the hand pass replaced the quad's material by its viewmodel shader (tex) - set whichever it has
+		var dmat := dq.material_override
+		if dmat is StandardMaterial3D:
+			(dmat as StandardMaterial3D).albedo_texture = UiKit.sprite(spr)
+		elif dmat is ShaderMaterial:
+			(dmat as ShaderMaterial).set_shader_parameter("tex", UiKit.sprite(spr))
+	dq.visible = true
+	# map quad: 1 unit = 128 px, +x right, +y up on screen = map north (-z)
+	dq.position = Vector3((bx / 2.0) / 128.0, -(bz / 2.0) / 128.0, 0.003)
+	# MapRenderer draws the sprite's top towards +y of the map (south) and turns it by rot * 22.5 deg in that y-down
+	# space: here (y = north) the quad is flipped on y and turned by the negated angle
+	dq.rotation = Vector3(0.0, 0.0, -float(rot) * TAU / 16.0)
+	dq.scale = Vector3(1.0, -1.0, 1.0)
+
+
+## Banner / frame markers of the held map (Java MapRenderer: 8 x 8 map-pixel sprites at x / 2 + 64, rotated in 22.5 deg
+## steps, later decorations nearer; a banner's name under it, scaled to fit 25 px, at most 6 px tall, on a 25 %
+## black background).
+func _update_map_decos(mid: int) -> void:
+	var dn := item_root.get_node_or_null("map_decos") as Node3D
+	if dn == null or mid < 0:
+		return
+	var rv := Maps.rev(world, mid)
+	if int(dn.get_meta("rev", -1)) == rv:
+		return
+	dn.set_meta("rev", rv)
+	for ch in dn.get_children():
+		ch.queue_free()
+	var k := 0
+	for d in Maps.decorations(world, mid):
+		k += 1
+		var q := MeshInstance3D.new()
+		var qm := QuadMesh.new()
+		qm.size = Vector2.ONE * (8.0 / 128.0)
+		q.mesh = qm
+		var mm := StandardMaterial3D.new()
+		mm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mm.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+		mm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+		mm.cull_mode = BaseMaterial3D.CULL_DISABLED
+		mm.albedo_texture = UiKit.sprite(str(d[0]))
+		q.material_override = mm
+		q.position = Vector3((float(d[1]) / 2.0) / 128.0, -(float(d[2]) / 2.0) / 128.0, 0.0015 + 0.0001 * k)
+		q.rotation = Vector3(0.0, 0.0, -float(d[3]) * TAU / 16.0)
+		q.scale = Vector3(1.0, -1.0, 1.0)
+		dn.add_child(q)
+		var nm := str(d[4])
+		if nm != "":
+			# the name under the marker: scaled to 25 px wide at most, 6 px tall at most (Java f7)
+			var lt := Maps.label_texture(nm)
+			var tw := float(lt.get_width() - 1)
+			var f7 := clampf(25.0 / maxf(tw, 1.0), 0.0, 6.0 / 9.0)
+			var lq := MeshInstance3D.new()
+			var lm := QuadMesh.new()
+			lm.size = Vector2(float(lt.get_width()), float(lt.get_height())) * f7 / 128.0
+			lq.mesh = lm
+			var lmat := ShaderMaterial.new()
+			lmat.shader = load("res://shaders/map_label.gdshader")
+			lmat.set_shader_parameter("tex", lt)
+			lq.material_override = lmat
+			lq.position = Vector3((float(d[1]) / 2.0) / 128.0, -(float(d[2]) / 2.0 + 4.0 + float(lt.get_height()) * f7 / 2.0) / 128.0, 0.0025 + 0.0001 * k)
+			dn.add_child(lq)
+	_vm_pending = maxi(_vm_pending, 2)   # the new quads take the hand projection on the next conversion pass
+
+
 func _update_offhand(p: Player, bob_t: Transform3D, lv: Vector2) -> void:
 	var off := p.inventory.get_slot(Inventory.OFFHAND)
 	if off.is_empty():
@@ -399,6 +498,25 @@ func _ensure_item(s: ItemStack) -> void:
 			mm.albedo_texture = UiKit.sprite(str(layer[0])) if str(layer[0]) != "" else Maps.texture(world, mid)
 			q.material_override = mm
 			item_root.add_child(q)
+		# the holder's decoration (MapRenderer: an 8 x 8 map-pixel sprite quad over the map, rotated in 22.5 deg steps)
+		var dq := MeshInstance3D.new()
+		dq.name = "map_player"
+		var dqm := QuadMesh.new()
+		dqm.size = Vector2.ONE * (8.0 / 128.0)
+		dq.mesh = dqm
+		var dmm := StandardMaterial3D.new()
+		dmm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		dmm.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+		dmm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+		dmm.cull_mode = BaseMaterial3D.CULL_DISABLED
+		dmm.albedo_texture = UiKit.sprite("map/decorations/player")
+		dq.material_override = dmm
+		dq.set_meta("map_id", mid)
+		item_root.add_child(dq)
+		var dn := Node3D.new()
+		dn.name = "map_decos"
+		dn.set_meta("rev", -1)
+		item_root.add_child(dn)
 		return
 	# the model for this context (spears: item/<tier>_spear_in_hand; a drawn bow: item/bow_pulling_N)
 	var ref := pull if pull != "" else ItemRegistry.ctx_model(s.name(), "firstperson_righthand")

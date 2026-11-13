@@ -20,7 +20,9 @@ const SPRITES := ["flame", "soul_fire_flame", "generic_0", "generic_1", "generic
 	"cherry_0", "cherry_1", "cherry_2", "cherry_3", "cherry_4", "cherry_5", "cherry_6", "cherry_7", "cherry_8", "cherry_9", "cherry_10",
 	"cherry_11", "leaf_0", "leaf_1", "leaf_2", "leaf_3", "leaf_4", "leaf_5", "leaf_6", "leaf_7", "leaf_8", "leaf_9", "leaf_10", "leaf_11",
 	"pale_oak_0", "pale_oak_1", "pale_oak_2", "pale_oak_3", "pale_oak_4", "pale_oak_5", "pale_oak_6", "pale_oak_7", "pale_oak_8",
-	"pale_oak_9", "pale_oak_10", "pale_oak_11", "lava", "spark_0", "glow", "damage", "flash", "bubble_pop_0",
+	"pale_oak_9", "pale_oak_10", "pale_oak_11", "orange_poplar_1", "orange_poplar_2", "orange_poplar_3", "orange_poplar_4",
+	"red_poplar_1", "red_poplar_2", "red_poplar_3", "red_poplar_4", "yellow_poplar_1", "yellow_poplar_2", "yellow_poplar_3",
+	"yellow_poplar_4", "lava", "spark_0", "glow", "damage", "flash", "bubble_pop_0",
 	"sweep_0", "sweep_1", "sweep_2", "sweep_3", "sweep_4", "sweep_5", "sweep_6", "sweep_7",
 	"spark_1", "spark_2", "spark_3", "spark_4", "spark_5", "spark_6", "spark_7",
 	"glitter_0", "glitter_1", "glitter_2", "glitter_3", "glitter_4", "glitter_5", "glitter_6", "glitter_7"]
@@ -223,6 +225,15 @@ func _add(kind: String, pos: Vector3, vel: Vector3, color: Color) -> void:
 			var g := rng.randf() * 0.3
 			color = Color(g, g, g) if color == Color.WHITE else color
 			vel += Vector3(0, 0.004, 0)
+		"poof":
+			# Java ExplodeParticle (POOF): rises (gravity -0.1), friction 0.9, grey 0.7..1, size 0.1 x (1 + 6 r r)
+			life = int(16.0 / (rng.randf() * 0.8 + 0.2)) + 2
+			size = 0.1 * (rng.randf() * rng.randf() * 6.0 + 1.0)
+			var pg := rng.randf() * 0.3 + 0.7
+			color = Color(pg, pg, pg)
+			vel += Vector3(rng.randf_range(-1.0, 1.0), rng.randf_range(-1.0, 1.0), rng.randf_range(-1.0, 1.0)) * 0.05
+			grav = -0.004
+			fric = 0.9
 		"campfire_smoke":
 			life = rng.randi_range(80, 140)
 			size = 0.3 * (rng.randf() * 0.5 + 0.5)
@@ -311,7 +322,7 @@ func _add(kind: String, pos: Vector3, vel: Vector3, color: Color) -> void:
 			size = 0.1
 			vel += Vector3(0, 0.03, 0)
 			fric = 0.96
-		"cherry_leaves", "tinted_leaves", "pale_oak_leaves", "falling_leaf":
+		"cherry_leaves", "tinted_leaves", "pale_oak_leaves", "falling_leaf", "orange_poplar_leaves", "red_poplar_leaves", "yellow_poplar_leaves":
 			# Java FallingLeavesParticle(fallAcceleration, sideAcceleration, swirl, flowAway, scale, startVelocity):
 			# cherry (0.25, 2, false, true, 1, 0), tinted / pale oak (0.07, 10, true, false, 2, 0.021); one random sprite
 			var cherry := kind == "cherry_leaves"
@@ -325,7 +336,11 @@ func _add(kind: String, pos: Vector3, vel: Vector3, color: Color) -> void:
 			var spin := deg_to_rad(-5.0 if rng.randi() & 1 else 5.0)
 			size = (1.0 if cherry else 2.0) * (0.05 if rng.randi() & 1 else 0.075)
 			var a60 := deg_to_rad(pr * 60.0)
-			var spr := ("cherry_%d" if cherry else ("pale_oak_%d" if kind == "pale_oak_leaves" else "leaf_%d")) % rng.randi_range(0, 11)
+			var spr: String
+			if kind.ends_with("_poplar_leaves"):
+				spr = kind.trim_suffix("_leaves") + "_%d" % rng.randi_range(1, 4)   # particles/<colour>_poplar_leaves.json: 4 sprites
+			else:
+				spr = ("cherry_%d" if cherry else ("pale_oak_%d" if kind == "pale_oak_leaves" else "leaf_%d")) % rng.randi_range(0, 11)
 			# [roll, previous roll, spin speed, spin acceleration, flow x, flow z, side acceleration, swirl, flow away,
 			#  swirl period, sprite]
 			var lf := [0.0, 0.0, rot_speed, spin, cos(a60) * side, sin(a60) * side, side, not cherry, cherry, deg_to_rad(1000.0 + pr * 3000.0), spr]
@@ -353,6 +368,8 @@ func _sprite(kind: String, age: int, life: int) -> String:
 			return kind
 		"smoke", "large_smoke", "dust", "portal":
 			return "generic_%d" % (7 - int(t * 8.0))
+		"poof":
+			return "generic_%d" % mini(7, int(t * 8.0))
 		"campfire_smoke":
 			return "big_smoke_%d" % int(t * 12.0)
 		"explosion":
@@ -577,6 +594,9 @@ func _animate_blocks() -> void:
 
 ## One doAnimateTick hit: the block's ambient particles (torches, campfires, furnaces, portals, ...).
 func _anim_emit(b: BlockRegistry, x: int, y: int, z: int, st: int) -> void:
+	if (b.st_flags[st] & BlockRegistry.F_LEAVES) != 0:
+		_leaf_emit(b, x, y, z, st)   # most hits are leaves: roll their chance before any name work
+		return
 	var nm := b.name_of(st)
 	var q := Vector3(x + 0.5, y, z + 0.5)
 	if nm == "torch" or nm == "soul_torch":
@@ -606,26 +626,39 @@ func _anim_emit(b: BlockRegistry, x: int, y: int, z: int, st: int) -> void:
 		_add("dust", Vector3(x + rng.randf(), y + 0.06, z + rng.randf()), Vector3.ZERO, Color(0.3 + int(b.get_prop(st, "power")) / 15.0 * 0.7, 0, 0))
 	elif nm == "lava" and world.state_at(x, y + 1, z) == 0 and rng.randf() < 0.01:
 		_add("lava", Vector3(x + rng.randf(), y + 1.0, z + rng.randf()), Vector3.ZERO, Color.WHITE)
-	elif (b.st_flags[st] & BlockRegistry.F_LEAVES) != 0:
-		# Java LeavesBlock.spawnFallingLeavesParticle: leafParticleChance (cherry 0.1, pale oak 0.02, tinted 0.01), only
-		# above a block whose collision top face is not full; tinted leaves take the block colour at the position
-		if nm.contains("azalea"):
-			return
-		var chance := 0.1 if nm == "cherry_leaves" else (0.02 if nm == "pale_oak_leaves" else 0.01)
-		if rng.randf() >= chance:
-			return
-		var below: int = world.state_at(x, y - 1, z)
-		if below > 0 and (b.st_flags[below] & BlockRegistry.F_FULL_SHAPE) != 0:
-			return
-		var lp := Vector3(x + rng.randf(), y - 0.05, z + rng.randf())
-		if nm == "cherry_leaves" or nm == "pale_oak_leaves":
-			_add(nm, lp, Vector3.ZERO, Color.WHITE)
-		else:
-			_add("tinted_leaves", lp, Vector3.ZERO, _tint_at(st, Vector3i(x, y, z)))
 	elif (nm == "fire" or nm == "soul_fire") and rng.randf() < 0.3:
 		_add("large_smoke", Vector3(x + rng.randf(), y + rng.randf() * 0.5 + 0.5, z + rng.randf()), Vector3.ZERO, Color.WHITE)
 	elif nm.ends_with("candle") and b.get_prop(st, "lit") == "true" and rng.randf() < 0.3:
 		_add("flame", q + Vector3(0, 0.55, 0), Vector3.ZERO, Color.WHITE)
+
+
+## Java LeavesBlock.spawnFallingLeavesParticle: leafParticleChance (cherry 0.1, pale oak 0.02, tinted 0.01), only
+## above a block whose collision top face is not full; tinted leaves take the block colour at the position.
+## _leaf_kind per state: 0 no particles (azalea), 1 tinted, 2 cherry, 3 pale oak, 4-6 orange / red / yellow poplar
+## (26.3 poplar leaves: chance and motion not in the data, ESTIMATED as pale oak).
+var _leaf_kind := PackedByteArray()
+const LEAF_CHANCE := [0.0, 0.01, 0.1, 0.02, 0.02, 0.02, 0.02]
+const LEAF_KINDS := ["", "tinted_leaves", "cherry_leaves", "pale_oak_leaves", "orange_poplar_leaves", "red_poplar_leaves", "yellow_poplar_leaves"]
+func _leaf_emit(b: BlockRegistry, x: int, y: int, z: int, st: int) -> void:
+	if _leaf_kind.size() != b.total_states:
+		_leaf_kind.resize(b.total_states)
+		for s0 in b.total_states:
+			if (b.st_flags[s0] & BlockRegistry.F_LEAVES) == 0:
+				continue
+			var n0 := b.name_of(s0)
+			var lk := LEAF_KINDS.find(n0)
+			_leaf_kind[s0] = 0 if n0.contains("azalea") else (lk if lk >= 2 else 1)
+	var k := _leaf_kind[st]
+	if k == 0 or rng.randf() >= LEAF_CHANCE[k]:
+		return
+	var below: int = world.state_at(x, y - 1, z)
+	if below > 0 and (b.st_flags[below] & BlockRegistry.F_FULL_SHAPE) != 0:
+		return
+	var lp := Vector3(x + rng.randf(), y - 0.05, z + rng.randf())
+	if k >= 2:
+		_add(LEAF_KINDS[k], lp, Vector3.ZERO, Color.WHITE)
+	else:
+		_add("tinted_leaves", lp, Vector3.ZERO, _tint_at(st, Vector3i(x, y, z)))
 
 
 var _anim_seed := 0x2545F491

@@ -87,6 +87,22 @@ func _init(p_world) -> void:
 		planar = str(p_world.autoplay["trplanar"]) == "1"
 	for m in 3:
 		shaders[m] = _compile(m)
+	_preallocate()
+
+
+## Vertex pages for the render distance, created and cleared while the world loads: a page created mid-flight (a
+## 64 MB buffer committed and zeroed by the driver on first use) stalled the GPU for 8-22 ms over ~0.3 s (the worst
+## stutter of the flight benchmark, every ~3-4 s while new terrain streamed in). ~5,500 quads per chunk measured at
+## RD16 (5.2 M quads for ~1,000 chunks); capped at 10 pages (640 MB); page 0 is the translucent page; more pages are
+## still added on demand.
+func _preallocate() -> void:
+	var rdist := int(Settings.get_v("render_distance")) if Settings.values.has("render_distance") else 12
+	var chunks := (2 * rdist + 1) * (2 * rdist + 1)
+	var need := clampi(ceili(float(chunks) * 5500.0 / float(PAGE_QUADS)) + 1, 2, 10)
+	# (no buffer_clear: D3D12 clears need a storage / UAV buffer; on these vertex buffers it removed the device)
+	for i in need:
+		_new_page()
+	trans_page = 0
 
 
 ## The two effects (WorldManager._install_compositor orders them with SkyRD's).

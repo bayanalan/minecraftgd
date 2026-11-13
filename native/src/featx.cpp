@@ -7,6 +7,7 @@
 #include "native.h"
 #include "rng.h"
 #include <vector>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -277,6 +278,7 @@ struct Fx {
 			case 7: return below > 0 && (flags(below) & c.F_FULL_SHAPE);
 			case 8: return below > 0 && (flags(below) & c.F_LIQUID);
 			case 9: return below > 0 && (flags(below) & c.F_FULL_SHAPE) && !(bb & 64);
+			case 10: return (bb & 128) != 0;   // nether roots / sprouts / fungi: #nylium, soul soil, #dirt, farmland
 		}
 		return true;
 	}
@@ -428,8 +430,44 @@ struct Fx {
 				for (int k = 0; k < (n3 > 0 ? n3 : 0); k++) chain(pf, i + 1, x, y, z);
 				return;
 			}
+			case 16: {
+				// count_on_every_layer (Features._chain / _layer_y): the count provider is sampled on every loop check
+				std::vector<int> found;
+				int layer = 0;
+				bool more = true;
+				while (more) {
+					more = false;
+					int64_t jn = 0;
+					while (jn < ip(m[1])) {
+						int x2 = x + (int)r.next_int_bound(16);
+						int z2 = z + (int)r.next_int_bound(16);
+						int top = height(m[2], x2, z2);
+						int y2 = layer_y(x2, top, z2, layer, m[3]);
+						if (y2 != INT32_MAX) { found.push_back(x2); found.push_back(y2); found.push_back(z2); more = true; }
+						jn++;
+					}
+					layer++;
+				}
+				for (size_t q = 0; q + 2 < found.size(); q += 3) chain(pf, i + 1, found[q], found[q + 1], found[q + 2]);
+				return;
+			}
 			default: chain(pf, i + 1, x, y, z); return;
 		}
+	}
+	int layer_y(int x, int y, int z, int target, int bed) {
+		int nn = 0;
+		int prev = get(x, y, z);
+		for (int j = y; j >= c.gen_min_y + 1; j--) {
+			int cur = get(x, j - 1, z);
+			bool ce = cur <= 0 || (flags(cur) & c.F_LIQUID);
+			bool pe = prev <= 0 || (flags(prev) & c.F_LIQUID);
+			if (!ce && pe && c.stblock[cur] != bed) {
+				if (nn == target) return j;
+				nn++;
+			}
+			prev = cur;
+		}
+		return INT32_MAX;
 	}
 
 	// ---------------------------------------------------------------- configured features (Features.place_feature)
@@ -517,6 +555,14 @@ struct Fx {
 			case 22: return mushroom(n, x, y, z);
 			case 23: return fallen(n, x, y, z);
 			case 24: return cluster(n, x, y, z);
+			case 25: return replace_blobs(n, x, y, z);
+			case 26: return delta(n, x, y, z);
+			case 27: return columns(n, x, y, z);
+			case 28: return pillar(n, x, y, z);
+			case 29: return patchy(n, x, y, z);
+			case 30: return neighbor_spread(n, x, y, z);
+			case 31: return fungus(n, x, y, z);
+			case 32: return sculk_patch(n, x, y, z);
 			case 13: {
 				for (int k2 = 0; k2 < 12; k2++) {
 					int qx = x + (int)r.next_int_bound(5) - 2;
@@ -1608,6 +1654,551 @@ struct Fx {
 		}
 		return true;
 	}
+	// ---------------------------------------------------------------- Nether (FeaturesExt, same RNG order)
+	// 26.3 Nether feature types; in GDScript they cost ~200 ms per basalt-delta chunk (seconds per chunk while loading).
+	bool is_air(int st) const { return st == 0 || (st > 0 && (flags(st) & 1)); }
+	bool is_blk(int st, int bid) const { return st >= 0 && c.stblock[st] == bid; }
+	static constexpr int D6[6][3] = {{0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}};
+	// netherrack_replace_blobs: [25, target block, state, radius ip]
+	bool replace_blobs(const int32_t *n, int x, int y, int z) {
+		int lo = c.gen_min_y + 1, hi = c.gen_min_y + c.gen_depth - 1;
+		int py = y < lo ? lo : (y > hi ? hi : y);
+		bool found = false;
+		while (py > c.gen_min_y + 1) {
+			if (is_blk(get(x, py, z), n[1])) { found = true; break; }
+			py--;
+		}
+		if (!found) return false;
+		int64_t i = ip(n[3]), j = ip(n[3]), k = ip(n[3]);
+		int64_t l = std::max(i, std::max(j, k));
+		bool any = false;
+		for (int64_t dx = -i; dx <= i; dx++)
+			for (int64_t dy = -j; dy <= j; dy++)
+				for (int64_t dz = -k; dz <= k; dz++) {
+					if (std::llabs(dx) + std::llabs(dy) + std::llabs(dz) > l) continue;
+					int qx = x + (int)dx, qy = py + (int)dy, qz = z + (int)dz;
+					if (is_blk(get(qx, qy, qz), n[1])) { set(qx, qy, qz, n[2], W_FORCE); any = true; }
+				}
+		return any;
+	}
+	// delta_feature: [26, contents, rim, size ip, rim_size ip, contents block, n bad, bad block ids...]
+	bool delta_clear(const int32_t *n, int x, int y, int z) {
+		int s = get(x, y, z);
+		if (s < 0) return false;
+		int b = c.stblock[s];
+		if (b == n[5]) return false;
+		for (int k = 0; k < n[6]; k++) if (n[7 + k] == b) return false;
+		for (int d = 0; d < 6; d++) {
+			bool air = is_air(get(x + D6[d][0], y + D6[d][1], z + D6[d][2]));
+			if ((air && d != 1) || (!air && d == 1)) return false;
+		}
+		return true;
+	}
+	bool delta(const int32_t *n, int x, int y, int z) {
+		bool any = false;
+		bool big = r.next_double() < 0.9;
+		int64_t i = big ? ip(n[4]) : 0;
+		int64_t j = big ? ip(n[4]) : 0;
+		bool rim = big && i != 0 && j != 0;
+		int64_t k = ip(n[3]), l = ip(n[3]);
+		int64_t m = std::max(k, l);
+		// BlockPos.withinManhattan(o, k, 0, l) in Features_ext.within_manhattan order; stops beyond distance m
+		for (int64_t depth = 0; depth <= k + l && depth <= m; depth++) {
+			int64_t mx = std::min(k, depth);
+			for (int64_t ax = -mx; ax <= mx; ax++) {
+				int64_t mm = depth - std::llabs(ax);
+				if (mm > l) continue;
+				for (int sg = 0; sg < (mm != 0 ? 2 : 1); sg++) {
+					int px = x + (int)ax, py = y, pz = z + (int)(sg == 0 ? mm : -mm);
+					if (delta_clear(n, px, py, pz)) {
+						if (rim) { any = true; set(px, py, pz, n[2], W_FORCE); }
+						int qx = px + (int)i, qz = pz + (int)j;
+						if (delta_clear(n, qx, py, qz)) { any = true; set(qx, py, qz, n[1], W_FORCE); }
+					}
+				}
+			}
+		}
+		return any;
+	}
+	// stepped_column_cluster: [27, block pv, can_replace pr, continue pr, cluster_reach, column_count, column_reach ip,
+	//   height ip, n cannot, cannot block ids...]
+	bool col_cannot(const int32_t *n, int st) const {
+		if (st < 0) return false;
+		int b = c.stblock[st];
+		for (int k = 0; k < n[8]; k++) if (n[9 + k] == b) return true;
+		return false;
+	}
+	bool col_can_place(const int32_t *n, int x, int y, int z) {
+		if (!test(n[2], x, y, z)) return false;
+		int below = get(x, y - 1, z);
+		return below > 0 && !is_air(below) && !col_cannot(n, below);
+	}
+	bool col_place(const int32_t *n, int px, int py, int pz, int64_t distance, int64_t reach) {
+		bool any = false;
+		for (int64_t dz = -reach; dz <= reach; dz++)
+			for (int64_t dx = -reach; dx <= reach; dx++) {
+				int x = px + (int)dx, z = pz + (int)dz;
+				int64_t i = std::llabs(dx) + std::llabs(dz);
+				bool have = false;
+				int qy = 0;
+				if (test(n[2], x, py, z)) {
+					int sy = py;
+					int64_t nn = i;
+					while (sy > c.gen_min_y + 1 && nn > 0) {
+						nn--;
+						if (col_can_place(n, x, sy, z)) { have = true; qy = sy; break; }
+						sy--;
+					}
+				} else {
+					int sy = py;
+					int64_t nn = i;
+					while (sy < c.gen_min_y + c.gen_depth && nn > 0) {
+						nn--;
+						int st = get(x, sy, z);
+						if (col_cannot(n, st)) break;
+						if (is_air(st)) { have = true; qy = sy; break; }
+						sy++;
+					}
+				}
+				if (!have) continue;
+				int64_t hgt = distance - i / 2;
+				int my = qy;
+				while (hgt >= 0) {
+					if (test(n[2], x, my, z)) {
+						int st = provide(n[1], x, my, z);
+						if (st >= 0) set(x, my, z, st, W_FORCE);
+						my++;
+						any = true;
+					} else if (test(n[3], x, my, z)) {
+						my++;
+					} else break;
+					hgt--;
+				}
+			}
+		return any;
+	}
+	bool columns(const int32_t *n, int x, int y, int z) {
+		if (!col_can_place(n, x, y, z)) return false;
+		int64_t j = ip(n[7]);
+		int64_t k = std::min(j, (int64_t)n[4]);
+		bool any = false;
+		for (int cnt = 0; cnt < n[5]; cnt++) {
+			int64_t px = x - k + r.next_int_bound(2 * k + 1);
+			r.next_int_bound(1);
+			int64_t pz = z - k + r.next_int_bound(2 * k + 1);
+			int64_t m = j - (std::llabs(px - x) + std::llabs(pz - z));
+			if (m >= 0 && col_place(n, (int)px, y, (int)pz, m, ip(n[6]))) any = true;
+		}
+		return any;
+	}
+	// single_block_pillar: [28, block pv, can_replace pr, dir -1 / 1, chance (F), cap pf or -1]
+	bool pillar(const int32_t *n, int x, int y, int z) {
+		double chance = F[n[4]];
+		int py = y, last = y;
+		bool placed = false;
+		while (py >= c.gen_min_y && py < c.gen_min_y + c.gen_depth && test(n[2], x, py, z)) {
+			int st = provide(n[1], x, py, z);
+			if (st >= 0) set(x, py, z, st, W_FORCE);
+			placed = true;
+			last = py;
+			py += n[3];
+			if (chance < 1.0 && r.next_float() >= chance) break;
+		}
+		if (placed && n[5] >= 0) sub(n[5], x, last, z);
+		return placed;
+	}
+	// projected_random_patchy_square: [29, block pv, size, max projection, through pr]
+	bool patchy(const int32_t *n, int x, int y, int z) {
+		int sz = n[2];
+		bool any = false;
+		for (int i = -sz; i <= sz; i++)
+			for (int j = -sz; j <= sz; j++) {
+				int k = std::abs(i) * std::abs(j);
+				if (r.next_int_bound(10) >= 10 - k) continue;
+				int qx = x + i, qy = y, qz = z + j, h = 0;
+				while (h < n[3] && test(n[4], qx, qy - 1, qz)) { qy--; h++; }
+				if (!test(n[4], qx, qy, qz)) continue;
+				int st = provide(n[1], qx, qy, qz);
+				if (st > 0) { set(qx, qy, qz, st, W_FORCE); any = true; }
+			}
+		return any;
+	}
+	// random_neighbor_spread: [30, block pv, can_replace pr, attempts, xz ip, y ip, n accepted, accepted block ids...]
+	bool neighbor_spread(const int32_t *n, int x, int y, int z) {
+		if (!test(n[2], x, y, z)) return false;
+		int st = provide(n[1], x, y, z);
+		if (st >= 0) set(x, y, z, st, W_FORCE);
+		for (int a = 0; a < n[3]; a++) {
+			int px = x + (int)ip(n[4]);
+			int py = y + (int)ip(n[5]);
+			int pz = z + (int)ip(n[4]);
+			if (!test(n[2], px, py, pz)) continue;
+			int cnt = 0;
+			for (int d = 0; d < 6; d++) {
+				int s = get(px + D6[d][0], py + D6[d][1], pz + D6[d][2]);
+				if (s > 0) {
+					int b = c.stblock[s];
+					bool acc = false;
+					for (int q = 0; q < n[6]; q++) if (n[7 + q] == b) { acc = true; break; }
+					if (acc && ++cnt > 1) break;
+				}
+			}
+			if (cnt == 1) {
+				int s2 = provide(n[1], px, py, pz);
+				if (s2 >= 0) set(px, py, pz, s2, W_FORCE);
+			}
+		}
+		return true;
+	}
+	// huge_fungus: [31, stem, hat, decor, base block, replace pr, planted, hat is wart, vine plant, vine tip age 23, 24, 25]
+	bool fung_repl(const int32_t *n, int x, int y, int z, bool check) {
+		int s = get(x, y, z);
+		if (s == 0 || (s > 0 && (flags(s) & c.F_REPLACEABLE))) return true;
+		return check && test(n[5], x, y, z);
+	}
+	void weeping(const int32_t *n, int x, int y, int z) {
+		int my = y - 1;
+		if (!is_air(get(x, my, z))) return;
+		int64_t nn = mth(1, 5);
+		if (r.next_int_bound(7) == 0) nn *= 2;
+		for (int64_t i = 0; i <= nn; i++) {
+			if (is_air(get(x, my, z))) {
+				if (i == nn || !is_air(get(x, my - 1, z))) {
+					int64_t age = mth(23, 25);
+					set(x, my, z, n[9 + (int)(age - 23)], W_FORCE);
+					break;
+				}
+				set(x, my, z, n[8], W_FORCE);
+			}
+			my--;
+		}
+	}
+	void hat_block(const int32_t *n, int x, int y, int z, double decor, double hat, double vine) {
+		if (r.next_float() < decor) set(x, y, z, n[3], W_FORCE);
+		else if (r.next_float() < hat) {
+			set(x, y, z, n[2], W_FORCE);
+			if (r.next_float() < vine) weeping(n, x, y, z);
+		}
+	}
+	bool fungus(const int32_t *n, int x, int y, int z) {
+		if (!is_blk(get(x, y - 1, z), n[4])) return false;
+		int64_t h = mth(4, 13);
+		if (r.next_int_bound(12) == 0) h *= 2;
+		bool planted = n[6] != 0;
+		if (!planted && y + h + 1 >= c.gen_depth) return false;
+		bool huge = !planted && r.next_float() < 0.06;
+		set(x, y, z, 0, W_FORCE);
+		int si = huge ? 1 : 0;
+		for (int j = -si; j <= si; j++)
+			for (int k = -si; k <= si; k++) {
+				bool corner = huge && std::abs(j) == si && std::abs(k) == si;
+				for (int64_t l = 0; l < h; l++) {
+					int my = y + (int)l;
+					if (fung_repl(n, x + j, my, z + k, true)) {
+						if (corner) { if (r.next_float() < 0.1) set(x + j, my, z + k, n[1], W_FORCE); }
+						else set(x + j, my, z + k, n[1], W_FORCE);
+					}
+				}
+			}
+		bool wart = n[7] != 0;
+		int64_t i = std::min((int64_t)r.next_int_bound(1 + h / 3) + 5, h);
+		int64_t j0 = h - i;
+		int hat_b = c.stblock[n[2]];
+		for (int64_t k2 = j0; k2 <= h; k2++) {
+			int64_t lr = k2 < h - r.next_int_bound(3) ? 2 : 1;
+			if (i > 8 && k2 < j0 + 4) lr = 3;
+			if (huge) lr++;
+			for (int64_t nn = -lr; nn <= lr; nn++)
+				for (int64_t o2 = -lr; o2 <= lr; o2++) {
+					bool e1 = nn == -lr || nn == lr, e2 = o2 == -lr || o2 == lr;
+					bool inner = !e1 && !e2 && k2 != h;
+					bool corner2 = e1 && e2;
+					bool low = k2 < j0 + 3;
+					int mx = x + (int)nn, my = y + (int)k2, mz = z + (int)o2;
+					if (!fung_repl(n, mx, my, mz, false)) continue;
+					if (low) {
+						if (!inner) {
+							int bs = get(mx, my - 1, mz);
+							if (bs > 0 && c.stblock[bs] == hat_b) set(mx, my, mz, n[2], W_FORCE);
+							else if (r.next_float() < 0.15) {
+								set(mx, my, mz, n[2], W_FORCE);
+								if (wart && r.next_int_bound(11) == 0) weeping(n, mx, my, mz);
+							}
+						}
+					} else if (inner) hat_block(n, mx, my, mz, 0.1, 0.2, wart ? 0.1 : 0.0);
+					else if (corner2) hat_block(n, mx, my, mz, 0.01, 0.7, wart ? 0.083 : 0.0);
+					else hat_block(n, mx, my, mz, 0.0005, 0.98, wart ? 0.07 : 0.0);
+				}
+		}
+		return true;
+	}
+
+	// ---------------------------------------------------------------- sculk_patch (Java SculkPatchFeature with the
+	// world-gen SculkSpreader: replaceable #sculk_replaceable_world_gen, growth cost 50, no-growth radius 1, charge
+	// decay 1 in 5, additional decay 1 in 10; cursors merge never, die 15 blocks out; sculk / sculk vein behaviours,
+	// MultifaceSpreader for veins). Directions: 0 down, 1 up, 2 north, 3 south, 4 west, 5 east (Direction.values()).
+	enum { SK_CC = 1, SK_AMT, SK_ATT, SK_GROW, SK_SPREAD, SK_RARE, SK_S_SCULK, SK_S_SENSOR, SK_S_SENSOR_WL, SK_S_SHRIEK,
+		SK_S_SHRIEK_WL, SK_S_WATER, SK_B_SCULK, SK_B_VEIN, SK_B_CATALYST, SK_B_PISTON, SK_B_WATER, SK_B_SENSOR, SK_B_SHRIEK,
+		SK_B_FIRE, SK_B_SOUL_FIRE, SK_VEIN_FIRST, SK_LOCAL, SK_STATE = SK_LOCAL + 128, SK_NREPL = SK_STATE + 128, SK_REPL };
+	struct SkC { int x, y, z, charge, upd, decay, faces; };   // faces -1 = none known (Java null)
+	const int32_t *sk = nullptr;
+	int skd(int d, int a) const {
+		static const int D[6][3] = {{0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}};
+		return D[d][a];
+	}
+	int sk_at(int x, int y, int z, int d) const { return get(x + skd(d, 0), y + skd(d, 1), z + skd(d, 2)); }
+	bool sk_sturdy(int st) const { int f = flags(st); return st > 0 && (f & c.F_FULL_SHAPE) && (f & c.F_COLLIDE); }
+	bool sk_is_vein(int st) const { return st > 0 && bid(st) == sk[SK_B_VEIN]; }
+	int sk_code(int st) const { return sk_is_vein(st) ? sk[SK_LOCAL + (st - sk[SK_VEIN_FIRST])] : 0; }
+	bool sk_has(int st, int d) const { return (sk_code(st) >> d) & 1; }
+	int sk_beh(int st) const {   // 0 default, 1 sculk, 2 sculk vein
+		if (st <= 0) return 0;
+		int b = bid(st);
+		return b == sk[SK_B_SCULK] ? 1 : (b == sk[SK_B_VEIN] ? 2 : 0);
+	}
+	bool sk_repl(int st) const {
+		if (st <= 0) return false;
+		int b = bid(st);
+		return std::binary_search(sk + SK_REPL, sk + SK_REPL + sk[SK_NREPL], b);
+	}
+	bool sk_fluid(int st) const { return st > 0 && (flags(st) & (c.F_LIQUID | c.F_WATERLOGGED)); }
+	// MultifaceBlock.isValidStateForPlacement: no such face yet, and the block behind that face can hold it
+	bool sk_valid(int st, int x, int y, int z, int d) const { return (!sk_is_vein(st) || !sk_has(st, d)) && sk_sturdy(sk_at(x, y, z, d)); }
+	// SculkVeinSpreaderConfig.stateCanBeReplaced
+	bool sk_can_replace(int px, int py, int pz, int sx, int sy, int sz, int d, int st) const {
+		int b2 = bid(sk_at(sx, sy, sz, d));
+		if (b2 == sk[SK_B_SCULK] || b2 == sk[SK_B_CATALYST] || b2 == sk[SK_B_PISTON]) return false;
+		if (std::abs(px - sx) + std::abs(py - sy) + std::abs(pz - sz) == 2 && sk_sturdy(sk_at(px, py, pz, d ^ 1))) return false;
+		if (st > 0 && (flags(st) & c.F_LIQUID) && bid(st) != sk[SK_B_WATER]) return false;
+		int b = bid(st);
+		if (st > 0 && (b == sk[SK_B_FIRE] || b == sk[SK_B_SOUL_FIRE])) return false;
+		return st == 0 || (flags(st) & c.F_REPLACEABLE) || sk_is_vein(st) || st == sk[SK_S_WATER];
+	}
+	// MultifaceSpreader.spreadFromFaceTowardDirection; types: 0 same position, 1 same plane, 2 wrap around
+	bool sk_spread_one(int st, int x, int y, int z, int sd, int face, int ntypes, const int *types) {
+		if ((face >> 1) == (sd >> 1)) return false;
+		if (!(!sk_is_vein(st) || (sk_has(st, sd) && !sk_has(st, face)))) return false;
+		for (int t = 0; t < ntypes; t++) {
+			int qx = x, qy = y, qz = z, qd = face;
+			if (types[t] == 1) { qx += skd(face, 0); qy += skd(face, 1); qz += skd(face, 2); qd = sd; }
+			else if (types[t] == 2) {
+				qx += skd(face, 0) + skd(sd, 0); qy += skd(face, 1) + skd(sd, 1); qz += skd(face, 2) + skd(sd, 2);
+				qd = face ^ 1;
+			}
+			int cur = get(qx, qy, qz);
+			if (sk_can_replace(x, y, z, qx, qy, qz, qd, cur) && sk_valid(cur, qx, qy, qz, qd)) {
+				int base = sk_is_vein(cur) ? sk_code(cur) : (cur == sk[SK_S_WATER] ? 64 : 0);
+				set(qx, qy, qz, sk[SK_STATE + (base | (1 << qd))], W_FORCE);
+				return true;
+			}
+		}
+		return false;
+	}
+	int sk_spread_all(int st, int x, int y, int z, bool same_only) {
+		static const int ALL[3] = {0, 1, 2}, SAME[1] = {0};
+		int n = 0;
+		bool other = !sk_is_vein(st);
+		for (int sd = 0; sd < 6; sd++) {
+			if (!(other || sk_has(st, sd))) continue;
+			for (int face = 0; face < 6; face++)
+				if (sk_spread_one(st, x, y, z, sd, face, same_only ? 1 : 3, same_only ? SAME : ALL)) n++;
+		}
+		return n;
+	}
+	// SculkVeinBlock.regrow
+	bool sk_regrow(int x, int y, int z, int st, int faces) {
+		int code = 0;
+		for (int d = 0; d < 6; d++)
+			if (((faces >> d) & 1) && sk_sturdy(sk_at(x, y, z, d))) code |= 1 << d;
+		if (code == 0) return false;
+		if (sk_fluid(st)) code |= 64;
+		set(x, y, z, sk[SK_STATE + code], W_FORCE);
+		return true;
+	}
+	bool sk_spread_vein(int beh, int x, int y, int z, int st, int faces) {
+		if (beh == 0) {
+			if (faces < 0) return sk_spread_all(get(x, y, z), x, y, z, true) > 0;
+			if (faces != 0) return (st == 0 || sk_fluid(st)) && sk_regrow(x, y, z, st, faces);
+		}
+		return sk_spread_all(st, x, y, z, false) > 0;
+	}
+	// SculkVeinBlock.onDischarged: faces against sculk drop off; no face left -> air / water
+	void sk_discharged(int beh, int st, int x, int y, int z) {
+		if (beh != 2 || !sk_is_vein(st)) return;
+		int code = sk_code(st);
+		for (int d = 0; d < 6; d++)
+			if (((code >> d) & 1) && bid(sk_at(x, y, z, d)) == sk[SK_B_SCULK]) code &= ~(1 << d);
+		set(x, y, z, (code & 63) == 0 ? ((code & 64) ? sk[SK_S_WATER] : 0) : sk[SK_STATE + code], W_FORCE);
+	}
+	bool sk_place_sculk(int x, int y, int z) {
+		int st = get(x, y, z);
+		int ord[6] = {0, 1, 2, 3, 4, 5};
+		for (int k = 6; k > 1; k--) { int j = (int)r.next_int_bound(k); std::swap(ord[k - 1], ord[j]); }
+		for (int k = 0; k < 6; k++) {
+			int d = ord[k];
+			if (!sk_has(st, d)) continue;
+			int bx = x + skd(d, 0), by = y + skd(d, 1), bz = z + skd(d, 2);
+			if (!sk_repl(get(bx, by, bz))) continue;
+			set(bx, by, bz, sk[SK_S_SCULK], W_FORCE);
+			sk_spread_all(sk[SK_S_SCULK], bx, by, bz, false);
+			for (int d2 = 0; d2 < 6; d2++) {
+				if (d2 == (d ^ 1)) continue;
+				int qx = bx + skd(d2, 0), qy = by + skd(d2, 1), qz = bz + skd(d2, 2);
+				int s2 = get(qx, qy, qz);
+				if (sk_is_vein(s2)) sk_discharged(2, s2, qx, qy, qz);
+			}
+			return true;
+		}
+		return false;
+	}
+	bool sk_can_growth(int x, int y, int z) const {
+		int a = get(x, y + 1, z);
+		if (!(a == 0 || (a > 0 && bid(a) == sk[SK_B_WATER]))) return false;
+		int n = 0;
+		for (int qy = y; qy <= y + 2; qy++)
+			for (int qz = z - 4; qz <= z + 4; qz++)
+				for (int qx = x - 4; qx <= x + 4; qx++) {
+					int b = bid(get(qx, qy, qz));
+					if (b == sk[SK_B_SENSOR] || b == sk[SK_B_SHRIEK]) n++;
+					if (n > 2) return false;
+				}
+		return true;
+	}
+	int sk_use_charge(int beh, SkC &cu, int ox, int oy, int oz, bool convert) {
+		int i = cu.charge;
+		if (beh == 0) return cu.decay > 0 ? i : 0;
+		if (beh == 2) {
+			if (convert && sk_place_sculk(cu.x, cu.y, cu.z)) return i - 1;
+			return r.next_int_bound(5) == 0 ? (int)std::floor(i * 0.5f) : i;
+		}
+		if (i == 0 || r.next_int_bound(5) != 0) return i;
+		bool near = cu.x == ox && cu.y == oy && cu.z == oz;
+		if (!near && sk_can_growth(cu.x, cu.y, cu.z)) {
+			if ((int)r.next_int_bound(50) < i) {
+				int above = get(cu.x, cu.y + 1, cu.z);
+				bool wet = sk_fluid(above);
+				int g = r.next_int_bound(11) == 0 ? (wet ? sk[SK_S_SHRIEK_WL] : sk[SK_S_SHRIEK]) : (wet ? sk[SK_S_SENSOR_WL] : sk[SK_S_SENSOR]);
+				set(cu.x, cu.y + 1, cu.z, g, W_FORCE);
+			}
+			return std::max(0, i - 50);
+		}
+		if (r.next_int_bound(10) != 0) return i;
+		if (near) return i - 1;
+		double dx = cu.x - ox, dy = cu.y - oy, dz = cu.z - oz;
+		float f = (float)std::sqrt(dx * dx + dy * dy + dz * dz) - 1.0f;
+		f = f * f;
+		float f1 = std::min(1.0f, f / (float)(23 * 23));
+		return i - std::max(1, (int)(i * f1 * 0.5f));
+	}
+	bool sk_clear(int x, int y, int z, int d) const { return !sk_sturdy(sk_at(x, y, z, d)); }
+	bool sk_unobstructed(int x, int y, int z, int qx, int qy, int qz) const {
+		int dx = qx - x, dy = qy - y, dz = qz - z;
+		if (std::abs(dx) + std::abs(dy) + std::abs(dz) == 1) return true;
+		int ddx = dx < 0 ? 4 : 5, ddy = dy < 0 ? 0 : 1, ddz = dz < 0 ? 2 : 3;
+		if (dx == 0) return sk_clear(x, y, z, ddy) || sk_clear(x, y, z, ddz);
+		if (dy == 0) return sk_clear(x, y, z, ddx) || sk_clear(x, y, z, ddz);
+		return sk_clear(x, y, z, ddx) || sk_clear(x, y, z, ddy);
+	}
+	bool sk_substrate(int st, int x, int y, int z) const {
+		if (!sk_is_vein(st)) return false;
+		for (int d = 0; d < 6; d++) if (sk_has(st, d) && sk_repl(sk_at(x, y, z, d))) return true;
+		return false;
+	}
+	// ChargeCursor.getValidMovementPos: the 18 non-corner neighbours shuffled; a sculk / vein block reachable, the first
+	// with substrate access wins, else the last one seen
+	bool sk_move(int x, int y, int z, int &ox, int &oy, int &oz) {
+		static int NC[18][3];
+		static bool init = false;
+		if (!init) {
+			int k = 0;
+			for (int cz = -1; cz <= 1; cz++)
+				for (int cy = -1; cy <= 1; cy++)
+					for (int cx = -1; cx <= 1; cx++)
+						if ((cx == 0 || cy == 0 || cz == 0) && !(cx == 0 && cy == 0 && cz == 0)) { NC[k][0] = cx; NC[k][1] = cy; NC[k][2] = cz; k++; }
+			init = true;
+		}
+		int idx[18];
+		for (int k = 0; k < 18; k++) idx[k] = k;
+		for (int k = 18; k > 1; k--) { int j = (int)r.next_int_bound(k); std::swap(idx[k - 1], idx[j]); }
+		bool found = false;
+		for (int k = 0; k < 18; k++) {
+			int qx = x + NC[idx[k]][0], qy = y + NC[idx[k]][1], qz = z + NC[idx[k]][2];
+			int qs = get(qx, qy, qz);
+			if (sk_beh(qs) != 0 && sk_unobstructed(x, y, z, qx, qy, qz)) {
+				ox = qx; oy = qy; oz = qz;
+				found = true;
+				if (sk_substrate(qs, qx, qy, qz)) break;
+			}
+		}
+		return found;
+	}
+	void sk_update(SkC &cu, int ox, int oy, int oz, bool convert) {
+		if (cu.charge <= 0) return;
+		if (cu.upd > 0) { cu.upd--; return; }
+		int st = get(cu.x, cu.y, cu.z);
+		int beh = sk_beh(st);
+		if (convert && sk_spread_vein(beh, cu.x, cu.y, cu.z, st, cu.faces) && beh != 1) {
+			st = get(cu.x, cu.y, cu.z);
+			beh = sk_beh(st);
+		}
+		cu.charge = sk_use_charge(beh, cu, ox, oy, oz, convert);
+		if (cu.charge <= 0) { sk_discharged(beh, st, cu.x, cu.y, cu.z); return; }
+		int nx, ny, nz;
+		if (sk_move(cu.x, cu.y, cu.z, nx, ny, nz)) {
+			sk_discharged(beh, st, cu.x, cu.y, cu.z);
+			cu.x = nx; cu.y = ny; cu.z = nz;
+			double dx = cu.x - ox, dz = cu.z - oz;
+			if (!(dx * dx + dz * dz < 225.0)) { cu.charge = 0; return; }
+			st = get(nx, ny, nz);
+		}
+		int nb = sk_beh(st);
+		if (nb != 0) cu.faces = nb == 2 ? (sk_code(st) & 63) : 0;
+		cu.decay = beh == 0 ? std::max(cu.decay - 1, 0) : 1;
+		cu.upd = 1;
+	}
+	bool sculk_patch(const int32_t *n, int x, int y, int z) {
+		sk = n;
+		int s0 = get(x, y, z);
+		if (sk_beh(s0) == 0) {
+			if (!(s0 == 0 || s0 == n[SK_S_WATER])) return false;
+			bool any = false;
+			for (int d = 0; d < 6 && !any; d++) {
+				int s = sk_at(x, y, z, d);
+				any = s > 0 && (flags(s) & c.F_FULL_SHAPE) && (flags(s) & c.F_COLLIDE);
+			}
+			if (!any) return false;
+		}
+		std::vector<SkC> cur, nxt;
+		int rounds = n[SK_SPREAD] + n[SK_GROW];
+		for (int j = 0; j < rounds; j++) {
+			for (int k = 0; k < n[SK_CC]; k++) {
+				int ch = n[SK_AMT];
+				while (ch > 0) {
+					int i = std::min(ch, 1000);
+					if (cur.size() < 32) cur.push_back(SkC{x, y, z, i, 1, 0, -1});
+					ch -= i;
+				}
+			}
+			bool convert = j < n[SK_SPREAD];
+			for (int l = 0; l < n[SK_ATT] && !cur.empty(); l++) {
+				nxt.clear();
+				for (auto &cu : cur) {
+					if (std::abs(cu.x - x) + std::abs(cu.y - y) + std::abs(cu.z - z) > 1024) continue;
+					sk_update(cu, x, y, z, convert);
+					if (cu.charge > 0) nxt.push_back(cu);
+				}
+				cur.swap(nxt);
+			}
+			cur.clear();
+		}
+		int rare = n[SK_RARE] >= 0 ? (int)ip(n[SK_RARE]) : 0;
+		for (int k = 0; k < rare; k++) {
+			int qx = x + (int)r.next_int_bound(5) - 2, qz = z + (int)r.next_int_bound(5) - 2;
+			if (get(qx, y, qz) == 0 && sk_sturdy(get(qx, y - 1, qz))) set(qx, y, qz, n[SK_S_SHRIEK], W_FORCE);
+		}
+		return true;
+	}
+
 	bool disk(const int32_t *n, int x, int y, int z) {
 		int64_t rad = ip(n[3]);
 		int half = n[4];

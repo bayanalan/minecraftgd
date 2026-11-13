@@ -116,19 +116,30 @@ func _shadow_text(font: Font, base: Vector2, t: String, w: float, fs: int, col: 
 	canvas.draw_string(font, base, t, HORIZONTAL_ALIGNMENT_CENTER, w, fs, col)
 
 
-func toast(head: String, title: String, icon: String) -> void:
-	toasts.append([head, title, icon, Time.get_ticks_msec()])
+func toast(head: String, title: String, icon: String, head_color: Color = Color8(255, 255, 0)) -> void:
+	toasts.append([head, title, icon, Time.get_ticks_msec(), head_color, false])
+	Audio.play_ui("ui.toast.in")   # Toast.Visibility.SHOW
 
 
 func _draw_toasts(font: Font, size: Vector2) -> void:
 	var now := Time.get_ticks_msec()
 	var y := 0.0
 	for t in toasts.duplicate():
+		# Java ToastManager: shown 5000 ms, then hidden; each change slides over 600 ms (f = t / 600, f * f)
 		var age: int = now - int(t[3])
-		if age > 5000:
+		if age > 5600:
 			toasts.erase(t)
 			continue
-		var slide := clampf(minf(age, 5000 - age) / 250.0, 0.0, 1.0)
+		var slide := 0.0
+		if age < 5000:
+			slide = clampf(age / 600.0, 0.0, 1.0)
+			slide *= slide
+		else:
+			if not bool(t[5]):
+				t[5] = true
+				Audio.play_ui("ui.toast.out")
+			var hf := clampf((age - 5000) / 600.0, 0.0, 1.0)
+			slide = 1.0 - hf * hf
 		var pos := Vector2(size.x - 160.0 * slide, y)
 		var bg := UiKit.sprite("gui/sprites/toast/advancement")
 		if bg != null:
@@ -139,7 +150,7 @@ func _draw_toasts(font: Font, size: Vector2) -> void:
 		if ic != null:
 			canvas.draw_texture_rect(ic, Rect2(pos + Vector2(8, 8), Vector2(16, 16)), false)
 		# Java AdvancementToast: header at (30, 7) 0xFFFF00 (challenges 0xFF88FF), title at (30, 18) white, no shadow
-		canvas.draw_string(font, pos + Vector2(30, 7 + 7), str(t[0]), HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color8(255, 255, 0))
+		canvas.draw_string(font, pos + Vector2(30, 7 + 7), str(t[0]), HORIZONTAL_ALIGNMENT_LEFT, -1, 8, t[4] if t.size() > 4 else Color8(255, 255, 0))
 		canvas.draw_string(font, pos + Vector2(30, 18 + 7), str(t[1]), HORIZONTAL_ALIGNMENT_LEFT, 126, 8, Color.WHITE)
 		y += 32.0
 

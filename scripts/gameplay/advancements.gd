@@ -11,6 +11,7 @@ var world
 var defs: Dictionary = {}       # id -> {criteria: {name: {trigger, conditions}}, requirements: [[...]], title, desc, icon, tab, parent, hidden}
 var progress: Dictionary = {}   # id -> {criterion: true}
 var done: Dictionary = {}
+var _by_kind: Dictionary = {}   # trigger kind -> [[advancement id, criterion name, conditions], ...] (built once)
 
 
 func _init(w) -> void:
@@ -38,6 +39,14 @@ func _init(w) -> void:
 	for id in defs:
 		if _complete(id):
 			done[id] = true
+		var crit: Dictionary = defs[id]["criteria"]
+		for cname in crit:
+			var c = crit[cname]
+			if c is Dictionary:
+				var kind := str(c.get("trigger", "")).trim_prefix("minecraft:")
+				if not _by_kind.has(kind):
+					_by_kind[kind] = []
+				_by_kind[kind].append([id, cname, c.get("conditions", {})])
 
 
 static func _text(v) -> String:
@@ -62,36 +71,44 @@ func _complete(id: String) -> bool:
 	return true
 
 
+## Only the criteria listening to kind are tested (indexed at load; the old scan over every advancement and
+## criterion cost ~2 ms per location trigger).
 func trigger(kind: String, ctx: Dictionary = {}) -> void:
-	for id in defs:
+	var lst = _by_kind.get(kind)
+	if lst == null:
+		return
+	var changed_ids: Array = []
+	for e in lst:
+		var id: String = e[0]
 		if done.has(id):
 			continue
-		var d: Dictionary = defs[id]
-		var crit: Dictionary = d["criteria"]
-		var changed := false
-		for cname in crit:
-			var c = crit[cname]
-			if not (c is Dictionary) or str(c.get("trigger", "")).trim_prefix("minecraft:") != kind:
-				continue
-			if (progress.get(id, {}) as Dictionary).has(cname):
-				continue
-			if _matches(kind, c.get("conditions", {}), ctx):
-				if not progress.has(id):
-					progress[id] = {}
-				progress[id][cname] = true
-				changed = true
-		if changed and _complete(id):
-			done[id] = true
-			_award(id)
+		var cname: String = e[1]
+		if (progress.get(id, {}) as Dictionary).has(cname):
+			continue
+		if _matches(kind, e[2], ctx):
+			if not progress.has(id):
+				progress[id] = {}
+			progress[id][cname] = true
+			if not changed_ids.has(id):
+				changed_ids.append(id)
+	for id2 in changed_ids:
+		if not done.has(id2) and _complete(id2):
+			done[id2] = true
+			_award(id2)
 
 
 func _award(id: String) -> void:
 	var d: Dictionary = defs[id]
 	if d["toast"]:
-		var head := {"goal": "Goal Reached!", "challenge": "Challenge Complete!"}.get(d["frame"], "Advancement Made!")
-		world.hud.toast(head, d["title"], d["icon"])
-		world.hud.chat_message("Player has made the advancement [%s]" % d["title"])
-		Audio.play("ui.toast.challenge_complete" if d["frame"] == "challenge" else "entity.player.levelup", world.player.pos, "Players", 0.6)
+		# Java AdvancementToast: header per frame type (challenges pink 0xFF88FF, else yellow), ToastManager plays
+		# ui.toast.in / out, challenges also ui.toast.challenge_complete; chat: chat.type.advancement.<frame>
+		var fr := str(d["frame"])
+		var head := {"goal": "Goal Reached!", "challenge": "Challenge Complete!"}.get(fr, "Advancement Made!")
+		world.hud.toast(head, d["title"], d["icon"], Color8(255, 136, 255) if fr == "challenge" else Color8(255, 255, 0))
+		var verb := {"goal": "has reached the goal", "challenge": "has completed the challenge"}.get(fr, "has made the advancement")
+		world.hud.chat_message("Player %s [%s]" % [verb, d["title"]])
+		if fr == "challenge":
+			Audio.play_ui("ui.toast.challenge_complete")
 
 
 func on_inventory(inv: Inventory) -> void:

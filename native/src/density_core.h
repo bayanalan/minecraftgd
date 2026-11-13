@@ -188,6 +188,26 @@ extern std::vector<Graph *> g_graphs;
 const Graph *graph_of(int64_t h);
 
 // ---------------------------------------------------------------- evaluation context (one per call, per thread)
+// Large evaluator buffers reused by later evaluators on the same thread: every chunk job used to allocate and zero
+// 2+ MB (per-node column caches, memo, corner grids), so fresh pages were faulted in for each chunk and released again -
+// page-fault work plus, on free, TLB shootdowns interrupting every thread of the process (main-thread stalls).
+struct EvalStore {
+	const void *graph = nullptr;
+	std::vector<double> memo;
+	std::vector<uint32_t> stamp;
+	uint32_t stamp_ctr = 1;
+	std::vector<std::vector<double>> corners;
+	std::vector<std::vector<uint8_t>> corner_ok;
+	std::vector<double> c2;
+	std::vector<uint32_t> c2gen;
+	uint32_t c2g = 0;
+	std::unordered_map<uint64_t, double> c2map;
+};
+inline std::vector<EvalStore *> &eval_pool() {
+	static thread_local std::vector<EvalStore *> pool;
+	return pool;
+}
+
 struct Eval {
 	const Graph &g;
 	int x0, z0;
@@ -202,17 +222,46 @@ struct Eval {
 	std::vector<std::vector<double>> corners;
 	// 2D column cache: in-chunk columns x0..x0+16, z0..z0+16 (17x17), map elsewhere
 	std::vector<double> c2;
-	std::vector<uint8_t> c2ok;
+	std::vector<uint32_t> c2gen;   // c2 entry valid when it holds this evaluator's generation c2g
+	uint32_t c2g = 1;
 	std::unordered_map<uint64_t, double> c2map;
 
 	Eval(const Graph &gr, int cx, int cz, bool hc) : g(gr), x0(cx * 16), z0(cz * 16), has_chunk(hc), mode(0) {
 		size_t n = g.nodes.size();
-		memo.assign(n, 0.0);
-		stamp.assign(n, 0);
+		auto &pool = eval_pool();
+		for (size_t i = 0; i < pool.size(); i++) {
+			EvalStore *s = pool[i];
+			if (s->graph != (const void *)&g) continue;
+			pool.erase(pool.begin() + i);
+			memo.swap(s->memo); stamp.swap(s->stamp); stamp_ctr = s->stamp_ctr;
+			corners.swap(s->corners); corner_ok.swap(s->corner_ok);
+			c2.swap(s->c2); c2gen.swap(s->c2gen); c2g = s->c2g;
+			c2map.swap(s->c2map);
+			delete s;
+			break;
+		}
+		if (memo.size() != n) { memo.assign(n, 0.0); stamp.assign(n, 0); stamp_ctr = 1; }
+		if (stamp_ctr > 0xF0000000u) { std::fill(stamp.begin(), stamp.end(), 0u); stamp_ctr = 1; }
 		corners.resize(n);
-		c2.assign(n * 289, 0.0);
-		c2ok.assign(n * 289, 0);
+		for (auto &ok : corner_ok) std::fill(ok.begin(), ok.end(), (uint8_t)0);
+		if (c2.size() != n * 289) { c2.assign(n * 289, 0.0); c2gen.assign(n * 289, 0u); c2g = 0; }
+		if (++c2g == 0) { std::fill(c2gen.begin(), c2gen.end(), 0u); c2g = 1; }
+		c2map.clear();
 	}
+
+	~Eval() {
+		auto &pool = eval_pool();
+		if (pool.size() >= 3) return;
+		EvalStore *s = new EvalStore();
+		s->graph = (const void *)&g;
+		memo.swap(s->memo); stamp.swap(s->stamp); s->stamp_ctr = stamp_ctr;
+		corners.swap(s->corners); corner_ok.swap(s->corner_ok);
+		c2.swap(s->c2); c2gen.swap(s->c2gen); s->c2g = c2g;
+		c2map.swap(s->c2map);
+		pool.push_back(s);
+	}
+	Eval(const Eval &) = delete;
+	Eval &operator=(const Eval &) = delete;
 
 	double at(int n, int x, int y, int z) {
 		// evaluate node n at a point different from the current memo point
@@ -236,10 +285,10 @@ struct Eval {
 			int lx = x - x0, lz = z - z0;
 			if (lx >= 0 && lx <= 16 && lz >= 0 && lz <= 16) {
 				size_t ci = (size_t)n * 289 + lz * 17 + lx;
-				if (c2ok[ci]) return c2[ci];
+				if (c2gen[ci] == c2g) return c2[ci];
 				double v = compute(n, d, x, y, z);
 				c2[ci] = v;
-				c2ok[ci] = 1;
+				c2gen[ci] = c2g;
 				return v;
 			}
 			uint64_t key = ((uint64_t)(uint32_t)n << 42) ^ ((uint64_t)(uint32_t)(x & 0x1FFFFF) << 21) ^ (uint64_t)(uint32_t)(z & 0x1FFFFF);
@@ -272,11 +321,12 @@ struct Eval {
 	double corner(int n, const Node &d, int ix, int iy, int iz) {
 		std::vector<double> &cv = corners[n];
 		int nx = 16 / d.cxz + 1;
-		if (cv.empty()) {
-			int ny = HEIGHT / d.cy + 1;
-			cv.assign((size_t)nx * ny * nx, 0.0);
-			if (corner_ok.size() < corners.size()) corner_ok.resize(corners.size());
-			corner_ok[n].assign(cv.size(), 0);
+		size_t want = (size_t)nx * (HEIGHT / d.cy + 1) * nx;
+		if (corner_ok.size() < corners.size()) corner_ok.resize(corners.size());
+		if (cv.size() != want || corner_ok[n].size() != want) {
+			// first use (or a pooled grid of another size): allocate; pooled grids of the right size were cleared on reuse
+			cv.assign(want, 0.0);
+			corner_ok[n].assign(want, 0);
 		}
 		size_t i = ((size_t)iy * nx + iz) * nx + ix;
 		if (corner_ok[n][i]) return cv[i];
@@ -289,16 +339,27 @@ struct Eval {
 		return v;
 	}
 
+	// Per INTERP node: the 8 corners of the cell last used (Java NoiseChunk fetches a cell's corners once and only
+	// interpolates per block; looking all 8 up per block was most of the 13-27 ms per-block density pass)
+	std::vector<int64_t> cell_key;
+	std::vector<double> cell_c;   // 8 per node: c000 c100 c001 c101 c010 c110 c011 c111
 	double interp(int n, const Node &d, int x, int y, int z) {
 		if (mode == 2) return ev(d.a, x, y, z);
 		if (!has_chunk) return ev(d.a, x, y, z);
 		int lx = x - x0, lz = z - z0, ly = y - MIN_Y;
 		if (lx < 0 || lx > 15 || lz < 0 || lz > 15 || ly < 0 || ly >= HEIGHT) return ev(d.a, x, y, z);
 		int ix = lx / d.cxz, iz = lz / d.cxz, iy = ly / d.cy;
-		double c000 = corner(n, d, ix, iy, iz), c100 = corner(n, d, ix + 1, iy, iz);
-		double c001 = corner(n, d, ix, iy, iz + 1), c101 = corner(n, d, ix + 1, iy, iz + 1);
-		double c010 = corner(n, d, ix, iy + 1, iz), c110 = corner(n, d, ix + 1, iy + 1, iz);
-		double c011 = corner(n, d, ix, iy + 1, iz + 1), c111 = corner(n, d, ix + 1, iy + 1, iz + 1);
+		if (cell_key.size() < g.nodes.size()) { cell_key.assign(g.nodes.size(), -1); cell_c.assign(g.nodes.size() * 8, 0.0); }
+		int64_t ck = ((int64_t)iy << 16) | ((int64_t)iz << 8) | (int64_t)ix;
+		double *cc = &cell_c[(size_t)n * 8];
+		if (cell_key[n] != ck) {
+			cell_key[n] = ck;
+			cc[0] = corner(n, d, ix, iy, iz); cc[1] = corner(n, d, ix + 1, iy, iz);
+			cc[2] = corner(n, d, ix, iy, iz + 1); cc[3] = corner(n, d, ix + 1, iy, iz + 1);
+			cc[4] = corner(n, d, ix, iy + 1, iz); cc[5] = corner(n, d, ix + 1, iy + 1, iz);
+			cc[6] = corner(n, d, ix, iy + 1, iz + 1); cc[7] = corner(n, d, ix + 1, iy + 1, iz + 1);
+		}
+		double c000 = cc[0], c100 = cc[1], c001 = cc[2], c101 = cc[3], c010 = cc[4], c110 = cc[5], c011 = cc[6], c111 = cc[7];
 		if (mode == 1 && d.cxz == 4 && d.cy == 8) {
 			// GDScript cell path (_interp_cells): y, then z, then x
 			double ty = (ly & 7) * 0.125;
@@ -355,7 +416,9 @@ struct Eval {
 		return (m + kk * (nn - m)) + kk * (1.0 - kk) * (q + kk * (r - q));
 	}
 
+	uint64_t *kcount = nullptr;   // profiling: compute() calls per node kind (RC_DFPROF)
 	double compute(int n, const Node &d, int x, int y, int z) {
+		if (kcount) kcount[d.k]++;
 		switch (d.k) {
 			case CONST: return d.v0;
 			case ADD: return ev(d.a, x, y, z) + ev(d.b, x, y, z);
@@ -433,6 +496,132 @@ struct Eval {
 			}
 		}
 		return 0.0;
+	}
+
+	// ---------------------------------------------------------------- cell batch evaluation (block mode)
+	// The final density's nodes above its interpolated ones are cheap arithmetic over interpolated values; per block
+	// they cost ~10 interpreter steps. eval_cell runs them over the 128 blocks of a 4 x 8 x 4 cell as array operations
+	// (Java NoiseChunk interpolates whole cells too). Every operation repeats the scalar expression exactly (the scalar
+	// shortcuts - MIN / MAX below the other side's bound, MUL by 0, LERP at 0 / 1, RANGE - give the same value when
+	// both sides are computed), INTERP lanes use interp()'s block-mode y -> z -> x order, so the result is bit-identical.
+	// Lane = ((ly & 7) * 4 + (lz & 3)) * 4 + (lx & 3). Kinds not listed (noise, splines, ... outside an interpolation)
+	// disable the batch path (batch_ok = false) and the fill evaluates block by block.
+	int batch_state = 0;            // 0 not built, 1 ok, -1 unsupported
+	std::vector<int> tape;          // post-order node list
+	std::vector<int> slot;          // node -> lane slot (-1 none)
+	std::vector<double> lanes;      // slots x 128
+	bool tape_add(int n, int depth) {
+		if (n < 0 || depth > 64) return false;
+		if (slot[n] >= 0) return true;
+		const Node &d = g.nodes[n];
+		switch (d.k) {
+			case CONST: case ONE: case ZERO: break;
+			case GRADIENT: break;
+			case INTERP: if (d.cxz != 4 || d.cy != 8) return false; break;
+			case ADD: case MUL: case SUB: case DIV: case MIN: case MAX:
+				if (!tape_add(d.a, depth + 1) || !tape_add(d.b, depth + 1)) return false;
+				break;
+			case ABS: case SQUARE: case CUBE: case HALF_NEG: case QUARTER_NEG: case SQUEEZE: case NEGATE: case CLAMP: case PASS:
+				if (!tape_add(d.a, depth + 1)) return false;
+				break;
+			case LERP: case RANGE:
+				if (!tape_add(d.a, depth + 1) || !tape_add(d.b, depth + 1) || !tape_add(d.c, depth + 1)) return false;
+				break;
+			default:
+				if (!d.is2d) return false;   // a 2D (column-cached) node: one value per column, read through ev()
+				break;
+		}
+		slot[n] = (int)tape.size();
+		tape.push_back(n);
+		return true;
+	}
+	bool batch_ok(int root) {
+		if (batch_state == 0) {
+			slot.assign(g.nodes.size(), -1);
+			tape.clear();
+			batch_state = tape_add(root, 0) ? 1 : -1;
+			if (batch_state == 1) lanes.assign(tape.size() * 128, 0.0);
+		}
+		return batch_state == 1;
+	}
+	// cx0 / cz0 local (0, 4, 8, 12), ly0 local (multiple of 8); out[lane]
+	void eval_cell(int root, int cx0, int ly0, int cz0, double *out) {
+		static const double XS[4] = {0.0, 0.25, 0.5, 0.75};
+		for (size_t ti = 0; ti < tape.size(); ti++) {
+			int n = tape[ti];
+			const Node &d = g.nodes[n];
+			double *o = &lanes[ti * 128];
+			auto L = [&](int m) -> const double * { return &lanes[(size_t)slot[m] * 128]; };
+			switch (d.k) {
+				case CONST: for (int i = 0; i < 128; i++) o[i] = d.v0; break;
+				case ONE: for (int i = 0; i < 128; i++) o[i] = 1.0; break;
+				case ZERO: for (int i = 0; i < 128; i++) o[i] = 0.0; break;
+				case GRADIENT:
+					for (int i = 0; i < 128; i++) {
+						int ly = ly0 + (i >> 4), lz = cz0 + ((i >> 2) & 3), lx = cx0 + (i & 3);
+						int t = d.axis == 1 ? MIN_Y + ly : (d.axis == 0 ? x0 + lx : z0 + lz);
+						o[i] = gradient(d, t);
+					}
+					break;
+				case INTERP: {
+					int ix = cx0 >> 2, iz = cz0 >> 2, iy = ly0 >> 3;
+					double c000 = corner(n, d, ix, iy, iz), c100 = corner(n, d, ix + 1, iy, iz);
+					double c001 = corner(n, d, ix, iy, iz + 1), c101 = corner(n, d, ix + 1, iy, iz + 1);
+					double c010 = corner(n, d, ix, iy + 1, iz), c110 = corner(n, d, ix + 1, iy + 1, iz);
+					double c011 = corner(n, d, ix, iy + 1, iz + 1), c111 = corner(n, d, ix + 1, iy + 1, iz + 1);
+					for (int i = 0; i < 128; i++) {
+						double ty = (i >> 4) * 0.125;
+						double y00 = c000 + ty * (c010 - c000);
+						double y10 = c100 + ty * (c110 - c100);
+						double y01 = c001 + ty * (c011 - c001);
+						double y11 = c101 + ty * (c111 - c101);
+						double tz = ((i >> 2) & 3) * 0.25;
+						double z0v = y00 + tz * (y01 - y00);
+						double z1v = y10 + tz * (y11 - y10);
+						double dz = z1v - z0v;
+						int sx = i & 3;
+						o[i] = sx == 0 ? z0v : z0v + XS[sx] * dz;
+					}
+					break;
+				}
+				case ADD: { const double *a = L(d.a), *b = L(d.b); for (int i = 0; i < 128; i++) o[i] = a[i] + b[i]; break; }
+				case SUB: { const double *a = L(d.a), *b = L(d.b); for (int i = 0; i < 128; i++) o[i] = a[i] - b[i]; break; }
+				case MUL: { const double *a = L(d.a), *b = L(d.b); for (int i = 0; i < 128; i++) o[i] = a[i] == 0.0 ? 0.0 : a[i] * b[i]; break; }
+				case DIV: { const double *a = L(d.a), *b = L(d.b); for (int i = 0; i < 128; i++) o[i] = b[i] != 0.0 ? a[i] / b[i] : 0.0; break; }
+				case MIN: { const double *a = L(d.a), *b = L(d.b); double lo = g.nodes[d.b].lo; for (int i = 0; i < 128; i++) o[i] = a[i] < lo ? a[i] : (a[i] < b[i] ? a[i] : b[i]); break; }
+				case MAX: { const double *a = L(d.a), *b = L(d.b); double hi = g.nodes[d.b].hi; for (int i = 0; i < 128; i++) o[i] = a[i] > hi ? a[i] : (a[i] > b[i] ? a[i] : b[i]); break; }
+				case ABS: { const double *a = L(d.a); for (int i = 0; i < 128; i++) o[i] = std::fabs(a[i]); break; }
+				case SQUARE: { const double *a = L(d.a); for (int i = 0; i < 128; i++) o[i] = a[i] * a[i]; break; }
+				case CUBE: { const double *a = L(d.a); for (int i = 0; i < 128; i++) o[i] = a[i] * a[i] * a[i]; break; }
+				case HALF_NEG: { const double *a = L(d.a); for (int i = 0; i < 128; i++) o[i] = a[i] > 0.0 ? a[i] : a[i] * 0.5; break; }
+				case QUARTER_NEG: { const double *a = L(d.a); for (int i = 0; i < 128; i++) o[i] = a[i] > 0.0 ? a[i] : a[i] * 0.25; break; }
+				case SQUEEZE: { const double *a = L(d.a); for (int i = 0; i < 128; i++) { double e = std::min(1.0, std::max(-1.0, a[i])); o[i] = e / 2.0 - e * e * e / 24.0; } break; }
+				case NEGATE: { const double *a = L(d.a); for (int i = 0; i < 128; i++) o[i] = -a[i]; break; }
+				case CLAMP: { const double *a = L(d.a); for (int i = 0; i < 128; i++) o[i] = std::min(d.v1, std::max(d.v0, a[i])); break; }
+				case PASS: { const double *a = L(d.a); for (int i = 0; i < 128; i++) o[i] = a[i]; break; }
+				case LERP: {
+					const double *al = L(d.a), *b = L(d.b), *cc = L(d.c);
+					for (int i = 0; i < 128; i++) o[i] = al[i] == 0.0 ? b[i] : (al[i] == 1.0 ? cc[i] : b[i] + al[i] * (cc[i] - b[i]));
+					break;
+				}
+				case RANGE: {
+					const double *iv = L(d.a), *b = L(d.b), *cc = L(d.c);
+					for (int i = 0; i < 128; i++) o[i] = (iv[i] >= d.v0 && iv[i] < d.v1) ? b[i] : cc[i];
+					break;
+				}
+				default: {
+					// 2D column-cached node: 16 columns
+					for (int lz = 0; lz < 4; lz++)
+						for (int lx = 0; lx < 4; lx++) {
+							double v = ev(n, x0 + cx0 + lx, MIN_Y + ly0, z0 + cz0 + lz);
+							for (int ly = 0; ly < 8; ly++) o[(ly * 4 + lz) * 4 + lx] = v;
+						}
+					break;
+				}
+			}
+		}
+		const double *r = &lanes[(size_t)slot[root] * 128];
+		for (int i = 0; i < 128; i++) out[i] = r[i];
 	}
 };
 

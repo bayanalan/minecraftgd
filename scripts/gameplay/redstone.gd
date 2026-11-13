@@ -36,7 +36,7 @@ static func _relevance_of(st: int) -> int:
 	var n := b.name_of(st)
 	if n == "redstone_wire":
 		return 1
-	if n in ["repeater", "comparator", "piston", "sticky_piston", "dispenser", "dropper", "hopper", "powered_rail", "activator_rail",
+	if n in ["repeater", "comparator", "piston", "sticky_piston", "dispenser", "dropper", "crafter", "hopper", "powered_rail", "activator_rail",
 			"redstone_lamp", "tnt", "note_block", "redstone_torch", "redstone_wall_torch"]:
 		return 2
 	if (n.ends_with("_door") or n.ends_with("_trapdoor") or n.ends_with("_fence_gate")) and b.has_prop(st, "powered"):
@@ -126,6 +126,8 @@ static func container_signal(world, p: Vector3i) -> int:
 	var d: Dictionary = BlockEntities.get_data(world, p)
 	if d.is_empty() or not d.has("items"):
 		return 0
+	if str(d.get("id", "")) == "crafter":
+		return Crafter.signal_strength(d)
 	var items: Array = d["items"]
 	if items.is_empty():
 		return 0
@@ -338,6 +340,17 @@ static func _update_consumer(world, p: Vector3i) -> void:
 			elif not pw2 and was:
 				world.set_block(p.x, p.y, p.z, b.with_prop(st, "triggered", "false"), false)
 			return
+		"crafter":
+			# CrafterBlock.neighborChanged: a rising edge schedules the craft in 4 ticks; losing power clears both flags
+			var pw3 := _powered_any(world, p)
+			var was3 := b.get_prop(st, "triggered") == "true"
+			if pw3 and not was3:
+				world.set_block(p.x, p.y, p.z, b.with_prop(st, "triggered", "true"), false)
+				BlockEntities.get_data(world, p)["craft_at"] = int(world.game_time) + 4
+				BlockUpdates.schedule(world, p, 4)
+			elif not pw3 and was3:
+				world.set_block(p.x, p.y, p.z, b.with_prop(b.with_prop(st, "triggered", "false"), "crafting", "false"), false)
+			return
 		"hopper":
 			var en := not _powered_any(world, p)
 			if (b.get_prop(st, "enabled") == "true") != en:
@@ -422,6 +435,15 @@ static func scheduled(world, p: Vector3i, st: int) -> bool:
 			return true
 		"dispenser", "dropper":
 			_dispense(world, p, st, n == "dropper")
+			return true
+		"crafter":
+			var cd := BlockEntities.get_data(world, p)
+			if b.get_prop(st, "crafting") == "true" and int(world.game_time) >= int(cd.get("crafting_until", 0)):
+				world.set_block(p.x, p.y, p.z, b.with_prop(st, "crafting", "false"), false)   # CrafterBlockEntity tick: the crafting look ends
+				st = world.state_at(p.x, p.y, p.z)
+			if cd.has("craft_at") and int(world.game_time) >= int(cd["craft_at"]):
+				cd.erase("craft_at")
+				Crafter.craft(world, p, st)
 			return true
 	return false
 
@@ -542,7 +564,10 @@ static func _dispense(world, p: Vector3i, st: int, dropper: bool) -> void:
 	if not dropper and nm in ["arrow", "snowball", "egg", "fire_charge"]:
 		world.entities.spawn_projectile("small_fireball" if nm == "fire_charge" else nm, out, Vector3(f) * 1.1 + Vector3(0, 0.1, 0), null)
 	elif not dropper and (nm == "water_bucket" or nm == "lava_bucket") and _state(world, front) == 0:
-		world.set_block(front.x, front.y, front.z, Res.blocks.WATER if nm == "water_bucket" else Res.blocks.LAVA)
+		if nm == "water_bucket" and Interaction.water_evaporates(world):
+			Interaction.evaporate(world, front)
+		else:
+			world.set_block(front.x, front.y, front.z, Res.blocks.WATER if nm == "water_bucket" else Res.blocks.LAVA)
 		BlockUpdates.schedule(world, front, 1)
 		items[k] = ItemStack.named("bucket", 1).to_dict()
 		used = false

@@ -25,7 +25,7 @@ static func _build() -> void:
 	for st in blocks.total_states:
 		var n := blocks.names[blocks.st_block[st]]
 		var t := false
-		if n in ["wheat", "carrots", "potatoes", "beetroots", "grass_block", "mycelium", "sugar_cane", "cactus", "ice", "snow", "fire", "melon_stem", "pumpkin_stem", "sweet_berry_bush", "farmland", "kelp", "bamboo", "cocoa", "nether_wart", "torchflower_crop", "pitcher_crop"]:
+		if n in ["wheat", "carrots", "potatoes", "beetroots", "grass_block", "mycelium", "sugar_cane", "cactus", "ice", "snow", "fire", "lava", "melon_stem", "pumpkin_stem", "sweet_berry_bush", "farmland", "kelp", "bamboo", "cocoa", "nether_wart", "torchflower_crop", "pitcher_crop"]:
 			t = true
 		elif n.ends_with("_sapling"):
 			t = true
@@ -165,8 +165,12 @@ static func random_tick(world, p: Vector3i, st: int, rng: RandomNumberGenerator)
 			if blk > 11:
 				world.set_block(p.x, p.y, p.z, 0)
 		"fire":
-			if rng.randi_range(0, 3) == 0 and world.gamerule("doFireTick", true):
-				world.set_block(p.x, p.y, p.z, 0)
+			# Java fire has no random tick: it runs on its scheduled tick (FireBlock.tick). Fire loaded without one
+			# (scheduled ticks are not saved) gets it back here.
+			if not BlockUpdates.pending.has(p):
+				BlockUpdates.fire_placed(world, p)
+		"lava":
+			_lava_tick(world, p, st, rng)
 		"farmland":
 			var wet := false
 			for dx in range(-4, 5):
@@ -359,3 +363,39 @@ class TreeSink:
 	func set_block(x: int, y: int, z: int, st: int) -> bool:
 		world.set_block(x, y, z, st)
 		return true
+
+## Java LavaFluid.randomTick (lava sources and flows): 1-2 steps up and around looking for an air cell next to
+## something lava ignites, else 3 tries to light the top of an ignitable block beside it.
+static func _lava_tick(world, p: Vector3i, _st: int, rng: RandomNumberGenerator) -> void:
+	if not world.gamerule("doFireTick", true):
+		return
+	var b := Res.blocks
+	var i := rng.randi_range(0, 2)
+	if i > 0:
+		var q := p
+		for _j in i:
+			q += Vector3i(rng.randi_range(0, 2) - 1, 1, rng.randi_range(0, 2) - 1)
+			if not world.cm.is_ready(q.x, q.z):
+				return
+			var s: int = world.state_at(q.x, q.y, q.z)
+			if s == 0:
+				for d in BlockUpdates.DIRS6:
+					var r: Vector3i = q + d
+					if _ignited_by_lava(world.state_at(r.x, r.y, r.z)):
+						world.set_block(q.x, q.y, q.z, BlockUpdates.fire_state(world, q))
+						return
+			elif s > 0 and (b.st_flags[s] & BlockRegistry.F_COLLIDE) != 0:
+				return
+	else:
+		for _k in 3:
+			var q2 := p + Vector3i(rng.randi_range(0, 2) - 1, 0, rng.randi_range(0, 2) - 1)
+			if not world.cm.is_ready(q2.x, q2.z):
+				return
+			if world.state_at(q2.x, q2.y + 1, q2.z) == 0 and _ignited_by_lava(world.state_at(q2.x, q2.y, q2.z)):
+				var up := q2 + Vector3i(0, 1, 0)
+				world.set_block(up.x, up.y, up.z, BlockUpdates.fire_state(world, up))
+
+
+## BlockBehaviour.Properties.ignitedByLava: the burnable blocks (wood, wool, leaves, plants, ...).
+static func _ignited_by_lava(st: int) -> bool:
+	return st > 0 and (BlockUpdates.ignite_odds(st) > 0 or (Res.blocks.st_flags[st] & BlockRegistry.F_FLAMMABLE) != 0)

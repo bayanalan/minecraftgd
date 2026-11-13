@@ -1,8 +1,7 @@
-## StructuresLegacy — non-jigsaw structures. Template-based (installed .nbt): igloo, shipwreck(+beached),
-## ruined_portal (+nether), nether_fossil, ocean_ruin, end_city (simplified recursion). Approximate original
-## builders (APPROXIMATE in PARITY_MATRIX; Java piece generators not reproduced block-for-block): stronghold (with a
-## complete End portal room), fortress (bridges, corridors, blaze spawners, nether wart), mineshaft, desert_pyramid,
-## jungle_temple, swamp_hut, buried_treasure, ocean_monument. woodland_mansion: not generated (documented).
+## StructuresLegacy — non-jigsaw structures. Template-based (game .nbt templates): igloo, shipwreck (+beached),
+## ruined_portal (+nether), nether_fossil, ocean_ruin, end_city (EndCityPieces recursion). StructurePiece code ported
+## in JavaPieces: stronghold, fortress, ocean monument, mineshaft, desert pyramid, jungle temple, swamp hut, buried
+## treasure. woodland_mansion: MansionPieces (WoodlandMansionPieces grid + piece placer).
 ## Contract: generate(structs, type, cfg, start_chunk, random) -> {} or {center, box, pieces? , blocks?, bes?, ents?}.
 class_name StructuresLegacy
 extends RefCounted
@@ -93,21 +92,17 @@ static func generate(st: Structures, t: String, cfg: Dictionary, sc: Vector2i, r
 		"end_city":
 			return _end_city(st, sc, r)
 		"stronghold":
-			return _stronghold(st, sc, r)
+			return JavaPieces.stronghold(st, sc)
 		"fortress":
-			return _fortress(st, sc, r)
+			return JavaPieces.fortress(st, sc, r)
 		"mineshaft":
-			return _mineshaft(st, cfg, sc, r)
-		"desert_pyramid":
-			return _desert_pyramid(st, sc, r)
-		"jungle_temple":
-			return _jungle_temple(st, sc, r)
-		"swamp_hut":
-			return _swamp_hut(st, sc, r)
+			return JavaPieces.mineshaft(st, cfg, sc, r)   # Java MineshaftPieces
+		"desert_pyramid", "jungle_temple", "swamp_hut":
+			return JavaPieces.scattered(st, t, sc, r)   # Java DesertPyramidPiece / JungleTemplePiece / SwampHutPiece
 		"buried_treasure":
-			return _buried_treasure(st, sc)
+			return JavaPieces.buried_treasure(sc)   # Java BuriedTreasurePieces
 		"ocean_monument":
-			return _monument(st, sc, r)
+			return JavaPieces.monument(st, sc, r)
 	return {}
 
 
@@ -117,6 +112,14 @@ static func _tpl_piece(loc: String, pos: Vector3i, rot: int, procs: Array = [], 
 		return {}
 	var el := {"t": "single", "loc": loc, "legacy": ignore_air, "proj": "rigid", "procs": procs}
 	return {"el": el, "pos": pos, "rot": rot, "box": tpl.box(pos, rot)}
+
+
+## Marks template pieces for TemplateStructurePiece.handleDataMarker (StructureTemplate._data_marker kinds).
+static func _with_markers(pieces: Array, kind: String) -> Array:
+	for p in pieces:
+		if not (p as Dictionary).is_empty():
+			p["el"]["markers"] = kind
+	return pieces
 
 
 static func _pieces_result(pieces: Array, center: Vector3i) -> Dictionary:
@@ -159,7 +162,7 @@ static func _igloo(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) 
 		for j in n - 1:
 			pieces.append(_tpl_piece("igloo/middle", lad + Vector3i(-1, -3 - j * 3, -1), rot, [], false))
 		pieces.append(_tpl_piece("igloo/bottom", lad + StructureTemplate.transform(Vector3i(-3, 0, -7), rot) + Vector3i(0, -3 - n * 3, 0), rot, [], false))
-	return _pieces_result(pieces, Vector3i(cx, y, cz))
+	return _pieces_result(_with_markers(pieces, "igloo"), Vector3i(cx, y, cz))
 
 
 const SHIP_OCEAN := ["shipwreck/with_mast", "shipwreck/sideways_full", "shipwreck/sideways_fronthalf", "shipwreck/sideways_backhalf", "shipwreck/rightsideup_full",
@@ -183,42 +186,245 @@ static func _shipwreck(st: Structures, cfg: Dictionary, sc: Vector2i, r: RandomS
 	if beached:
 		var tpl := StructureTemplate.get_template(loc)
 		y -= (tpl.size.y / 2 if tpl != null else 2) + r.next_int_bound(3)
-	return _pieces_result([_tpl_piece(loc, _centered(loc, Vector3i(cx, y, cz), rot), rot)], Vector3i(cx, y, cz))
+	return _pieces_result(_with_markers([_tpl_piece(loc, _centered(loc, Vector3i(cx, y, cz), rot), rot)], "shipwreck"), Vector3i(cx, y, cz))
 
 
+## Java RuinedPortalStructure.findGenerationPoint: setup (weighted), air pocket, template (5 % giant), rotation, mirror,
+## pivot = template centre; y from the placement (findSuitableY: the highest y at or below the placement's y where 3 of
+## the box's 4 corner columns hold a block, from the noise-stage base columns); the biome test is on the stub position
+## (chunk corner at that y), done here because y depends on the random. Returns the start with one ruined_portal piece.
 static func _ruined_portal(st: Structures, cfg: Dictionary, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
 	var setups: Array = cfg.get("setups", [{}])
-	var tot := 0.0
-	for s in setups:
-		tot += float(s.get("weight", 1.0))
-	var pick := r.next_float() * tot
 	var setup: Dictionary = setups[0]
-	for s in setups:
-		pick -= float(s.get("weight", 1.0))
-		if pick <= 0.0:
-			setup = s
-			break
-	var giant := r.next_float() < 0.05
-	var loc := "ruined_portal/giant_portal_%d" % (r.next_int_bound(3) + 1) if giant else "ruined_portal/portal_%d" % (r.next_int_bound(10) + 1)
+	if setups.size() > 1:
+		var tot := 0.0
+		for s in setups:
+			tot += float(s.get("weight", 1.0))
+		var fsel := r.next_float()
+		setup = setups[setups.size() - 1]
+		for s in setups:
+			fsel -= float(s.get("weight", 1.0)) / tot
+			if fsel < 0.0:
+				setup = s
+				break
+	var app := float(setup.get("air_pocket_probability", 0.0))
+	var air_pocket := app >= 1.0 or (app > 0.0 and r.next_float() < app)
+	var placement := str(setup.get("placement", "on_land_surface"))
+	var loc := ""
+	if r.next_float() < 0.05:
+		loc = "ruined_portal/giant_portal_%d" % (r.next_int_bound(3) + 1)
+	else:
+		loc = "ruined_portal/portal_%d" % (r.next_int_bound(10) + 1)
+	var tpl := StructureTemplate.get_template(loc)
+	if tpl == null:
+		return {}
 	var rot := r.next_int_bound(4)
-	var cx := sc.x * 16 + 8
-	var cz := sc.y * 16 + 8
-	var y := st.first_free_height(cx, cz) - 1
-	match str(setup.get("placement", "on_land_surface")):
-		"underground":
-			y = maxi(st.gen.gen_min_y + 15, y - 15 - r.next_int_bound(20))
-		"partly_buried":
-			y -= 4
-		"in_nether":
-			y = 32 + r.next_int_bound(60)
-		"on_ocean_floor":
-			y = st.first_free_height(cx, cz, true) - 1
-	var procs: Array = [{"t": "age", "moss": float(setup.get("mossiness", 0.2))},
-		{"t": "rule", "rules": [[{"t": "rblock", "id": st.gen.blocks.block_id("obsidian"), "p": 0.07}, {"t": "true"}, st.gen.blocks.default_state("crying_obsidian")]]}]
+	var mirror := 1 if r.next_float() >= 0.5 else 0   # Mirror.FRONT_BACK
+	var pivot := Vector3i(tpl.size.x / 2, 0, tpl.size.z / 2)
+	var origin := Vector3i(sc.x * 16, 0, sc.y * 16)
+	var bb := tpl.box_m(origin, rot, mirror, pivot)
+	var bmin: Vector3i = bb[0]
+	var bmax: Vector3i = bb[1]
+	var ctr := Vector3i(bmin.x + (bmax.x - bmin.x + 1) / 2, 0, bmin.z + (bmax.z - bmin.z + 1) / 2)
+	var ocean := placement == "on_ocean_floor"
+	var surface_y := st.base_height(ctr.x, ctr.z, ocean) - 1
+	var y := _rp_find_y(st, r, placement, air_pocket, surface_y, bmax.y - bmin.y + 1, bmin, bmax)
+	var pos := Vector3i(origin.x, y, origin.z)
+	if not (cfg.get("biomes", {}) as Dictionary).has(st.biome_id_at(pos.x, pos.y, pos.z)):
+		return {}
+	var cold := false
+	if bool(setup.get("can_be_cold", false)):
+		cold = st.gen.biome_temperature_at(st.biome_id_at(pos.x, pos.y, pos.z), pos.x, pos.y, pos.z) < 0.15
+	var blocks := st.gen.blocks
+	# RuinedPortalPiece.makeSettings: ignore (air kept only with an air pocket), rules, block age, protected blocks,
+	# lava-submerged blocks, blackstone
+	var rules: Array = [[{"t": "rblock", "id": blocks.block_id("gold_block"), "p": 0.3}, {"t": "true"}, 0]]
+	var lava_id := blocks.block_id("lava")
+	if ocean:
+		rules.append([{"t": "block", "id": lava_id}, {"t": "true"}, blocks.default_state("magma_block")])
+	elif cold:
+		rules.append([{"t": "block", "id": lava_id}, {"t": "true"}, blocks.default_state("netherrack")])
+	else:
+		rules.append([{"t": "rblock", "id": lava_id, "p": 0.2}, {"t": "true"}, blocks.default_state("magma_block")])
+	if not cold:
+		rules.append([{"t": "rblock", "id": blocks.block_id("netherrack"), "p": 0.07}, {"t": "true"}, blocks.default_state("magma_block")])
+	var prot := {}
+	for nm in Tags.blocks("#minecraft:features_cannot_replace"):
+		prot[blocks.block_id(nm)] = true
+	var procs: Array = [{"t": "rule", "rules": rules}, {"t": "age", "moss": float(setup.get("mossiness", 0.0))},
+		{"t": "protect", "ids": prot}, {"t": "lava_sub"}]
 	if bool(setup.get("replace_with_blackstone", false)):
-		procs.append({"t": "rule", "rules": [[{"t": "block", "id": st.gen.blocks.block_id("stone_bricks")}, {"t": "true"}, st.gen.blocks.default_state("polished_blackstone_bricks")]]})
-	return _pieces_result([_tpl_piece(loc, _centered(loc, Vector3i(cx, y, cz), rot), rot, procs)], Vector3i(cx, y, cz))
+		procs.append({"t": "blackstone"})
+	var pbox := tpl.box_m(pos, rot, mirror, pivot)
+	var el := {"t": "ruined_portal", "loc": loc, "legacy": not air_pocket, "proj": "rigid", "procs": procs, "mirror": mirror,
+		"pivot": pivot, "placement": placement, "cold": cold, "overgrown": bool(setup.get("overgrown", false)),
+		"vines": bool(setup.get("vines", false)), "tbox": pbox, "seed": RandomSources.pos_seed(pos.x, pos.y, pos.z) ^ st.gen.seed}
+	# the piece's reach: the template plus the netherrack spread around its centre (14) and drip columns below it
+	var pc: Vector3i = (pbox[0] + pbox[1]) / 2
+	var reach := [Vector3i(mini(pbox[0].x, pc.x - 14), pbox[0].y - 12, mini(pbox[0].z, pc.z - 14)), Vector3i(maxi(pbox[1].x, pc.x + 14), pbox[1].y + 1, maxi(pbox[1].z, pc.z + 14))]
+	return _pieces_result([{"el": el, "pos": pos, "rot": rot, "box": reach}], pos)
 
+
+static func _rp_between(r: RandomSources.LegacyRandom, a: int, b: int) -> int:
+	return r.next_int_bound(b - a + 1) + a
+
+
+## RuinedPortalStructure.findSuitableY.
+static func _rp_find_y(st: Structures, r: RandomSources.LegacyRandom, placement: String, air_pocket: bool, surface_y: int, yspan: int, bmin: Vector3i, bmax: Vector3i) -> int:
+	var min_y := st.gen.gen_min_y + 15
+	var y := surface_y
+	match placement:
+		"in_nether":
+			if air_pocket:
+				y = _rp_between(r, 32, 100)
+			elif r.next_float() < 0.5:
+				y = _rp_between(r, 27, 29)
+			else:
+				y = _rp_between(r, 29, 100)
+		"in_mountain":
+			var hi := surface_y - yspan
+			y = _rp_between(r, 70, hi) if 70 < hi else hi
+		"underground":
+			var hi2 := surface_y - yspan
+			y = _rp_between(r, min_y, hi2) if min_y < hi2 else hi2
+		"partly_buried":
+			y = surface_y - yspan + _rp_between(r, 2, 8)
+	var cols: Array = [st.base_column(bmin.x, bmin.z), st.base_column(bmax.x, bmin.z), st.base_column(bmin.x, bmax.z), st.base_column(bmax.x, bmax.z)]
+	var ocean := placement == "on_ocean_floor"
+	var yy := y
+	while yy > min_y:
+		var n := 0
+		var i := yy - st.gen.gen_min_y
+		for col in cols:
+			var k: int = (col as PackedByteArray)[i] if i >= 0 and i < (col as PackedByteArray).size() else 0
+			if (k == 1) if ocean else (k != 0):
+				n += 1
+				if n == 3:
+					return yy
+		yy -= 1
+	return yy
+
+
+const RP_SPREAD := [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.7, 0.6, 0.4, 0.2]
+const RP_DIRS := [Vector3i(0, 0, -1), Vector3i(1, 0, 0), Vector3i(0, 0, 1), Vector3i(-1, 0, 0)]
+const RP_DIR_NAMES := ["north", "east", "south", "west"]
+
+
+## RuinedPortalPiece placement + postProcess, clipped to this chunk: the template, then the netherrack / magma spread
+## around the portal (spreadNetherrack), drip columns under its netherrack floor, vines and leaves. Java draws these
+## from the decorating chunk's random in one pass; chunks here are placed in parallel, so each column / block uses
+## its own random from the start seed - every chunk computes the same blocks for the columns it owns.
+static func place_ruined_portal(st: Structures, c: Features.FCtx, el: Dictionary, pos: Vector3i, rot: int, cmin: Vector3i, cmax: Vector3i) -> void:
+	var f := st.f
+	var tpl := StructureTemplate.get_template(str(el["loc"]))
+	if tpl == null:
+		return
+	tpl.place(f, c, pos, rot, el["procs"], bool(el["legacy"]), false, cmin, cmax, 0, int(el["mirror"]), el["pivot"])
+	var blocks := f.blocks
+	var bb: Array = el["tbox"]
+	var bmin: Vector3i = bb[0]
+	var bmax: Vector3i = bb[1]
+	var seed := int(el["seed"])
+	var placement := str(el["placement"])
+	var cold := bool(el["cold"])
+	var overgrown := bool(el["overgrown"])
+	var nr := blocks.default_state("netherrack")
+	var magma := blocks.default_state("magma_block")
+	var nr_id := blocks.block_id("netherrack")
+	var obs_id := blocks.block_id("obsidian")
+	var lava_id := blocks.block_id("lava")
+	var prot := Tags.blocks("#minecraft:features_cannot_replace")
+	var leaves := blocks.with_prop(blocks.default_state("jungle_leaves"), "persistent", "true")
+	var place_nm := func(rr: RandomSources.LegacyRandom, p: Vector3i) -> void:
+		f.set_block(c, p, magma if (not cold and rr.next_float() < 0.07) else nr)
+	var drip := func(rr: RandomSources.LegacyRandom, p: Vector3i) -> void:
+		var q := p
+		place_nm.call(rr, q)
+		var n := 8
+		while n > 0 and rr.next_float() < 0.5:
+			q.y -= 1
+			n -= 1
+			place_nm.call(rr, q)
+	var leaves_above := func(rr: RandomSources.LegacyRandom, p: Vector3i) -> void:
+		if rr.next_float() < 0.5 and blocks.st_block[maxi(0, f.get_block(c, p))] == nr_id and f.get_block(c, p + Vector3i(0, 1, 0)) == 0:
+			f.set_block(c, p + Vector3i(0, 1, 0), leaves)
+	var inside := func(x: int, z: int) -> bool:
+		return x >= cmin.x and x <= cmax.x and z >= cmin.z and z <= cmax.z
+	# spreadNetherrack
+	var surf_follow := placement == "on_land_surface" or placement == "on_ocean_floor"
+	var ctr := Vector3i(bmin.x + (bmax.x - bmin.x + 1) / 2, 0, bmin.z + (bmax.z - bmin.z + 1) / 2)
+	var k := ((bmax.x - bmin.x + 1) + (bmax.z - bmin.z + 1)) / 2
+	var r0 := RandomSources.LegacyRandom.new(seed)
+	var l := r0.next_int_bound(maxi(1, 8 - k / 2))
+	var n := RP_SPREAD.size()
+	for x in range(ctr.x - n, ctr.x + n + 1):
+		for z in range(ctr.z - n, ctr.z + n + 1):
+			if not inside.call(x, z):
+				continue
+			var e := maxi(0, absi(x - ctr.x) + absi(z - ctr.z) + l)
+			if e >= n:
+				continue
+			var rr := RandomSources.LegacyRandom.new(RandomSources.pos_seed(x, 0, z) ^ seed)
+			if rr.next_double() >= float(RP_SPREAD[e]):
+				continue
+			var y := _rp_surface_y(f, c, x, z, placement, bmax.y)
+			var y2 := y if surf_follow else mini(bmin.y, y)
+			var mp := Vector3i(x, y2, z)
+			if absi(y2 - bmin.y) > 3:
+				continue
+			var cur := f.get_block(c, mp)
+			if cur <= 0:
+				continue
+			var cb := blocks.st_block[cur]
+			if cb == obs_id or prot.has(blocks.name_of(cur)) or (placement != "in_nether" and cb == lava_id):
+				continue
+			place_nm.call(rr, mp)
+			if overgrown:
+				leaves_above.call(rr, mp)
+			drip.call(rr, mp + Vector3i(0, -1, 0))
+	# addNetherrackDripColumnsBelowPortal
+	for x in range(bmin.x + 1, bmax.x):
+		for z in range(bmin.z + 1, bmax.z):
+			if not inside.call(x, z):
+				continue
+			var p := Vector3i(x, bmin.y, z)
+			var s0 := f.get_block(c, p)
+			if s0 > 0 and blocks.st_block[s0] == nr_id:
+				drip.call(RandomSources.LegacyRandom.new(RandomSources.pos_seed(x, bmin.y - 1, z) ^ seed), p + Vector3i(0, -1, 0))
+	# vines / leaves over the piece box
+	var vines := bool(el["vines"])
+	if not (vines or overgrown):
+		return
+	var vine := blocks.default_state("vine")
+	var vine_id := blocks.block_id("vine")
+	for y in range(bmin.y, bmax.y + 1):
+		for z in range(bmin.z - 1, bmax.z + 2):
+			for x in range(bmin.x - 1, bmax.x + 2):
+				var p2 := Vector3i(x, y, z)
+				var rr2 := RandomSources.LegacyRandom.new(RandomSources.pos_seed(x, y, z) ^ seed)
+				var in_box := x >= bmin.x and x <= bmax.x and z >= bmin.z and z <= bmax.z
+				if vines and in_box:
+					var s1 := f.get_block(c, p2)
+					var di := rr2.next_int_bound(4)
+					var q: Vector3i = p2 + RP_DIRS[di]
+					if s1 > 0 and blocks.st_block[s1] != vine_id and inside.call(q.x, q.z) and f.get_block(c, q) == 0:
+						var fl := blocks.st_flags[s1]
+						if (fl & BlockRegistry.F_FULL_SHAPE) and (fl & BlockRegistry.F_COLLIDE):
+							f.set_block(c, q, blocks.with_prop(vine, RP_DIR_NAMES[(di + 2) % 4], "true"))
+				if overgrown and in_box and inside.call(x, z):
+					leaves_above.call(rr2, p2)
+
+
+## getSurfaceY: the WORLD_SURFACE_WG (OCEAN_FLOOR_WG on the ocean floor) height - 1, counting this chunk's placed
+## blocks (Java's worldgen heightmaps follow the blocks the template just placed).
+static func _rp_surface_y(f: Features, c: Features.FCtx, x: int, z: int, placement: String, top: int) -> int:
+	var ocean := placement == "on_ocean_floor"
+	var h := f.height(c, "OCEAN_FLOOR_WG" if ocean else "WORLD_SURFACE_WG", x, z) - 1
+	for y in range(top + 1, h, -1):
+		var s := f.get_block(c, Vector3i(x, y, z))
+		if s > 0 and (not ocean or (f.blocks.st_flags[s] & BlockRegistry.F_COLLIDE) != 0):
+			return y
+	return h
 
 static func _nether_fossil(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
 	var x := sc.x * 16 + r.next_int_bound(16)
@@ -270,290 +476,195 @@ static func _ocean_ruin(st: Structures, cfg: Dictionary, sc: Vector2i, r: Random
 	var cz := sc.y * 16 + 8
 	var y := st.first_free_height(cx, cz, true) - 1
 	var procs: Array = [{"t": "rot", "integrity": float(cfg.get("large_probability", 0.9)) * 0.0 + 0.9}]
-	return _pieces_result([_tpl_piece(loc, _centered(loc, Vector3i(cx, y, cz), rot), rot, procs)], Vector3i(cx, y, cz))
+	return _pieces_result(_with_markers([_tpl_piece(loc, _centered(loc, Vector3i(cx, y, cz), rot), rot, procs)], "ocean_ruin_big" if big else "ocean_ruin_small"), Vector3i(cx, y, cz))
 
 
-## Simplified EndCityPieces: base floor + roof, stacked floors and a tower; ship on large cities.
+## Java EndCityStructure + EndCityPieces: random rotation, the start 7 blocks into the chunk at the lowest of the
+## 5 x 5 box corners (nothing below y 60), base floor + second / third floor + roof, then the recursive section
+## generators (tower, tower bridge with the one ship, house tower, fat tower) with their collision rule (a batch is
+## dropped when it hits a piece of another batch). Pieces are templates; data markers give chest loot, shulkers and
+## the elytra frame (StructureTemplate._data_marker).
+const EC_TOWER_BRIDGES := [[0, Vector3i(1, -1, 0)], [1, Vector3i(6, -1, 1)], [3, Vector3i(0, -1, 5)], [2, Vector3i(5, -1, 6)]]
+const EC_FAT_BRIDGES := [[0, Vector3i(4, -1, 0)], [1, Vector3i(12, -1, 4)], [3, Vector3i(0, -1, 8)], [2, Vector3i(8, -1, 12)]]
+
+
 static func _end_city(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
 	var rot := r.next_int_bound(4)
-	var cx := sc.x * 16 + 8
-	var cz := sc.y * 16 + 8
-	var y := st.first_free_height(cx, cz)
-	if y < 60:
+	var i := 5
+	var j := 5
+	match rot:
+		1:
+			i = -5
+		2:
+			i = -5
+			j = -5
+		3:
+			j = -5
+	var k := sc.x * 16 + 7
+	var l := sc.y * 16 + 7
+	var lo := 1 << 30
+	for cxz in [Vector2i(k, l), Vector2i(k, l + j), Vector2i(k + i, l), Vector2i(k + i, l + j)]:
+		lo = mini(lo, st.base_height(cxz.x, cxz.y, false) - 1)
+	if lo < 60:
 		return {}
-	var base := _centered("end_city/base_floor", Vector3i(cx, y, cz), rot)
-	# Java EndCityPieces "overwrite": true -> STRUCTURE_BLOCK (air placed), false -> STRUCTURE_AND_AIR
-	var pieces: Array = [_tpl_piece("end_city/base_floor", base, rot, [], false)]
-	var h := 8
-	var levels := r.next_int_bound(3)
-	var floors := [["end_city/second_floor_1", "end_city/second_roof"], ["end_city/third_floor_1", "end_city/third_roof"]]
-	var cur := base + Vector3i(0, 4, 0)
-	for i in levels:
-		var fl: Array = floors[mini(i, 1)]
-		pieces.append(_tpl_piece(fl[0], cur, rot, [], true))
-		var tp := StructureTemplate.get_template(fl[0])
-		cur += Vector3i(0, (tp.size.y if tp != null else h), 0)
-	var roof: String = "end_city/base_roof" if levels == 0 else floors[mini(levels - 1, 1)][1]
-	pieces.append(_tpl_piece(roof, cur, rot, [], roof == "end_city/second_roof"))
-	var tw := base + StructureTemplate.transform(Vector3i(3, cur.y - base.y + 4, 3), rot)
-	pieces.append(_tpl_piece("end_city/tower_base", tw, rot, [], false))
-	var tcur := tw + Vector3i(0, 3, 0)
-	for i in r.next_int_bound(3) + 2:
-		pieces.append(_tpl_piece("end_city/tower_piece", tcur + Vector3i(1, 0, 1), rot, [], false))
-		tcur += Vector3i(0, 4, 0)
-	pieces.append(_tpl_piece("end_city/tower_top", tcur, rot, [], false))
-	if r.next_int_bound(10) < 4:
-		pieces.append(_tpl_piece("end_city/ship", tcur + StructureTemplate.transform(Vector3i(-4, 8, -12), rot), rot, [], false))
-	return _pieces_result(pieces, Vector3i(cx, y, cz))
+	var start := Vector3i(k, lo, l)
+	var pieces: Array = []
+	var gens := {"ship": false}
+	var p := _ec_new(pieces, "base_floor", start, rot, true)
+	p = _ec_add(pieces, _ec_child(p, Vector3i(-1, 0, -1), "second_floor_1", rot, false))
+	p = _ec_add(pieces, _ec_child(p, Vector3i(-1, 4, -1), "third_floor_1", rot, false))
+	p = _ec_add(pieces, _ec_child(p, Vector3i(-1, 8, -1), "third_roof", rot, true))
+	_ec_recursive(r, gens, "tower", 1, p, null, pieces)
+	var out: Array = []
+	for pc in pieces:
+		out.append(_tpl_piece("end_city/" + str(pc["loc"]), pc["pos"], int(pc["rot"]), [], not bool(pc["ow"])))
+	return _pieces_result(_with_markers(out, "end_city"), start)
 
 
-# ------------------------------------------------------------------ approximate builders
-
-static func _sb(b: Builder, r: RandomSources.LegacyRandom) -> int:
-	var fl := r.next_float()
-	if fl < 0.2:
-		return b.s("cracked_stone_bricks")
-	if fl < 0.5:
-		return b.s("mossy_stone_bricks")
-	if fl < 0.55:
-		return b.s("infested_stone_bricks")
-	return b.s("stone_bricks")
+static func _ec_new(pieces: Array, loc: String, pos: Vector3i, rot: int, ow: bool) -> Dictionary:
+	var pc := _ec_piece(loc, pos, rot, ow)
+	pieces.append(pc)
+	return pc
 
 
-static func _stronghold(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
-	var b := Builder.new()
-	b.reg = st.gen.blocks
-	var top := mini(st.gen.sea_level - 10 - r.next_int_bound(10), st.first_free_height(sc.x * 16 + 8, sc.y * 16 + 8) - 12)
-	var o := Vector3i(sc.x * 16 + 2, top, sc.y * 16 + 2)
-	var wall := func(_p: Vector3i) -> int: return _sb(b, r)
-	# spiral staircase down from the start room
-	b.room(o, o + Vector3i(4, 10, 4), wall)
-	for i in 10:
-		var yy := o.y + 9 - i
-		var spots := [Vector3i(1, 0, 1), Vector3i(2, 0, 1), Vector3i(3, 0, 1), Vector3i(3, 0, 2), Vector3i(3, 0, 3), Vector3i(2, 0, 3), Vector3i(1, 0, 3), Vector3i(1, 0, 2)]
-		var sp: Vector3i = spots[i % spots.size()]
-		b.put(Vector3i(o.x + sp.x, yy, o.z + sp.z), b.s("stone_brick_slab"))
-	# corridor network (random walk of 5x5 corridors and rooms)
-	var cur := o + Vector3i(2, 0, 2)
-	var dirs := [Vector3i(1, 0, 0), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(0, 0, -1)]
-	var d: Vector3i = dirs[r.next_int_bound(4)]
-	var steps := 10 + r.next_int_bound(6)
-	for i in steps:
-		var ln := 7 + r.next_int_bound(9)
-		var a := cur + Vector3i(-2, 0, -2)
-		var e := cur + d * ln + Vector3i(2, 4, 2)
-		b.room(Vector3i(mini(a.x, e.x), a.y, mini(a.z, e.z)), Vector3i(maxi(a.x, e.x), e.y, maxi(a.z, e.z)), wall)
-		cur += d * ln
-		var kind := r.next_int_bound(6)
-		if kind == 0:
-			# library
-			var la := cur + Vector3i(-7, 0, -7)
-			b.room(la, la + Vector3i(14, 6, 14), wall)
-			for z in range(la.z + 1, la.z + 14):
-				b.put(Vector3i(la.x + 1, la.y + 1, z), b.s("bookshelf"))
-				b.put(Vector3i(la.x + 1, la.y + 2, z), b.s("bookshelf"))
-				b.put(Vector3i(la.x + 13, la.y + 1, z), b.s("bookshelf"))
-				b.put(Vector3i(la.x + 13, la.y + 2, z), b.s("bookshelf"))
-			b.chest(la + Vector3i(7, 1, 2), "chests/stronghold_library")
-		elif kind == 1:
-			var ra := cur + Vector3i(-4, 0, -4)
-			b.room(ra, ra + Vector3i(8, 6, 8), wall)
-			b.chest(ra + Vector3i(4, 1, 4), "chests/stronghold_crossing")
-		elif kind == 2:
-			b.put(cur + Vector3i(0, 1, 0), b.s("torch"))
-		if r.next_int_bound(3) == 0:
-			d = dirs[r.next_int_bound(4)]
-	# portal room at the end
-	var pr := cur + d * 3 + Vector3i(-5, 0, -7)
-	b.room(pr, pr + Vector3i(10, 7, 15), wall)
-	for x in range(pr.x + 1, pr.x + 10):
-		for z in range(pr.z + 1, pr.z + 15):
-			b.put(Vector3i(x, pr.y + 1, z), 0)
-	# lava pool + stairs + frames
-	var c := pr + Vector3i(5, 3, 8)
-	for dz in range(-1, 2):
-		for dx in range(-1, 2):
-			b.put(c + Vector3i(dx, -1, dz), b.s("lava"))
-	var frame := b.s("end_portal_frame")
-	var ring := [[Vector3i(-1, 0, -2), "south"], [Vector3i(0, 0, -2), "south"], [Vector3i(1, 0, -2), "south"], [Vector3i(-1, 0, 2), "north"], [Vector3i(0, 0, 2), "north"], [Vector3i(1, 0, 2), "north"],
-		[Vector3i(-2, 0, -1), "east"], [Vector3i(-2, 0, 0), "east"], [Vector3i(-2, 0, 1), "east"], [Vector3i(2, 0, -1), "west"], [Vector3i(2, 0, 0), "west"], [Vector3i(2, 0, 1), "west"]]
-	var all_eyes := true
-	for e2 in ring:
-		var eye := r.next_float() > 0.9
-		all_eyes = all_eyes and eye
-		b.put(c + e2[0], b.reg.with_prop(b.reg.with_prop(frame, "facing", e2[1]), "eye", "true" if eye else "false"))
-	if all_eyes:
-		for dz in range(-1, 2):
-			for dx in range(-1, 2):
-				b.put(c + Vector3i(dx, 0, dz), b.s("end_portal"))
-	for i in 3:
-		b.put(c + Vector3i(0, -2 + i, -4 - i), b.s("stone_brick_stairs"))
-	b.spawner(pr + Vector3i(5, 2, 13), "silverfish")
-	return b.result(c)
+static func _ec_piece(loc: String, pos: Vector3i, rot: int, ow: bool) -> Dictionary:
+	var tpl := StructureTemplate.get_template("end_city/" + loc)
+	var bx: Array = tpl.box(pos, rot) if tpl != null else [pos, pos]
+	return {"loc": loc, "pos": pos, "rot": rot, "ow": ow, "box": bx, "gd": 0}
 
 
-static func _fortress(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
-	var b := Builder.new()
-	b.reg = st.gen.blocks
-	var nb := b.s("nether_bricks")
-	var fence := b.s("nether_brick_fence")
-	var y := 48 + r.next_int_bound(23)
-	var o := Vector3i(sc.x * 16 + 2, y, sc.y * 16 + 2)
-	var cur := o
-	var dirs := [Vector3i(1, 0, 0), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(0, 0, -1)]
-	var d: Vector3i = dirs[r.next_int_bound(4)]
-	for i in 8 + r.next_int_bound(6):
-		var ln := 10 + r.next_int_bound(10)
-		for k in ln:
-			var p := cur + d * k
-			var side := Vector3i(d.z, 0, d.x)
-			for w in range(-2, 3):
-				b.put(p + side * w, nb)
-				b.put(p + side * w + Vector3i(0, 1, 0), fence if absi(w) == 2 else 0)
-				for hgt in range(2, 5):
-					b.put(p + side * w + Vector3i(0, hgt, 0), 0)
-			# support pillars
-			if k % 6 == 0:
-				for py in range(1, 20):
-					b.put(p + Vector3i(0, -py, 0), nb)
-		cur += d * ln
-		var room := r.next_int_bound(4)
-		if room == 0:
-			var a := cur + Vector3i(-3, 0, -3)
-			b.fill(a, a + Vector3i(6, 0, 6), nb)
-			b.spawner(cur + Vector3i(0, 1, 0), "blaze")
-			for x in range(-3, 4):
-				b.put(cur + Vector3i(x, 1, -3), fence)
-				b.put(cur + Vector3i(x, 1, 3), fence)
-		elif room == 1:
-			var a2 := cur + Vector3i(-4, 0, -4)
-			b.fill(a2, a2 + Vector3i(8, 0, 8), nb)
-			for x in range(-2, 3):
-				b.put(cur + Vector3i(x, 0, 0), b.s("soul_sand"))
-				b.put(cur + Vector3i(x, 1, 0), b.reg.with_prop(b.s("nether_wart"), "age", str(r.next_int_bound(4))))
-			b.chest(cur + Vector3i(3, 1, 3), "chests/nether_bridge")
-		if r.next_int_bound(2) == 0:
-			d = dirs[r.next_int_bound(4)]
-	return b.result(o)
+## EndCityPieces.addPiece: the child template at the parent's position + the offset turned by the parent's rotation
+## (calculateConnectedPosition with a zero child anchor).
+static func _ec_child(parent: Dictionary, off: Vector3i, loc: String, rot: int, ow: bool) -> Dictionary:
+	return _ec_piece(loc, parent["pos"] + StructureTemplate.transform(off, int(parent["rot"])), rot, ow)
 
 
-static func _mineshaft(st: Structures, cfg: Dictionary, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
-	var b := Builder.new()
-	b.reg = st.gen.blocks
-	var mesa := str(cfg.get("mineshaft_type", "normal")) == "mesa"
-	var plank := b.s("dark_oak_planks" if mesa else "oak_planks")
-	var fence := b.s("dark_oak_fence" if mesa else "oak_fence")
-	var y := (st.gen.sea_level - 10 - r.next_int_bound(30)) if not mesa else st.gen.sea_level + r.next_int_bound(20)
-	y = maxi(y, st.gen.gen_min_y + 12)
-	var o := Vector3i(sc.x * 16 + 8, y, sc.y * 16 + 8)
-	b.begin_part()   # room
-	b.fill(o + Vector3i(-4, 0, -4), o + Vector3i(4, 4, 4), 0)
-	b.fill(o + Vector3i(-4, -1, -4), o + Vector3i(4, -1, 4), b.s("dirt"))
-	var dirs := [Vector3i(1, 0, 0), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(0, 0, -1)]
-	var stack: Array = [[o, dirs[0], 0], [o, dirs[1], 0], [o, dirs[2], 0], [o, dirs[3], 0]]
-	var budget := 30
-	while not stack.is_empty() and budget > 0:
-		budget -= 1
-		var e: Array = stack.pop_back()
-		var cur: Vector3i = e[0]
-		var d: Vector3i = e[1]
-		var depth: int = e[2]
-		var ln := 10 + r.next_int_bound(20)
-		var side := Vector3i(d.z, 0, d.x)
-		b.begin_part()   # corridor
-		for k in ln:
-			var p := cur + d * k
-			for w in range(-1, 2):
-				for h in range(0, 3):
-					b.put(p + side * w + Vector3i(0, h, 0), 0)
-			if k % 4 == 0:
-				b.put(p + side * -1, fence)
-				b.put(p + side * -1 + Vector3i(0, 1, 0), fence)
-				b.put(p + side * 1, fence)
-				b.put(p + side * 1 + Vector3i(0, 1, 0), fence)
-				for w2 in range(-1, 2):
-					b.put(p + side * w2 + Vector3i(0, 2, 0), plank)
-			elif r.next_int_bound(3) == 0:
-				b.put(p, b.reg.with_prop(b.s("rail"), "shape", "east_west" if d.x != 0 else "north_south"))
-			if r.next_int_bound(40) == 0:
-				b.put(p + side * w_rand(r) + Vector3i(0, 2, 0), b.s("cobweb"))
-			if r.next_int_bound(100) == 0:
-				b.chest(p + side, "chests/abandoned_mineshaft")
-		if r.next_int_bound(23) == 0 and not mesa:
-			b.spawner(cur + d * (ln / 2), "cave_spider")
-		var end := cur + d * ln
-		if depth < 6:
-			stack.append([end, d, depth + 1])
-			if r.next_int_bound(3) == 0:
-				stack.append([end, Vector3i(d.z, 0, -d.x), depth + 1])
-			if r.next_int_bound(3) == 0:
-				stack.append([end, Vector3i(-d.z, 0, d.x), depth + 1])
-	var res := b.result(o)
-	if not res.is_empty():
-		res["dry"] = true   # parts touching liquid are skipped per chunk, nothing replaces liquid (structures.gd _place_start)
-	return res
+static func _ec_add(lst: Array, pc: Dictionary) -> Dictionary:
+	lst.append(pc)
+	return pc
 
 
-static func w_rand(r: RandomSources.LegacyRandom) -> int:
-	return r.next_int_bound(3) - 1
+static func _ec_hit(pieces: Array, bx: Array) -> Dictionary:
+	for o in pieces:
+		var ob: Array = o["box"]
+		if bx[1].x >= ob[0].x and bx[0].x <= ob[1].x and bx[1].y >= ob[0].y and bx[0].y <= ob[1].y and bx[1].z >= ob[0].z and bx[0].z <= ob[1].z:
+			return o
+	return {}
 
 
-static func _desert_pyramid(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
-	var b := Builder.new()
-	b.reg = st.gen.blocks
-	var o := Vector3i(sc.x * 16, st.first_free_height(sc.x * 16 + 10, sc.y * 16 + 10) - 1, sc.y * 16)
-	var ss := b.s("sandstone")
-	for lvl in 10:
-		b.fill(o + Vector3i(lvl, lvl, lvl), o + Vector3i(20 - lvl, lvl, 20 - lvl), ss)
-		if lvl > 0 and lvl < 9:
-			b.fill(o + Vector3i(lvl + 1, lvl, lvl + 1), o + Vector3i(19 - lvl, lvl, 19 - lvl), 0 if lvl < 5 else ss)
-	b.fill(o + Vector3i(1, -14, 1), o + Vector3i(19, -1, 19), ss)
-	b.fill(o + Vector3i(8, -13, 8), o + Vector3i(12, -10, 12), 0)
-	b.put(o + Vector3i(10, -14, 10), b.s("stone_pressure_plate") if false else b.s("tnt"))
-	b.chest(o + Vector3i(10, -13, 8), "chests/desert_pyramid", "south")
-	b.chest(o + Vector3i(10, -13, 12), "chests/desert_pyramid", "north")
-	b.chest(o + Vector3i(8, -13, 10), "chests/desert_pyramid", "east")
-	b.chest(o + Vector3i(12, -13, 10), "chests/desert_pyramid", "west")
-	b.fill(o + Vector3i(10, -9, 10), o + Vector3i(10, 0, 10), 0)
-	b.put(o + Vector3i(10, 0, 10), b.s("blue_terracotta"))
-	return b.result(o + Vector3i(10, 0, 10))
+static func _ec_recursive(r: RandomSources.LegacyRandom, gens: Dictionary, gen: String, depth: int, parent: Dictionary, pos, pieces: Array) -> bool:
+	if depth > 8:
+		return false
+	var lst: Array = []
+	var ok := false
+	match gen:
+		"tower":
+			ok = _ec_tower(r, gens, depth, parent, lst)
+		"bridge":
+			ok = _ec_bridge(r, gens, depth, parent, lst)
+		"house":
+			ok = _ec_house(r, gens, depth, parent, pos, lst)
+		"fat":
+			ok = _ec_fat(r, gens, depth, parent, lst)
+	if not ok:
+		return false
+	var gd := r.next_int()
+	for sp in lst:
+		sp["gd"] = gd
+		var hit := _ec_hit(pieces, sp["box"])
+		if not hit.is_empty() and int(hit["gd"]) != int(parent["gd"]):
+			return false
+	pieces.append_array(lst)
+	return true
 
 
-static func _jungle_temple(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
-	var b := Builder.new()
-	b.reg = st.gen.blocks
-	var o := Vector3i(sc.x * 16, st.first_free_height(sc.x * 16 + 6, sc.y * 16 + 7) - 1, sc.y * 16)
-	var wall := func(_p: Vector3i) -> int: return b.s("mossy_cobblestone") if r.next_float() < 0.4 else b.s("cobblestone")
-	b.room(o + Vector3i(0, -4, 0), o + Vector3i(11, 4, 14), wall)
-	b.room(o + Vector3i(2, 4, 2), o + Vector3i(9, 9, 12), wall)
-	b.chest(o + Vector3i(8, -3, 3), "chests/jungle_temple", "west")
-	b.chest(o + Vector3i(9, -3, 10), "chests/jungle_temple", "north")
-	b.put(o + Vector3i(3, -3, 6), b.reg.with_prop(b.s("dispenser"), "facing", "south"))
-	b.bes[o + Vector3i(3, -3, 6)] = {"id": "dispenser", "loot_table": "chests/jungle_temple_dispenser"}
-	for dz in range(5, 9):
-		b.put(o + Vector3i(5, 0, dz), 0)
-		b.put(o + Vector3i(6, 0, dz), 0)
-	return b.result(o + Vector3i(6, 0, 7))
+static func _ec_house(r: RandomSources.LegacyRandom, gens: Dictionary, depth: int, parent: Dictionary, pos: Vector3i, lst: Array) -> bool:
+	if depth > 8:
+		return false
+	var rot: int = parent["rot"]
+	var p := _ec_add(lst, _ec_child(parent, pos, "base_floor", rot, true))
+	var i := r.next_int_bound(3)
+	if i == 0:
+		_ec_add(lst, _ec_child(p, Vector3i(-1, 4, -1), "base_roof", rot, true))
+	elif i == 1:
+		p = _ec_add(lst, _ec_child(p, Vector3i(-1, 0, -1), "second_floor_2", rot, false))
+		p = _ec_add(lst, _ec_child(p, Vector3i(-1, 8, -1), "second_roof", rot, false))
+		_ec_recursive(r, gens, "tower", depth + 1, p, null, lst)
+	else:
+		p = _ec_add(lst, _ec_child(p, Vector3i(-1, 0, -1), "second_floor_2", rot, false))
+		p = _ec_add(lst, _ec_child(p, Vector3i(-1, 4, -1), "third_floor_2", rot, false))
+		p = _ec_add(lst, _ec_child(p, Vector3i(-1, 8, -1), "third_roof", rot, true))
+		_ec_recursive(r, gens, "tower", depth + 1, p, null, lst)
+	return true
 
 
-static func _swamp_hut(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
-	var b := Builder.new()
-	b.reg = st.gen.blocks
-	var o := Vector3i(sc.x * 16, st.first_free_height(sc.x * 16 + 3, sc.y * 16 + 4), sc.y * 16)
-	var plank := b.s("spruce_planks")
-	var log_ := b.s("oak_log")
-	for p in [Vector3i(1, 0, 2), Vector3i(5, 0, 2), Vector3i(1, 0, 7), Vector3i(5, 0, 7)]:
-		for yy in range(-3, 4):
-			b.put(o + p + Vector3i(0, yy, 0), log_)
-	b.fill(o + Vector3i(1, 1, 1), o + Vector3i(5, 1, 7), plank)
-	var wall := func(_p: Vector3i) -> int: return plank
-	b.room(o + Vector3i(1, 1, 2), o + Vector3i(5, 5, 7), wall)
-	b.put(o + Vector3i(3, 3, 2), 0)
-	b.put(o + Vector3i(3, 2, 2), 0)
-	b.put(o + Vector3i(4, 2, 6), b.s("cauldron"))
-	b.put(o + Vector3i(2, 2, 6), b.s("crafting_table"))
-	b.put(o + Vector3i(2, 3, 6), b.s("potted_red_mushroom"))
-	return b.result(o + Vector3i(3, 2, 4))
+static func _ec_tower(r: RandomSources.LegacyRandom, gens: Dictionary, depth: int, parent: Dictionary, lst: Array) -> bool:
+	var rot: int = parent["rot"]
+	var ox := 3 + r.next_int_bound(2)
+	var oz := 3 + r.next_int_bound(2)
+	var p := _ec_add(lst, _ec_child(parent, Vector3i(ox, -3, oz), "tower_base", rot, true))
+	p = _ec_add(lst, _ec_child(p, Vector3i(0, 7, 0), "tower_piece", rot, true))
+	var p1 = p if r.next_int_bound(3) == 0 else null
+	var i := 1 + r.next_int_bound(3)
+	for j in i:
+		p = _ec_add(lst, _ec_child(p, Vector3i(0, 4, 0), "tower_piece", rot, true))
+		if j < i - 1 and r.next_bool():
+			p1 = p
+	if p1 != null:
+		for tb in EC_TOWER_BRIDGES:
+			if r.next_bool():
+				var p2 := _ec_add(lst, _ec_child(p1, tb[1], "bridge_end", (rot + int(tb[0])) % 4, true))
+				_ec_recursive(r, gens, "bridge", depth + 1, p2, null, lst)
+		_ec_add(lst, _ec_child(p, Vector3i(-1, 4, -1), "tower_top", rot, true))
+	else:
+		if depth != 7:
+			return _ec_recursive(r, gens, "fat", depth + 1, p, null, lst)
+		_ec_add(lst, _ec_child(p, Vector3i(-1, 4, -1), "tower_top", rot, true))
+	return true
+
+
+static func _ec_bridge(r: RandomSources.LegacyRandom, gens: Dictionary, depth: int, parent: Dictionary, lst: Array) -> bool:
+	var rot: int = parent["rot"]
+	var i := r.next_int_bound(4) + 1
+	var p := _ec_add(lst, _ec_child(parent, Vector3i(0, 0, -4), "bridge_piece", rot, true))
+	p["gd"] = -1
+	var j := 0
+	for k in i:
+		if r.next_bool():
+			p = _ec_add(lst, _ec_child(p, Vector3i(0, j, -4), "bridge_piece", rot, true))
+			j = 0
+		else:
+			if r.next_bool():
+				p = _ec_add(lst, _ec_child(p, Vector3i(0, j, -4), "bridge_steep_stairs", rot, true))
+			else:
+				p = _ec_add(lst, _ec_child(p, Vector3i(0, j, -8), "bridge_gentle_stairs", rot, true))
+			j = 4
+	if not bool(gens["ship"]) and r.next_int_bound(10 - depth) == 0:
+		var sx := -8 + r.next_int_bound(8)
+		var sz := -70 + r.next_int_bound(10)
+		_ec_add(lst, _ec_child(p, Vector3i(sx, j, sz), "ship", rot, true))
+		gens["ship"] = true
+	elif not _ec_recursive(r, gens, "house", depth + 1, p, Vector3i(-3, j + 1, -11), lst):
+		return false
+	p = _ec_add(lst, _ec_child(p, Vector3i(4, j, 0), "bridge_end", (rot + 2) % 4, true))
+	p["gd"] = -1
+	return true
+
+
+static func _ec_fat(r: RandomSources.LegacyRandom, gens: Dictionary, depth: int, parent: Dictionary, lst: Array) -> bool:
+	var rot: int = parent["rot"]
+	var p := _ec_add(lst, _ec_child(parent, Vector3i(-3, 4, -3), "fat_tower_base", rot, true))
+	p = _ec_add(lst, _ec_child(p, Vector3i(0, 4, 0), "fat_tower_middle", rot, true))
+	var i := 0
+	while i < 2 and r.next_int_bound(3) != 0:
+		p = _ec_add(lst, _ec_child(p, Vector3i(0, 8, 0), "fat_tower_middle", rot, true))
+		for tb in EC_FAT_BRIDGES:
+			if r.next_bool():
+				var p1 := _ec_add(lst, _ec_child(p, tb[1], "bridge_end", (rot + int(tb[0])) % 4, true))
+				_ec_recursive(r, gens, "bridge", depth + 1, p1, null, lst)
+		i += 1
+	_ec_add(lst, _ec_child(p, Vector3i(-2, 8, -2), "fat_tower_top", rot, true))
+	return true
 
 
 static func _buried_treasure(st: Structures, sc: Vector2i) -> Dictionary:
@@ -566,30 +677,3 @@ static func _buried_treasure(st: Structures, sc: Vector2i) -> Dictionary:
 	b.chest(Vector3i(x, y, z), "chests/buried_treasure")
 	return b.result(Vector3i(x, y, z))
 
-
-static func _monument(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
-	var b := Builder.new()
-	b.reg = st.gen.blocks
-	var o := Vector3i(sc.x * 16 - 29, 39, sc.y * 16 - 29)
-	var pr := b.s("prismarine")
-	var pb := b.s("prismarine_bricks")
-	var dp := b.s("dark_prismarine")
-	var sea := b.s("sea_lantern")
-	var water := b.s("water")
-	for yy in 23:
-		var inset := maxi(0, yy - 12)
-		for z in range(inset, 58 - inset):
-			for x in range(inset, 58 - inset):
-				var edge := x == inset or x == 57 - inset or z == inset or z == 57 - inset or yy == 0 or yy == 22
-				var p := o + Vector3i(x, yy, z)
-				if edge:
-					b.put(p, sea if (x % 8 == 0 and z % 8 == 0) else (pb if yy % 4 == 0 else pr))
-				elif yy == 8 or yy == 16:
-					b.put(p, dp if (x + z) % 5 != 0 else water)
-				else:
-					b.put(p, water)
-	for dz in range(26, 32):
-		for dx in range(26, 32):
-			for dy in range(9, 11):
-				b.put(o + Vector3i(dx, dy, dz), b.s("gold_block") if dy == 10 and dx in [28, 29] and dz in [28, 29] else dp)
-	return b.result(o + Vector3i(29, 11, 29))

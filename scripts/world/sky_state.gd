@@ -85,10 +85,14 @@ func _biome_blend(world, pos: Vector3) -> Array:
 		var ccx := int(floor(pos.x / 16.0))
 		var ccz := int(floor(pos.z / 16.0))
 		var b9: Array = []
+		_blend_partial = false
 		for dz in range(-1, 2):
 			for dx in range(-1, 2):
 				var ch: Chunk = world.cm.get_chunk(ccx + dx, ccz + dz)
-				b9.append(ch.biomes if ch != null and ch.state >= Chunk.DATA_READY else null)
+				var ready := ch != null and ch.state >= Chunk.DATA_READY
+				if not ready:
+					_blend_partial = true
+				b9.append(ch.biomes if ready else null)
 		var dfog0 := _ac(world.dim_type, "minecraft:visual/fog_color", Color8(0xc0, 0xd8, 0xff))
 		var r: PackedColorArray = Native.inst.sky_blend(b9, ccx, ccz, pos.x, pos.y, pos.z, world.biomes.sky, world.biomes.fog,
 			PackedColorArray([Color8(0x78, 0xa7, 0xff), dfog0]))[0]
@@ -99,6 +103,7 @@ func _biome_blend(world, pos: Vector3) -> Array:
 		_bio_key = base
 		_bio_sky = []
 		_bio_fog = []
+		_blend_partial = false
 		var dfog := attr_color(world.dim_type, "minecraft:visual/fog_color", Color8(0xc0, 0xd8, 0xff))
 		for l in 6:
 			for n in 6:
@@ -108,7 +113,9 @@ func _biome_blend(world, pos: Vector3) -> Array:
 					var bz := (base.z - 2 + s) * 4
 					var c: Chunk = world.cm.get_chunk(bx >> 4, bz >> 4) if world.cm != null else null
 					var bio := -1
-					if c != null and c.state >= Chunk.DATA_READY:
+					if c == null or c.state < Chunk.DATA_READY:
+						_blend_partial = true
+					else:
 						bio = c.biome_at(bx & 15, clampi(by, Coords.MIN_Y, Coords.MAX_Y - 1), bz & 15)
 					var sk: Color = world.biomes.sky[bio] if bio >= 0 and bio < world.biomes.sky.size() else Color8(0x78, 0xa7, 0xff)
 					var fg: Color = world.biomes.fog[bio] if bio >= 0 and bio < world.biomes.fog.size() else dfog
@@ -136,11 +143,34 @@ func _biome_blend(world, pos: Vector3) -> Array:
 
 ## Timeline / biome / weather part (depends on the game tick, camera block and weather only): sky colour, fog base,
 ## light colours, celestial angles. update() reruns it when one of those changes (20 x / s instead of every frame).
-func _update_slow(world, cam_pos: Vector3, ticks: float, rain: float, thunder: float) -> void:
+## Split by what each part depends on (it ran in full on every tick AND every block the camera crossed: 0.2-0.6 ms
+## each time while flying): the biome blend on camera block changes, the time-only timeline tracks on tick / weather
+## changes, the sky / fog colours (timeline over the blended biome colours) on either.
+func _update_slow(world, cam_pos: Vector3, ticks: float, rain: float, thunder: float, pos_changed := true, time_changed := true) -> void:
+	if pos_changed:
+		_blend = _biome_blend(world, cam_pos)
+	if time_changed:
+		_update_time(world, ticks, rain, thunder)
+	var sky: Color = _tl(_blend[0], "minecraft:visual/sky_color", ticks)
+	var fog: Color = _tl(_blend[1], "minecraft:visual/fog_color", ticks)
+	# weather (ClientLevel.getSkyColor): grey towards luminance
+	if rain > 0.0:
+		var lum := (sky.r * 0.3 + sky.g * 0.59 + sky.b * 0.11) * 0.6
+		var m := 1.0 - rain * 0.75
+		sky = Color(sky.r * m + lum * (1.0 - m), sky.g * m + lum * (1.0 - m), sky.b * m + lum * (1.0 - m))
+	if thunder > 0.0:
+		var lum2 := (sky.r * 0.3 + sky.g * 0.59 + sky.b * 0.11) * 0.2
+		var m2 := 1.0 - thunder * 0.75
+		sky = Color(sky.r * m2 + lum2 * (1.0 - m2), sky.g * m2 + lum2 * (1.0 - m2), sky.b * m2 + lum2 * (1.0 - m2))
+	_sky_c = sky
+	_fog_c = fog
+
+
+var _blend: Array = [Color(0.47, 0.65, 1.0), Color(0.75, 0.85, 1.0)]
+
+
+func _update_time(world, ticks: float, rain: float, thunder: float) -> void:
 	var dt: Dictionary = world.dim_type
-	var bl := _biome_blend(world, cam_pos)
-	var sky: Color = _tl(bl[0], "minecraft:visual/sky_color", ticks)
-	var fog: Color = _tl(bl[1], "minecraft:visual/fog_color", ticks)
 	sky_light_color = _tl(_ac(dt, "minecraft:visual/sky_light_color", Color(1, 1, 1)), "minecraft:visual/sky_light_color", ticks)
 	var slf: float = _tl(_af(dt, "minecraft:visual/sky_light_factor", 1.0), "minecraft:visual/sky_light_factor", ticks)
 	ambient_color = _ac(dt, "minecraft:visual/ambient_light_color", Color(0, 0, 0))
@@ -153,15 +183,6 @@ func _update_slow(world, cam_pos: Vector3, ticks: float, rain: float, thunder: f
 	star_angle = deg_to_rad(float(_tl(0.0, "minecraft:visual/star_angle", ticks)))
 	var mp = _tl("full_moon", "minecraft:visual/moon_phase", ticks + float(world.game_time / 24000) * 24000.0)
 	moon_phase = str(mp)
-	# weather (ClientLevel.getSkyColor): grey towards luminance
-	if rain > 0.0:
-		var lum := (sky.r * 0.3 + sky.g * 0.59 + sky.b * 0.11) * 0.6
-		var m := 1.0 - rain * 0.75
-		sky = Color(sky.r * m + lum * (1.0 - m), sky.g * m + lum * (1.0 - m), sky.b * m + lum * (1.0 - m))
-	if thunder > 0.0:
-		var lum2 := (sky.r * 0.3 + sky.g * 0.59 + sky.b * 0.11) * 0.2
-		var m2 := 1.0 - thunder * 0.75
-		sky = Color(sky.r * m2 + lum2 * (1.0 - m2), sky.g * m2 + lum2 * (1.0 - m2), sky.b * m2 + lum2 * (1.0 - m2))
 	# ClientLevel.getCloudColor: towards 0.6 x grey with rain, 0.2 x grey with thunder (95 %)
 	if rain > 0.0:
 		var cg := (cloud_color.r * 0.3 + cloud_color.g * 0.59 + cloud_color.b * 0.11) * 0.6
@@ -177,11 +198,10 @@ func _update_slow(world, cam_pos: Vector3, ticks: float, rain: float, thunder: f
 		g *= (1.0 - rain * 5.0 / 16.0) * (1.0 - thunder * 5.0 / 16.0)
 		slf = (g * 0.8 + 0.2) * 0.95 + 0.05
 	sky_light_factor = slf
-	_sky_c = sky
-	_fog_c = fog
 
 
 var _ukey := Vector4i(-2147483648, 0, 0, 0)
+var _blend_partial := false
 var _wkey := Vector2i(-1, -1)
 var _sky_c := Color(0, 0, 0)
 var _fog_c := Color(0, 0, 0)
@@ -191,9 +211,15 @@ func update(world, cam_pos: Vector3, look: Vector3, ticks: float, rd_chunks: int
 	var key := Vector4i(int(ticks), int(floor(cam_pos.x)), int(floor(cam_pos.y)), int(floor(cam_pos.z)))
 	var wkey := Vector2i(int(rain * 512.0), int(thunder * 512.0))
 	if key != _ukey or wkey != _wkey:
+		# a blend taken before the chunks around the camera existed (teleport, portal, world load) is redone each tick
+		# until they do: otherwise a player standing still kept the default fog (light blue in the Nether)
+		var pos_changed := Vector3i(key.y, key.z, key.w) != Vector3i(_ukey.y, _ukey.z, _ukey.w) or _blend_partial
+		if _blend_partial and Vector3i(key.y, key.z, key.w) == Vector3i(_ukey.y, _ukey.z, _ukey.w):
+			_bio_key = Vector3i(-2147483648, 0, 0)
+		var time_changed := key.x != _ukey.x or wkey != _wkey
 		_ukey = key
 		_wkey = wkey
-		_update_slow(world, cam_pos, ticks, rain, thunder)
+		_update_slow(world, cam_pos, ticks, rain, thunder, pos_changed, time_changed)
 	var sky: Color = _sky_c
 	var fog: Color = _fog_c
 	# FogRenderer colour: sunrise tint looking towards the sun, blend towards the sky colour, weather, void

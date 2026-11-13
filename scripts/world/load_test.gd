@@ -211,7 +211,9 @@ static func native_check(w) -> void:
 						var r_old: Dictionary = stc0._make_start(st, sc)
 						var tb3 := Time.get_ticks_usec()
 						Structures.old_jig = false
+						for sk in ["cands", "fits", "jigsaws_tried", "pool_shuffle_ms", "eljig_ms", "elinfo_ms", "elinfo_miss", "ffh_ms", "ffh_calls"]: stc0.stats[sk] = 0
 						var r_new: Dictionary = stc0._make_start(st, sc)
+						if r_new.get("structure", "") == "trial_chambers": print("[nativecheck]   stats ", JSON.stringify(stc0.stats))
 						var tc3 := Time.get_ticks_usec()
 						if not r_old.has("pieces") or (r_old["pieces"] as Array).size() < 2:
 							continue
@@ -258,6 +260,7 @@ static func native_check(w) -> void:
 		var fn := int(w.autoplay.get("fchunks", "4"))
 		if w.autoplay.has("fonly"):
 			# isolate: stop dispatching world jobs and wait for in-flight ones
+			w.cm.adaptive_jobs = false
 			w.cm.max_jobs = 0
 			w.cm.queue_depth = 0   # no new queued jobs either (nothing would run them)
 			var tw := Time.get_ticks_msec()
@@ -440,6 +443,7 @@ static func run(w) -> void:
 	BlockUpdates.prof = true
 	if w.autoplay.has("workers"):
 		cm.max_jobs = int(w.autoplay["workers"])
+		cm.adaptive_jobs = false
 	var stamp := Time.get_datetime_string_from_system().replace(":", "-")
 	var dir := "user://perf/" + stamp
 	DirAccess.make_dir_recursive_absolute(dir)

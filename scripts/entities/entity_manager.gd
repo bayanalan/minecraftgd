@@ -278,7 +278,7 @@ func spawn_projectile(kind: String, p: Vector3, v: Vector3, owner_ref) -> void:
 	# camera - half a block for 16 px sprites (small fireball 0.75x, ghast fireball 3x)
 	var thrown := {"snowball": "snowball", "egg": "egg", "blue_egg": "blue_egg", "brown_egg": "brown_egg", "ender_pearl": "ender_pearl",
 		"experience_bottle": "experience_bottle", "splash_potion": "splash_potion", "lingering_potion": "lingering_potion",
-		"eye_of_ender": "ender_eye", "small_fireball": "fire_charge", "fireball": "fire_charge"}
+		"eye_of_ender": "ender_eye", "small_fireball": "fire_charge", "fireball": "fire_charge", "firework_rocket": "firework_rocket"}
 	if thrown.has(kind) and Res.mode == "vanilla" and Res.items.id(thrown[kind]) > 0:
 		var tim := ItemIcons.flat_image(Res.items.model_ref[Res.items.id(thrown[kind])])
 		if tim != null:
@@ -413,6 +413,8 @@ func spawn_mob(id: String, p: Vector3, baby: bool = false) -> Ent:
 	e.head_last = e.yaw
 	e.baby_age = -24000 if baby else 0
 	e.persistent = def["kind"] == "passive"
+	if id == "end_crystal":
+		e.rt["t0"] = rng.randi_range(0, 99999)   # Java EndCrystal.time starts at random.nextInt(100000)
 	e.node = EntityRenderer.build_rig(def)
 	EntityRenderer.group_head(e.node)
 	if def.has("children"):
@@ -860,15 +862,27 @@ func _tick_projectile(e: Ent, p: Player, gs: Callable, blocks: BlockRegistry) ->
 		_tick_stuck(e, p)
 		return
 	if e.id == "firework_rocket":
-		# Java FireworkRocketEntity.tick (not attached): accelerate x1.15 horizontally, +0.04 up; explode at life end
-		e.vel = Vector3(e.vel.x * 1.15, e.vel.y + 0.04, e.vel.z * 1.15)
-		var fhit := VoxelRaycast.cast(e.pos, e.vel, e.vel.length(), gs, blocks)
-		if fhit.is_empty():
-			e.pos += e.vel
+		if e.data.get("attached", false):
+			# Java FireworkRocketEntity.tick attached to a gliding player: it rides at the hand (the boost itself is
+			# applied in Player._travel_elytra while rocket_ticks last), at the feet when not gliding
+			var hand := Vector3.ZERO
+			if p.fall_flying:
+				var yr := deg_to_rad(p.yaw)
+				hand = Vector3(-cos(yr), 0.0, -sin(yr)) * 0.35 + Vector3(0, 0.3, 0)
+			e.pos = p.pos + hand
+			e.vel = p.vel
 		else:
-			e.data["life"] = 0
-		if e.age % 2 == 0:
-			Particles.emit("firework", e.pos, Vector3(rng.randfn(0, 0.02), -e.vel.y * 0.5, rng.randfn(0, 0.02)), Color.WHITE)
+			# Java FireworkRocketEntity.tick (not attached): accelerate x1.15 horizontally, +0.04 up; explode at life end
+			e.vel = Vector3(e.vel.x * 1.15, e.vel.y + 0.04, e.vel.z * 1.15)
+			var fhit := VoxelRaycast.cast(e.pos, e.vel, e.vel.length(), gs, blocks)
+			if fhit.is_empty():
+				e.pos += e.vel
+			else:
+				e.data["life"] = 0
+		if e.age == 1:
+			Audio.play("entity.firework_rocket.launch", e.pos, "Ambient", 3.0)
+		# client tick: a spark every tick (life % 2 < 2), gaussian 0.05 sideways, against the vertical motion
+		Particles.emit("firework", e.pos, Vector3(rng.randfn(0, 1) * 0.05, -e.vel.y * 0.5, rng.randfn(0, 1) * 0.05), Color.WHITE)
 		if e.age >= int(e.data.get("life", 30)):
 			_firework_explode(e, p)
 			_remove(e)
@@ -967,6 +981,9 @@ func _firework_explode(e: Ent, p: Player) -> void:
 	var fw = e.stack.components.get("minecraft:fireworks", {}) if e.stack != null else {}
 	var stars: Array = fw.get("explosions", []) if fw is Dictionary else []
 	if stars.is_empty():
+		# entity event 17 without explosions: 2-4 poof particles
+		for i0 in rng.randi_range(0, 2) + 2:
+			Particles.emit("poof", e.pos, Vector3(rng.randfn(0, 1) * 0.05, 0.005, rng.randfn(0, 1) * 0.05))
 		return
 	var large := false
 	for st in stars:
@@ -1384,10 +1401,12 @@ func _damage(e: Ent, amount: float, source) -> void:
 		return
 	if e.id == "wither" and e.charge < 0:
 		return   # invulnerable while charging
+	if e.data.get("Invulnerable", false):
+		return   # Java Entity.isInvulnerable (respawned spike crystals until the dragon is back)
 	if e.def.get("dragon", false):
 		if e.state == DragonFight.Ph.DYING:
 			return
-		if not (e.state in [DragonFight.Ph.SITTING_SCANNING, DragonFight.Ph.SITTING_ATTACKING, DragonFight.Ph.SITTING_FLAMING]):
+		if not e.data.has("head_hit") and not (e.state in [DragonFight.Ph.SITTING_SCANNING, DragonFight.Ph.SITTING_ATTACKING, DragonFight.Ph.SITTING_FLAMING]):
 			amount = amount / 4.0 + minf(amount, 1.0)   # Java: hits off the head part (perched: the head is in reach)
 	var harmor := ArmorRender.horse_armor_points(e) if e.data.has("horse_armor") else 0
 	if harmor > 0:
@@ -1446,11 +1465,21 @@ func _teleport(e: Ent, gs: Callable, blocks: BlockRegistry) -> bool:
 
 func _die(e: Ent, by_player: bool) -> void:
 	if e.id == "end_crystal":
+		# Java EndCrystal.hurtServer -> EnderDragon.onCrystalDestroyed: the dragon healing from this crystal takes 10
+		# damage to the head; a holding / strafing dragon turns on the player
 		_remove(e)
-		explode(e.pos + Vector3(0, 0.5, 0), 6.0, true)
+		explode(e.pos, 6.0, true)
+		if world.dragon_fight != null:
+			world.dragon_fight.on_crystal_destroyed(e)
 		for o in ents:
-			if o.kind == "mob" and o.id == "ender_dragon" and o.pos.distance_to(e.pos) < 32.0:
-				_damage(o, 10.0, null)
+			if o.kind == "mob" and o.id == "ender_dragon" and not o.dead:
+				if o.rt.get("crystal") == e:
+					o.rt.erase("crystal")
+					o.data["head_hit"] = true
+					_damage(o, 10.0, null)
+					o.data.erase("head_hit")
+				if by_player and o.state == DragonFight.Ph.HOLDING:
+					DragonFight._set_phase(o, DragonFight.Ph.STRAFE)
 		return
 	if e.id == "ender_dragon":
 		DragonFight.start_dying(e)   # 200 ticks rising and spinning, then on_dragon_death
@@ -1511,9 +1540,9 @@ func _tick_dying(e: Ent, gs: Callable, blocks: BlockRegistry) -> void:
 		return
 	e.death_time += 1
 	if e.death_time >= 20:
-		for k in 20:
-			Particles.emit("smoke", e.pos + Vector3(rng.randf_range(-1, 1) * e.w, rng.randf() * e.h, rng.randf_range(-1, 1) * e.w),
-				Vector3(rng.randfn() * 0.02, rng.randfn() * 0.02, rng.randfn() * 0.02), Color(1, 1, 1))
+		for k in 20:   # LivingEntity.makePoofParticles
+			Particles.emit("poof", e.pos + Vector3(rng.randf_range(-1, 1) * e.w, rng.randf() * e.h, rng.randf_range(-1, 1) * e.w),
+				Vector3(rng.randfn() * 0.02, rng.randfn() * 0.02, rng.randfn() * 0.02))
 		_remove(e)
 
 
@@ -2034,8 +2063,13 @@ func _natural_spawn(p: Player) -> void:
 			continue
 		if category != "monster" and passives >= PASSIVE_CAP * 3:
 			continue
-		var lst := _biome_spawns(bio, category)
-		if lst.is_empty():
+		# structure spawn overrides (fortress enemies, witches in huts, guardians, pillagers; none in trial chambers)
+		var ov = null
+		var sgen = world.gen
+		if sgen != null and "structures" in sgen and sgen.structures != null:
+			ov = sgen.structures.spawn_override(x, y, z, category, Res.blocks.name_of(below) if below > 0 else "")
+		var lst: Array = ov if ov != null else _biome_spawns(bio, category)
+		if lst.is_empty() and ov == null:
 			lst = [{"type": "zombie", "weight": 100}, {"type": "skeleton", "weight": 100}, {"type": "creeper", "weight": 100}, {"type": "spider", "weight": 100}] if category == "monster" else [{"type": "pig", "weight": 10}, {"type": "cow", "weight": 8}, {"type": "sheep", "weight": 12}, {"type": "chicken", "weight": 10}]
 		var total := 0
 		var cands: Array = []
@@ -2175,7 +2209,7 @@ func _ser(e: Ent) -> Dictionary:
 		"mob":
 			if e.def.get("kind") == "hostile" and not e.persistent:
 				return {}
-			return {"k": "mob", "id": e.id, "p": [e.pos.x, e.pos.y, e.pos.z], "hp": e.hp, "y": e.yaw, "b": e.baby_age, "sh": e.sheared, "d": e.data}
+			return {"k": "mob", "id": e.id, "p": [e.pos.x, e.pos.y, e.pos.z], "hp": e.hp, "y": e.yaw, "b": e.baby_age, "sh": e.sheared, "d": e.data, "pers": e.persistent}
 	return {}
 
 
@@ -2203,6 +2237,8 @@ func _deser(d: Dictionary) -> void:
 				m.sheared = bool(d.get("sh", false))
 				if d.get("d") is Dictionary and not (d["d"] as Dictionary).is_empty():
 					m.data = d["d"]
+				if d.get("pers", false):
+					m.persistent = true   # structure mobs (swamp hut witch / cat) never despawn
 
 
 func on_block_changed(_p: Vector3i, _old: int, _new: int) -> void:
@@ -2406,6 +2442,8 @@ func _process(_delta: float) -> void:
 							c.position.y = (-24.0 / 16.0) + (0.5 if e.target_player else 0.0) * 0.4
 					if e.def.get("dragon", false):
 						_dragon_pose(e, model, ea)
+					elif e.id == "end_crystal":
+						_crystal_pose(e, model, ea)
 					for mi in _meshes(model):
 						mi.set_instance_shader_parameter("light", Vector2((l >> 4) / 15.0, (l & 15) / 15.0))
 						mi.set_instance_shader_parameter("hurt", 1.0 if e.hurt_time > 0 or e.death_time > 0 or (e.fuse >= 0 and (e.fuse / 4) % 2 == 0) else 0.0)
@@ -2413,22 +2451,212 @@ func _process(_delta: float) -> void:
 					e.node.scale = Vector3.ONE * (1.0 + e.fuse / 30.0 * 0.2)
 
 
-## Java EnderDragonModel.setupAnim wings / jaw from the interpolated flap time (Java model space; x / y negated here).
+## Java EnderDragonRenderer + EnderDragonModel.setupAnim from the flight history (64 ticks of yaw / y): the body turns
+## with the yaw 7 ticks back and pitches with the climb, the neck, head and tail follow older samples (curving behind
+## turns and waving with the flap phase), wings flap, legs tuck, the whole model bobs. Java model-space values; ours
+## is flipped on x / y: positions (-x, -y, z) / 16, rotations (-x, -y, z).
 func _dragon_pose(e: Ent, model: Node, ea: float) -> void:
-	var f8: float = lerpf(float(e.rt.get("flap_o", 0.0)), float(e.rt.get("flap", 0.0)), ea) * TAU
-	for side in [["wing0", "wing4", 1.0], ["wing2", "wing5", -1.0]]:
-		var w: Node3D = model.find_child(side[0], true, false)
-		var tip: Node3D = model.find_child(side[1], true, false)
-		var sg: float = side[2]
-		if w != null:
-			w.rotation_order = EULER_ORDER_ZYX
-			w.rotation = Vector3(-(0.125 - cos(f8) * 0.2), 0.25 * sg, -(sin(f8) + 0.125) * 0.8 * sg)
-		if tip != null:
-			tip.rotation = Vector3(0, 0, (sin(f8 + 2.0) + 0.5) * 0.75 * sg)
-	var jaw: Node3D = model.find_child("jaw", true, false)
+	var hist: PackedFloat32Array = e.rt.get("hist", PackedFloat32Array())
+	if hist.size() != 128:
+		return
+	var hi: int = int(e.rt.get("hist_i", 0))
+	var pt := ea
+	var hs := func(i: int) -> Vector2:
+		var a := (hi - i) & 63
+		var b := (hi - i - 1) & 63
+		var yb := hist[b * 2]
+		return Vector2(yb + wrapf(hist[a * 2] - yb, -180.0, 180.0) * pt, lerpf(hist[b * 2 + 1], hist[a * 2 + 1], pt))
+	var fl: float = lerpf(float(e.rt.get("flap_o", 0.0)), float(e.rt.get("flap", 0.0)), ea)
+	var fr := fl * TAU
+	var f1 := sin(fr - 1.0) + 1.0
+	f1 = (f1 * f1 + f1 * 2.0) * 0.05
+	# renderer: rotY(-yaw 7 back), rotX((y 5 back - y 10 back) * 10), translate (0, 0, 1); root bob (0, f1 - 2, -3), f1 * 2 deg
+	var h7: Vector2 = hs.call(7)
+	var climb: float = (hs.call(5) as Vector2).y - (hs.call(10) as Vector2).y
+	e.node.rotation = Vector3(deg_to_rad(climb * 10.0), deg_to_rad(-h7.x), 0.0)
+	var m3 := model as Node3D
+	m3.position = Vector3(0.0, 3.501 - f1, -2.0)
+	m3.rotation = Vector3(-deg_to_rad(f1 * 2.0), 0.0, 0.0)
+	var sitting: bool = e.state in [DragonFight.Ph.SITTING_SCANNING, DragonFight.Ph.SITTING_ATTACKING, DragonFight.Ph.SITTING_FLAMING]
+	var landing: bool = e.state == DragonFight.Ph.LANDING or e.state == DragonFight.Ph.TAKEOFF
+	var egg_d: float = float(e.rt.get("egg_d", 0.0))
+	var s6: Vector2 = hs.call(6)
+	var f6 := wrapf((hs.call(5) as Vector2).x - (hs.call(10) as Vector2).x, -180.0, 180.0)
+	var f7 := wrapf((hs.call(5) as Vector2).x + f6 / 2.0, -180.0, 180.0)
+	var px := 0.0
+	var py := 20.0
+	var pz := -12.0
+	var dg := PI / 180.0
+	for i in 5:
+		var s: Vector2 = hs.call(5 - i)
+		var off := (float(i) / maxf(egg_d / 4.0, 1.0)) if sitting else (float(i) if landing else s.y - s6.y)
+		var yr := wrapf(s.x - s6.x, -180.0, 180.0) * dg * 1.5
+		var xr := cos(i * 0.45 + fr) * 0.15 + off * dg * 1.5 * 5.0
+		var zr := -wrapf(s.x - f7, -180.0, 180.0) * dg * 1.5
+		var nk := m3.get_node_or_null("neck%d" % i) as Node3D
+		if nk != null:
+			nk.position = Vector3(-px, -py, pz) / 16.0
+			nk.rotation = Vector3(-xr, -yr, zr)
+		py += sin(xr) * 10.0
+		pz -= cos(yr) * cos(xr) * 10.0
+		px -= sin(yr) * cos(xr) * 10.0
+	var hd := m3.get_node_or_null("head") as Node3D
+	if hd != null:
+		var s0: Vector2 = hs.call(0)
+		var off6 := (6.0 / maxf(egg_d / 4.0, 1.0)) if sitting else (6.0 if landing else 0.0)
+		hd.position = Vector3(-px, -py, pz) / 16.0
+		hd.rotation = Vector3(-wrapf(off6, -180.0, 180.0) * dg * 1.5 * 5.0, -wrapf(s0.x - s6.x, -180.0, 180.0) * dg, -wrapf(s0.x - f7, -180.0, 180.0) * dg)
+	var jaw := m3.find_child("jaw", true, false) as Node3D
 	if jaw != null:
-		jaw.rotation.x = -(sin(f8) + 1.0) * 0.2
+		jaw.rotation.x = -(sin(fr) + 1.0) * 0.2
+	var torso := m3.get_node_or_null("torso") as Node3D
+	if torso != null:
+		torso.rotation = Vector3(0.0, 0.0, deg_to_rad(-f6 * 1.5))
+	# wings (Java left: x 0.125 - cos f * 0.2, y -0.25, z -(sin f + 0.125) * 0.8; tip z (sin(f + 2) + 0.5) * 0.75;
+	# the right one mirrored) and legs
+	var wx := 0.125 - cos(fr) * 0.2
+	var wz := (sin(fr) + 0.125) * 0.8
+	var tz := (sin(fr + 2.0) + 0.5) * 0.75
+	for sd in [["left", 1.0], ["right", -1.0]]:
+		var n: String = sd[0]
+		var sg: float = sd[1]
+		var w := m3.find_child(n + "_wing", true, false) as Node3D
+		if w != null:
+			w.rotation = Vector3(-wx, 0.25 * sg, -wz * sg)
+		var wt := m3.find_child(n + "_wing_tip", true, false) as Node3D
+		if wt != null:
+			wt.rotation = Vector3(0.0, 0.0, tz * sg)
+		for lg in [["_hind_leg", 1.0], ["_hind_leg_tip", 0.5], ["_hind_foot", 0.75], ["_front_leg", 1.3], ["_front_leg_tip", -0.5], ["_front_foot", 0.75]]:
+			var ln := m3.find_child(n + str(lg[0]), true, false) as Node3D
+			if ln != null:
+				var base: float = lg[1]
+				ln.rotation.x = -(base + (f1 * 0.1 if base > 0.0 else -f1 * 0.1))
+	var tx := 0.0
+	var ty := 10.0
+	var tzp := 60.0
+	var s11: Vector2 = hs.call(11)
+	var f10 := 0.0
+	for j in 12:
+		var s3: Vector2 = hs.call(12 + j)
+		f10 += sin(j * 0.45 + fr) * 0.05
+		var yr2 := (wrapf(s3.x - s11.x, -180.0, 180.0) * 1.5 + 180.0) * dg
+		var xr2 := f10 + (s3.y - s11.y) * dg * 1.5 * 5.0
+		var zr2 := wrapf(s3.x - f7, -180.0, 180.0) * dg * 1.5
+		var tl := m3.get_node_or_null("tail%d" % j) as Node3D
+		if tl != null:
+			tl.position = Vector3(-tx, -ty, tzp) / 16.0
+			tl.rotation = Vector3(-xr2, -yr2, zr2)
+		ty += sin(xr2) * 10.0
+		tzp -= cos(yr2) * cos(xr2) * 10.0
+		tx -= sin(yr2) * cos(xr2) * 10.0
+	_crystal_beam(e, ea)
 
+
+## EnderDragonRenderer.renderCrystalBeams: 8 quads from 2 blocks above the dragon (radius 0.15, black) to the healing
+## crystal's glass (radius 0.75, white), end_crystal_beam texture scrolling with the age.
+var _beam_mat: ShaderMaterial = null
+
+
+func _crystal_beam(e: Ent, ea: float) -> void:
+	var c = e.rt.get("crystal")
+	if c == null or not (c is Ent) or (c as Ent).node == null or (c as Ent).dead:
+		_beam_draw(e, Vector3.INF, Vector3.ZERO, 0.0)
+		return
+	var ce: Ent = c
+	var ca := float(ce.rt.get("t0", 0)) + ce.age + ea
+	_beam_draw(e, world.vis(e.prev.lerp(e.pos, ea)) + Vector3(0, 2, 0), world.vis(ce.prev.lerp(ce.pos, ea)) + Vector3(0, 2.0 + _crystal_y(ca), 0), float(e.age) + ea)
+
+
+## renderCrystalBeams between two points (render space): radius 0.15 and black at dp, 0.75 and white at cp.
+## dp = INF hides the owner's beam.
+func _beam_draw(e: Ent, dp: Vector3, cp: Vector3, age: float) -> void:
+	var bm: MeshInstance3D = e.node.get_node_or_null("beam")
+	if dp == Vector3.INF:
+		if bm != null:
+			bm.visible = false
+		return
+	if bm == null:
+		bm = MeshInstance3D.new()
+		bm.name = "beam"
+		bm.top_level = true
+		bm.mesh = ImmediateMesh.new()
+		if _beam_mat == null:
+			_beam_mat = ShaderMaterial.new()
+			_beam_mat.shader = load("res://shaders/crystal_beam.gdshader")
+			_beam_mat.set_shader_parameter("tex", EntityRenderer.texture("entity/end_crystal/end_crystal_beam"))
+		bm.material_override = _beam_mat
+		e.node.add_child(bm)
+	bm.visible = true
+	bm.global_transform = Transform3D.IDENTITY
+	var d := cp - dp
+	var ln := d.length()
+	if ln < 0.01:
+		bm.visible = false
+		return
+	var fwd := d / ln
+	var ax := Vector3.UP if absf(fwd.y) < 0.99 else Vector3.RIGHT
+	var u := fwd.cross(ax).normalized()
+	var v := fwd.cross(u)
+	var v0 := -age * 0.01
+	var v1 := ln / 32.0 - age * 0.01
+	var im := bm.mesh as ImmediateMesh
+	im.clear_surfaces()
+	im.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+	var pa := Vector2(0.0, 0.75)
+	var ua := 0.0
+	for j in range(1, 9):
+		var pb := Vector2(sin(j * TAU / 8.0) * 0.75, cos(j * TAU / 8.0) * 0.75)
+		var ub := j / 8.0
+		var q := [dp + (u * pa.x + v * pa.y) * 0.2, cp + u * pa.x + v * pa.y, cp + u * pb.x + v * pb.y, dp + (u * pb.x + v * pb.y) * 0.2]
+		var quv := [Vector2(ua, v0), Vector2(ua, v1), Vector2(ub, v1), Vector2(ub, v0)]
+		var qc := [Color.BLACK, Color.WHITE, Color.WHITE, Color.BLACK]
+		for k in [0, 1, 2, 0, 2, 3]:
+			im.surface_set_color(qc[k])
+			im.surface_set_uv(quv[k])
+			im.surface_add_vertex(q[k])
+		pa = pb
+		ua = ub
+	im.surface_end()
+
+
+## EndCrystalRenderer.getY: the bobbing offset of the glass (-1.4 .. -0.6).
+static func _crystal_y(age: float) -> float:
+	var f := sin(age * 0.2) / 2.0 + 0.5
+	f = (f * f + f) * 0.4
+	return f - 1.4
+
+
+const SIN45 := 0.70710677
+
+
+## EndCrystalRenderer / EndCrystalModel: scale 2, translate (0, -0.5, 0) (no model flip); base plate (hidden on
+## crystals players place), outer glass at y 24 px + getY * 8 px, inner glass (x 0.875) and cube (x 0.875 again),
+## each turned by Ry(age * 3 deg) * R(60 deg about (sin 45, 0, sin 45)). Our part meshes are built flipped (F) at the
+## model node (y 1.5): part transform = T(0, -1.5, 0) * S2 * T(0, -0.5, 0) * P * F.
+func _crystal_pose(e: Ent, model: Node, ea: float) -> void:
+	e.node.rotation = Vector3.ZERO
+	var m3 := model as Node3D
+	m3.rotation = Vector3.ZERO
+	var age := float(e.rt.get("t0", 0)) + e.age + ea
+	var q := Basis(Vector3.UP, deg_to_rad(age * 3.0)) * Basis(Vector3(SIN45, 0.0, SIN45), PI / 3.0)
+	var root := Transform3D(Basis.from_scale(Vector3.ONE * 2.0), Vector3(0.0, -1.5 - 1.0, 0.0))
+	var flip := Transform3D(Basis.from_scale(Vector3(-1, -1, 1)), Vector3.ZERO)
+	var p_outer := Transform3D(q, Vector3(0.0, 1.5 + _crystal_y(age) / 2.0, 0.0))
+	var p_inner := p_outer * Transform3D(q.scaled(Vector3.ONE * 0.875), Vector3.ZERO)
+	var p_cube := p_inner * Transform3D(q.scaled(Vector3.ONE * 0.875), Vector3.ZERO)
+	for pr in [["base", Transform3D.IDENTITY], ["outer_glass", p_outer], ["inner_glass", p_inner], ["crystal_cube", p_cube]]:
+		var nd := m3.get_node_or_null(str(pr[0])) as Node3D
+		if nd != null:
+			nd.transform = root * (pr[1] as Transform3D) * flip
+	var bs := m3.get_node_or_null("base") as Node3D
+	if bs != null:
+		bs.visible = bool(e.data.get("ShowBottom", true))
+	# EndCrystalRenderer: a beam from 2 above the beam target's centre to the glass (dragon respawn sequence)
+	var bt = e.data.get("BeamTarget")
+	if bt is Vector3i:
+		_beam_draw(e, world.vis(Vector3(bt) + Vector3(0.5, 2.5, 0.5)), world.vis(e.prev.lerp(e.pos, ea)) + Vector3(0, 2.0 + _crystal_y(age), 0), age)
+	else:
+		_beam_draw(e, Vector3.INF, Vector3.ZERO, 0.0)
 
 ## Java Mth.triangleWave
 static func _triangle_wave(f: float, period: float) -> float:

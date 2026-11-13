@@ -69,6 +69,10 @@ class Overlay:
 	var last_upd := 0
 
 	func _init(parent: Node) -> void:
+		hist.resize(4001)
+		# no on-screen readout unless asked (--benchoverlay): the player's own FPS counter setting already shows one
+		if not OS.get_cmdline_user_args().has("--benchoverlay"):
+			return
 		layer = CanvasLayer.new()
 		layer.layer = 100
 		label = Label.new()
@@ -78,7 +82,6 @@ class Overlay:
 		label.add_theme_color_override("font_outline_color", Color(0, 0, 0))
 		label.add_theme_constant_override("outline_size", 6)
 		label.text = "FPS --"
-		hist.resize(4001)
 		layer.add_child(label)
 		parent.add_child(layer)
 
@@ -90,6 +93,10 @@ class Overlay:
 		if now_us - last_upd < 250000:
 			return
 		last_upd = now_us
+		if label == null:
+			acc_n = 0
+			acc_ms = 0.0
+			return
 		label.text = "FPS %d     1%% low %d     0.1%% low %d" % [roundi(1000.0 * acc_n / maxf(acc_ms, 0.001)), roundi(_low(maxi(1, hn / 100))), roundi(_low(maxi(1, hn / 1000)))]
 		acc_n = 0
 		acc_ms = 0.0
@@ -107,7 +114,8 @@ class Overlay:
 		return 1000.0 * k / maxf(tot, 0.001)
 
 	func close() -> void:
-		layer.queue_free()
+		if layer != null:
+			layer.queue_free()
 
 
 ## Whole-frame GPU timeline of the last finished frame (every RD timestamp, incl. work outside the viewport timer):
@@ -149,6 +157,7 @@ static func run(w) -> void:
 	var tree: SceneTree = w.get_tree()
 	if w.autoplay.has("workers"):
 		cm.max_jobs = int(w.autoplay["workers"])
+		cm.adaptive_jobs = false
 	if w.autoplay.has("vcompress"):
 		cm.vertex_compress = str(w.autoplay["vcompress"]) == "1"
 	print("[fps] texture layers: %d" % Res.atlas.names.size())
@@ -173,9 +182,15 @@ static func run(w) -> void:
 	if w.autoplay.has("time"):   # fixed time of day for sky / lighting screenshots (daylight cycle frozen)
 		w.day_time = int(w.autoplay["time"])
 		w.gamerules["doDaylightCycle"] = false
+	if w.autoplay.has("rain"):   # --rain=1: rain all run (weather cost: precipitation columns, splashes, sky)
+		w.raining = true
+		w.rain = 1.0
+		w.gamerules["doWeatherCycle"] = false
 	if w.autoplay.has("hold"):   # held item for view-model checks (A screenshots)
 		w.player.inventory.set_slot(w.player.inventory.selected, ItemStack.named(str(w.autoplay["hold"]), 1))
 	FrameProbe.busy_us = int(w.autoplay.get("busy", "0"))
+	if w.autoplay.has("cap"):   # --cap=N: Engine.max_fps during the measurement (power-headroom experiment)
+		Engine.max_fps = int(w.autoplay["cap"])
 	SLOW_MS = float(w.autoplay.get("slowms", "16.7"))
 	if w.autoplay.has("rtprof"):
 		BlockUpdates.prof = true
@@ -304,6 +319,8 @@ static func _static(w, summary: Dictionary, vp_rid: RID, ov: Overlay, dir := "")
 			await tree.process_frame
 	var secs := float(w.autoplay.get("fsecs", "6"))
 	var all_ft: Array = []
+	var st_cls := {}
+	var st_examples: Array = []
 	var smp := Sampler.new()
 	smp.vp = vp_rid
 	var views: Array = []
@@ -317,10 +334,25 @@ static func _static(w, summary: Dictionary, vp_rid: RID, ov: Overlay, dir := "")
 		vs.vp = vp_rid
 		var last := Time.get_ticks_usec()
 		var end := last + int(secs * 1e6)
+		var has_cyc: bool = Native.inst != null and Native.inst.has_method("thread_cycles")
+		var last_cyc: int = Native.inst.thread_cycles()[0] if has_cyc else 0
+		var prev_g := 0.0
 		while true:
 			await tree.process_frame
 			var now := Time.get_ticks_usec()
 			ft.append((now - last) / 1000.0)
+			# slow-frame classes (static views: nothing streams): GPU-heavy, main-thread CPU-bound, or waiting
+			var gms: float = RenderingServer.viewport_get_measured_render_time_gpu(vp_rid)
+			var cyc: int = Native.inst.thread_cycles()[0] if has_cyc else 0
+			var cpu_us := float(cyc - last_cyc) / 3100.0   # ~3100 counter ticks per us on the reference machine
+			last_cyc = cyc
+			var fdt := (now - last) / 1000.0
+			if fdt > 6.0:
+				var cls := "gpu" if maxf(gms, prev_g) > 4.0 else ("cpu" if cpu_us / 1000.0 > 0.8 * fdt else "wait")
+				st_cls[cls] = int(st_cls.get(cls, 0)) + 1
+				if st_examples.size() < 12:
+					st_examples.append("%.1f ms gpu %.2f/%.2f cpu %.1f ms probe %d ticks %s parts %s" % [fdt, gms, prev_g, cpu_us / 1000.0, int(w.frame_probe_t.get("probe_us", 0)) if "frame_probe_t" in w else -1, str(w.last_tick_parts.get("tick_no", -1)), JSON.stringify(w.frame_tparts).left(160)])
+			prev_g = gms
 			ov.frame((now - last) / 1000.0, now)
 			last = now
 			vs.add()
@@ -339,6 +371,9 @@ static func _static(w, summary: Dictionary, vp_rid: RID, ov: Overlay, dir := "")
 		views.append(vr)
 		all_ft.append_array(ft)
 	summary["views"] = views
+	print("[fps] static slow frames (> 6 ms) by class: %s" % JSON.stringify(st_cls))
+	for ex in st_examples:
+		print("[fps]   slow: %s" % ex)
 	summary["frames"] = _ft_stats(all_ft)
 	summary["render"] = smp.result()
 	return all_ft.size()
@@ -499,6 +534,9 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 		await tree.process_frame
 	var smp := Sampler.new()
 	smp.vp = vp_rid
+	var gpu_ft: Array = []
+	var slow_gpu: Array = []
+	var prev_gms := 0.0
 	var ft: Array = []
 	var entered := {}        # chunk key -> usec it came within ring 4 (-1 once visible)
 	var waits: Array = []
@@ -520,6 +558,9 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 	var last_gt: int = w.game_time
 	var last_up: int = cm.stats["uploaded"]
 	var hist := {}   # slow frames by count of ticks run in the frame
+	# --fcircle=R: circle the start at radius R (no new chunks once the spawn area is loaded: isolates rendering / main
+	# thread cost from chunk streaming)
+	var circ := float(w.autoplay.get("fcircle", "0"))
 	var fp := FrameProbe.install(w.get_tree().root)
 	FrameProbe.speed_probe = w.autoplay.has("trace")
 	var probe_sum := 0
@@ -549,6 +590,13 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 			pass
 		cyc_ms = maxf(1.0, (Native.inst.thread_cycles()[0] - cc0) / ((Time.get_ticks_usec() - tc0) / 1000.0))
 		last_cyc = Native.inst.thread_cycles()[0]
+	# per-frame process page faults + main-thread kernel / user time (proc_stats): kernel work in slow frames
+	var has_ps: bool = Native.inst != null and Native.inst.has_method("proc_stats")
+	var ps_last: Array = Native.inst.proc_stats() if has_ps else [0, 0, 0, 0]
+	var ps_d := [0, 0.0, 0.0, 0]
+	var after_waits: Array = []   # times (s) of frames with > 3 ms between the draw and the next process phase
+	var ps_tot := [0, 0.0, 0.0]   # all frames: page faults, main kernel ms, main user ms
+	var ps_slow := [0, 0.0, 0.0, 0]   # frames over 7 ms: same + count
 	while Time.get_ticks_usec() - ps < secs * 1e6:
 		if walk and Time.get_ticks_usec() - stuck_at > 1000000:
 			# walking: blocked (under 1.5 blocks in the last second) -> turn 70 degrees
@@ -561,6 +609,9 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 		p.in_strafe = 0.0
 		p.in_sprint = true
 		p.in_sneak = false
+		if circ > 0.0:
+			var ang := (Time.get_ticks_usec() - ps) / 1e6 * 20.0 / circ
+			dirv = Vector3(cos(ang), 0, sin(ang))
 		var hmax := -9999
 		for d in [0, 16, 32, 48, 64, 96]:
 			var q: Vector3 = p.pos + dirv * float(d)
@@ -575,6 +626,11 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 		var now := Time.get_ticks_usec()
 		var dt := (now - lt) / 1e6
 		ft.append(dt * 1000.0)
+		var gms: float = RenderingServer.viewport_get_measured_render_time_gpu(vp_rid)
+		gpu_ft.append(gms)
+		if dt * 1000.0 > 6.0:
+			slow_gpu.append(maxf(gms, prev_gms))
+		prev_gms = gms
 		var cpu_ms := 0.0
 		probe_sum += int(fp.get("probe_us", 0))
 		probe2_sum += int(fp.get("probe2_us", 0))
@@ -583,6 +639,18 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 			var cyc: int = Native.inst.thread_cycles()[0]
 			cpu_ms = (cyc - last_cyc) / cyc_ms
 			last_cyc = cyc
+		if has_ps:
+			var psn: Array = Native.inst.proc_stats()
+			ps_d = [int(psn[0]) - int(ps_last[0]), (int(psn[1]) - int(ps_last[1])) / 1e4, (int(psn[2]) - int(ps_last[2])) / 1e4, (int(psn[3]) - int(ps_last[3])) >> 10]
+			ps_last = psn
+			ps_tot[0] += ps_d[0]
+			ps_tot[1] += ps_d[1]
+			ps_tot[2] += ps_d[2]
+			if dt * 1000.0 > 7.0:
+				ps_slow[0] += ps_d[0]
+				ps_slow[1] += ps_d[1]
+				ps_slow[2] += ps_d[2]
+				ps_slow[3] += 1
 		var ev_before := play_ev   # events run after the previous frame's measurement land in this frame
 		if play:
 			play_ev = _play_step(w, p, dirv, now, ps, stone, play_state)
@@ -612,6 +680,12 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 		var ph_draw := (int(fp["post_draw"]) - int(fp["pre_draw"])) / 1000.0
 		var ph_gap1 := (int(fp["pre_draw"]) - int(fp["proc_end"])) / 1000.0
 		var ph_before := (now - int(fp["post_draw"])) / 1000.0   # after draw until this frame's process starts
+		# after-draw split: until the first physics step (OS events, audio, frame delay), physics steps, physics -> process
+		var aw := [ph_before, 0.0, 0.0]
+		if ph_before > 3.0:   # blocked after the draw (OS events / audio / frame delay): counted outside the capped spike log
+			after_waits.append(snappedf((now - ps) / 1e6, 0.01))
+		if int(fp.get("phys0", 0)) > int(fp["post_draw"]):
+			aw = [(int(fp["phys0"]) - int(fp["post_draw"])) / 1000.0, (int(fp["phys_end"]) - int(fp["phys0"])) / 1000.0, (now - int(fp["phys_end"])) / 1000.0]
 		prev_fp = fp.duplicate()
 		all_ph[0] += ph_proc
 		all_ph[1] += ph_draw
@@ -625,7 +699,7 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 			if ev_before != "":
 				spike_log.append("[spike] (play events before this frame: %s)" % ev_before)
 			# buffered: printing here (stdout to a file can block 20-40 ms) would itself cause the next spike
-			spike_log.append("[spike] t=%.2fs %.1f ms (main cpu %.1f, probe %d us / avg %d, shared %d / avg %d, private %d): proc %.1f draw %.1f gap %.1f after %.1f | cm commit %.1f dispatch %.1f rebuild %.1f uploads %d | ticks %d | pages %d | %s" % [(now - ps) / 1e6, dt * 1000.0, cpu_ms, int(fp.get("probe_us", 0)), probe_sum / maxi(1, probe_n), int(fp.get("probe2_us", 0)), probe2_sum / maxi(1, probe_n), int(fp.get("probe3_us", 0)), ph_proc, ph_draw, ph_gap1, ph_before, cm.last_commit_us / 1000.0, cm.last_dispatch_us / 1000.0, cm.last_rebuild_us / 1000.0, ups, ticks_run, trd_pages, JSON.stringify(w.frame_tparts)])
+			spike_log.append("[spike] t=%.2fs %.1f ms (main cpu %.1f, probe %d us %d Mcyc/s / avg %d, shared %d / avg %d, private %d): proc %.1f draw %.1f gap %.1f after %.1f (os %.1f phys %.1f post %.1f) | cm commit %.1f dispatch %.1f rebuild %.1f uploads %d | ticks %d | pages %d | rcpu %.2f setup %.2f gpu %.2f | pf %d kern %.1f user %.1f commit %+d KB | %s" % [(now - ps) / 1e6, dt * 1000.0, cpu_ms, int(fp.get("probe_us", 0)), int(fp.get("probe_cyc", 0)) / maxi(1, int(fp.get("probe_us", 1))), probe_sum / maxi(1, probe_n), int(fp.get("probe2_us", 0)), probe2_sum / maxi(1, probe_n), int(fp.get("probe3_us", 0)), ph_proc, ph_draw, ph_gap1, ph_before, aw[0], aw[1], aw[2], cm.last_commit_us / 1000.0, cm.last_dispatch_us / 1000.0, cm.last_rebuild_us / 1000.0, ups, ticks_run, trd_pages, RenderingServer.viewport_get_measured_render_time_cpu(vp_rid), RenderingServer.get_frame_setup_time_cpu(), gms, ps_d[0], ps_d[1], ps_d[2], ps_d[3], JSON.stringify(w.frame_tparts)])
 			spike_log.append("[spike]   upload_slow %d | commit by kind %s | world parts ticks %.1f cam %.1f berender %.1f cm %.1f target+sky %.1f total %.1f" % [cm.frame_upload_slow, JSON.stringify(cm.last_commit_parts), lp[0] / 1000.0, lp[1] / 1000.0, lp[2] / 1000.0, lp[3] / 1000.0, lp[4] / 1000.0, lp[5] / 1000.0])
 		if dt * 1000.0 > SLOW_MS:
 			slow_n += 1
@@ -717,6 +791,23 @@ static func _flight(w, summary: Dictionary, vp_rid: RID, dir: String, ov: Overla
 	print("[fps] average frame phases (ms): %s" % JSON.stringify(allp))
 	print("[fps] slow-frame phases (avg ms): %s" % JSON.stringify(phs))
 	print("[fps] pipeline compilations during flight: %d (in slow frames: %d)" % [int(last_pipe - pipe0), int(pipe_slow)])
+	if not gpu_ft.is_empty():
+		var gs := gpu_ft.duplicate()
+		gs.sort()
+		var gsum := 0.0
+		var over5 := 0
+		for gv in gs:
+			gsum += gv
+			if gv > 5.0:
+				over5 += 1
+		var sg4 := 0
+		for sv in slow_gpu:
+			if sv > 4.0:
+				sg4 += 1
+		print("[fps] gpu per frame: avg %.2f p50 %.2f p95 %.2f p99 %.2f max %.2f ms, frames over 5 ms %d / %d; slow frames (> 6 ms) with gpu > 4 ms (this or previous) %d / %d" % [gsum / gs.size(), gs[gs.size() / 2], gs[int(gs.size() * 0.95)], gs[int(gs.size() * 0.99)], gs[gs.size() - 1], over5, gs.size(), sg4, slow_gpu.size()])
+		print("[fps] main thread kernel work: all %d frames page faults %d (%.1f / frame), kernel %.1f ms, user %.1f ms; %d frames over 7 ms: page faults %d (%.1f / frame), kernel %.1f ms (%.2f / frame), user %.1f ms" % [gs.size(), ps_tot[0], float(ps_tot[0]) / maxi(1, gs.size()), ps_tot[1], ps_tot[2], ps_slow[3], ps_slow[0], float(ps_slow[0]) / maxi(1, ps_slow[3]), ps_slow[1], float(ps_slow[1]) / maxi(1, ps_slow[3]), ps_slow[2]])
+		print("[fps] after-draw waits > 3 ms: %d at %s" % [after_waits.size(), str(after_waits.slice(0, 12))])
+		print("[fps] worker cluster set changes (pin epoch): %d, wide now %s" % [ChunkManager.pin_epoch, str(ChunkManager.bg_wide)])
 	summary["pipeline_compilations"] = [int(last_pipe - pipe0), int(pipe_slow)]
 	print("[fps] slow frames (>16.7 ms): %d, avg ms per slow frame: %s" % [slow_n, JSON.stringify(sl)])
 	return ft.size()

@@ -218,7 +218,7 @@ func _advanced_video() -> Control:
 	thr.tooltip_text = "Worker threads generating, lighting and meshing chunks. Auto = 1/3 of the CPU threads (2..5), more while a world loads. More threads load faster but compete with the game for the CPU."
 	var rows := [
 		["header", "CPU"],
-		[thr, OptionsSub.tog("Fast-Core Pinning", "adv_pin_main", "Keeps the game thread on the fastest core cluster (CPUs with mixed core types: Snapdragon clusters, Intel P/E cores). Fewer stutters while chunks load.")],
+		[thr, OptionsSub.tog("Fast-Core Pinning", "adv_pin_main", "Keeps the game thread on the fastest core cluster and chunk generation on the other cores (CPUs with mixed core types: Snapdragon clusters, Intel P/E cores). Fewer stutters while chunks load.")],
 		["header", "Chunk Meshes (rebuilds loaded chunks)"],
 		[OptionsSub.tog("Smart Leaf Culling", "adv_leaf_cull", "Skips leaf faces that sit behind two layers of leaves (cannot be seen through the leaf textures). Fewer quads in forests."),
 			OptionsSub.tog("Face Merging", "adv_merge_faces", "Merges neighbouring faces with identical texture and lighting into one quad (pixel-identical). OFF = one quad per block face like Java.")],

@@ -119,8 +119,13 @@ func _warm_ui() -> void:
 
 
 func _ready() -> void:
+	ChunkManager._dc_mutex.lock()
+	ChunkManager.dim_cache.clear()   # chunks kept from another world's dimensions never carry over
+	ChunkManager._dc_mutex.unlock()
 	if ChunkManager.thread_prio and Native.inst.has_method("set_thread_priority"):
 		Native.inst.set_thread_priority(1)   # main thread above normal (see ChunkManager.thread_prio)
+	if Native.inst != null and Native.inst.has_method("no_power_throttling") and not OS.get_cmdline_user_args().has("--ecoqos"):
+		print("[power] throttling opt-out result %d" % int(Native.inst.no_power_throttling(1)[0]))   # no EcoQoS bursts on efficiency cores when the window loses focus
 	ChunkManager.pin_thread(true)   # main thread: its own core cluster (see ChunkManager.pin_thread)
 	Settings.set_in_menu(false)   # in a world: the player's V-Sync / framerate settings (menus: 60 FPS)
 	if DisplayServer.get_name() != "headless":
@@ -280,6 +285,7 @@ func _install_compositor() -> void:
 
 func _make_chunk_manager() -> void:
 	cm = ChunkManager.new()
+	cm.dim_name = dimension   # adopts this dimension's chunks kept in memory (ChunkManager.dim_cache)
 	Collision.fast_cm = cm
 	Collision.fast_world = self
 	cm.setup(Res.blocks, biomes, gen, get_world_3d().scenario)
@@ -311,7 +317,18 @@ func change_dimension(dim: String, arrival: Dictionary) -> void:
 	if changing_dim or closing:
 		return
 	changing_dim = true
+	# keep the decorated chunks around the player in memory for the way back (unload_all below stores their entities
+	# in them and saves the modified ones)
+	var keep := {}
+	var pc := Vector2i(int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4)
+	for kc in cm.chunks:
+		var cc: Chunk = cm.chunks[kc]
+		if cc.state >= Chunk.DECORATED and maxi(absi(cc.cx - pc.x), absi(cc.cz - pc.y)) <= 10:
+			keep[kc] = cc
 	cm.unload_all()
+	ChunkManager._dc_mutex.lock()
+	ChunkManager.dim_cache[dimension] = keep
+	ChunkManager._dc_mutex.unlock()
 	entities.clear_all()
 	save.flush()
 	cm.shutdown()
@@ -498,6 +515,8 @@ func set_block(x: int, y: int, z: int, st: int, notify := true) -> int:
 	if cm.tracing and old >= 0 and old != st:
 		var bk := Res.blocks.name_of(old) + " -> " + Res.blocks.name_of(st)
 		block_change_log[bk] = int(block_change_log.get(bk, 0)) + 1
+	if old >= 0 and old != st and st > 0 and Res.blocks.st_block[st] == BlockUpdates._fire_id() and (old == 0 or Res.blocks.st_block[old] != Res.blocks.st_block[st]):
+		BlockUpdates.fire_placed(self, Vector3i(x, y, z))   # FireBlock.onPlace: first tick in 30..39
 	if old >= 0 and old != st:
 		BERender.on_block_changed(Vector3i(x, y, z), old, st)
 		Interaction.chest_unlink(self, Vector3i(x, y, z), old, st)
@@ -650,7 +669,331 @@ var created_us := Time.get_ticks_usec()   # world entry (load test timing origin
 
 
 ## Render probe: waits for spawn + streaming, captures 5 screenshots and timing stats, then quits.
+func _stubstat(sts2: Structures, want: String) -> void:
+	var nb := 0
+	var nbio := 0
+	var lows: Array = []
+	for sset2 in sts2.sets:
+		for e2 in sset2["entries"]:
+			if str(e2["name"]) != want:
+				continue
+			var cfg2: Dictionary = e2["cfg"]
+			for scv2 in sts2._candidates(sset2, 0, 0, 64):
+				nb += 1
+				var bx2: int = scv2.x * 16 + 8
+				var bz2: int = scv2.y * 16 + 8
+				if (cfg2["biomes"] as Dictionary).has(sts2.biome_id_at(bx2, sts2._stub_y(cfg2, bx2, bz2), bz2)):
+					nbio += 1
+					lows.append("%s ok=%s" % [str(scv2), str(sts2._stub_ok(cfg2, scv2))])
+	print("[stubstat] %s: %d candidates, %d in biome: %s" % [want, nb, nbio, " ".join(lows.slice(0, 20))])
+
+
 func _auto_run() -> void:
+	if autoplay.has("dim") and str(autoplay["dim"]) != dimension and (autoplay.has("loadtest") or autoplay.has("nativecheck") or autoplay.has("fpsbench") or autoplay.has("dragonshots") or autoplay.has("rpcheck") or autoplay.has("respawntest") or autoplay.has("stubstat") or autoplay.has("ecdump") or autoplay.has("cam")):
+		# probes in another dimension (--dim=the_nether|the_end): travel first, then run the probe there
+		var tq := Time.get_ticks_msec()
+		while not spawn_ready and Time.get_ticks_msec() - tq < 60000:
+			await get_tree().process_frame
+		var dimq := str(autoplay["dim"])
+		var arrq := {"kind": "nether_portal", "pos": Portals.scaled_target(dimension, dimq, player.pos), "axis": "x"} if dimq == "the_nether" else {"kind": "end_platform", "pos": Vector3(100.5, 49, 0.5)}
+		change_dimension(dimq, arrq)
+		tq = Time.get_ticks_msec()
+		while not spawn_ready and Time.get_ticks_msec() - tq < 60000:
+			await get_tree().process_frame
+		print("[dim] probe in %s at %s" % [dimension, str(player.pos)])
+	if autoplay.has("respawntest"):   # --respawntest=1 (with --dim=the_end): kill the dragon, 4 crystals on the portal, respawn
+		var tr0 := Time.get_ticks_msec()
+		player.mode = Player.Mode.SPECTATOR
+		player.pos = Vector3(0.5, 90.0, -60.0)
+		player.prev_pos = player.pos
+		_update_origin(true)
+		while (dragon_fight == null or not dragon_fight.ready or dragon_fight._find("ender_dragon") == null) and Time.get_ticks_msec() - tr0 < 90000:
+			await get_tree().process_frame
+		for en1 in entities.ents.duplicate():
+			if en1.kind == "mob" and en1.id == "ender_dragon":
+				dragon_fight.on_dragon_death(en1)
+				entities._remove(en1)
+		var pyr := int(dragon_fight.state["podium_y"])
+		print("[respawntest] killed: %s, portal at y %d: %s" % [dragon_fight.state["killed"], pyr, Res.blocks.name_of(maxi(0, state_at(1, pyr, 0)))])
+		for cp2 in [Vector3(3.5, pyr + 1, 0.5), Vector3(-2.5, pyr + 1, 0.5), Vector3(0.5, pyr + 1, 3.5), Vector3(0.5, pyr + 1, -2.5)]:
+			var ce2 = entities.spawn_mob("end_crystal", cp2)
+			ce2.data["ShowBottom"] = false
+		dragon_fight.try_respawn()
+		print("[respawntest] stage %d, crystals %d, portal now %s" % [dragon_fight.respawn_stage, dragon_fight.respawn_crystals.size(), Res.blocks.name_of(maxi(0, state_at(1, pyr, 0)))])
+		var gt1: int = game_time
+		var last := -2
+		while Time.get_ticks_msec() - tr0 < 400000:
+			await get_tree().process_frame
+			if dragon_fight.respawn_stage != last:
+				last = dragon_fight.respawn_stage
+				print("[respawntest] t%d stage %d" % [game_time - gt1, last])
+				if last == -1:
+					break
+		var drn := 0
+		for en2 in entities.ents:
+			if en2.kind == "mob" and en2.id == "ender_dragon":
+				drn += 1
+		print("[respawntest] done after %d ticks: dragons %d, killed %s" % [game_time - gt1, drn, dragon_fight.state["killed"]])
+		get_tree().quit()
+		return
+	if autoplay.has("dragonshots"):   # --dragonshots=N (with --dim=the_end): N screenshots aimed at the dragon, 1.5 s apart
+		var td0 := Time.get_ticks_msec()
+		while not spawn_ready and Time.get_ticks_msec() - td0 < 60000:
+			await get_tree().process_frame
+		player.mode = Player.Mode.SPECTATOR
+		player.pos = Vector3(0.5, 90.0, -60.0)
+		player.prev_pos = player.pos
+		_update_origin(true)
+		var has_dr := false
+		while not has_dr and Time.get_ticks_msec() - td0 < 90000:
+			await get_tree().process_frame
+			for en0 in entities.ents:
+				has_dr = has_dr or (en0.kind == "mob" and en0.id == "ender_dragon")
+			if Engine.get_process_frames() % 300 == 0:
+				print("[dragonshots] wait: dim %s ready %s fight %s init %s c00 %s ents %d" % [dimension, spawn_ready, dragon_fight != null, dragon_fight.ready if dragon_fight != null else false, cm.is_ready(0, 0), entities.ents.size()])
+		for _w in 200:
+			await get_tree().process_frame
+		DirAccess.make_dir_recursive_absolute("user://autoplay")
+		for k in int(autoplay["dragonshots"]):
+			var dr = null
+			for en in entities.ents:
+				if en.kind == "mob" and en.id == "ender_dragon":
+					dr = en
+			if dr == null:
+				print("[dragonshots] no dragon")
+				break
+			var dpos: Vector3 = dr.pos + Vector3(0, 2, 0)
+			var ang := k * 1.3
+			player.mode = Player.Mode.SPECTATOR
+			player.pos = dpos + Vector3(cos(ang), 0.35, sin(ang)) * float(autoplay.get("dragondist", "28"))
+			player.prev_pos = player.pos
+			_update_origin(true)
+			for _f in 3:
+				var dirv: Vector3 = (dr.pos + Vector3(0, 2, 0) - player.eye_pos()).normalized()
+				player.yaw = rad_to_deg(atan2(-dirv.x, dirv.z))
+				player.pitch = rad_to_deg(-asin(dirv.y))
+				await get_tree().process_frame
+			var img := get_viewport().get_texture().get_image()
+			img.save_png("user://autoplay/dragon_%d.png" % k)
+			print("[dragonshots] %d phase %d pos %s crystal %s" % [k, dr.state, str(dr.pos), str(dr.rt.has("crystal"))])
+			for _f2 in 90:
+				player.pos = dr.pos + Vector3(0, 2, 0) + Vector3(cos(ang), 0.35, sin(ang)) * float(autoplay.get("dragondist", "28"))
+				player.prev_pos = player.pos
+				await get_tree().process_frame
+		get_tree().quit()
+		return
+	if autoplay.has("boxdump"):   # --boxdump=x0,y0,z0,x1,y1,z1 (after load, + optional --bdticks=N): block counts in the box
+		var bv: PackedStringArray = str(autoplay["boxdump"]).split(",")
+		var tb0 := Time.get_ticks_msec()
+		while not spawn_ready and Time.get_ticks_msec() - tb0 < 60000:
+			await get_tree().process_frame
+		while cm.pending_jobs() > 0 and Time.get_ticks_msec() - tb0 < 90000:
+			await get_tree().process_frame
+		if autoplay.has("cmds"):
+			for cl1 in str(autoplay["cmds"]).split(";"):
+				var cl2 := cl1.replace("+", " ").strip_edges()
+				if cl2 != "":
+					print("[cmds] %s -> %s" % [cl2, commands.execute(cl2)])
+		var gt0: int = game_time
+		while game_time - gt0 < int(autoplay.get("bdticks", "0")) and Time.get_ticks_msec() - tb0 < 600000:
+			await get_tree().process_frame
+		var cnt := {}
+		for by2 in range(int(bv[1]), int(bv[4]) + 1):
+			for bz2 in range(int(bv[2]), int(bv[5]) + 1):
+				for bx2 in range(int(bv[0]), int(bv[3]) + 1):
+					var sn := Res.blocks.name_of(maxi(0, state_at(bx2, by2, bz2)))
+					cnt[sn] = int(cnt.get(sn, 0)) + 1
+		print("[boxdump] %s" % str(cnt))
+		get_tree().quit()
+		return
+	if autoplay.has("ecdump"):   # --ecdump=1 (with --dim=the_end): first end city start along +x from chunk 62: pieces
+		var sts3: Structures = gen.structures
+		var ecfg: Dictionary = sts3.structures.get("end_city", {})
+		var ecz := 0
+		var ecx0 := 62
+		var ecx1 := 200
+		if str(autoplay["ecdump"]).contains(","):
+			var ev: PackedStringArray = str(autoplay["ecdump"]).split(",")
+			ecx0 = int(ev[0])
+			ecx1 = ecx0 + 1
+			ecz = int(ev[1])
+		for ecx in range(ecx0, ecx1):
+			var r3 := Structures.large_feature_seed(gen.seed, ecx, ecz)
+			var res3 := StructuresLegacy.generate(sts3, "end_city", ecfg, Vector2i(ecx, ecz), r3)
+			if res3.is_empty():
+				print("[ecdump] chunk (%d, %d): no start (lowest corner below 60?)" % [ecx, ecz])
+				continue
+			var names := {}
+			for pc3 in res3["pieces"]:
+				var nm3 := str(pc3["el"]["loc"]).trim_prefix("end_city/")
+				names[nm3] = int(names.get(nm3, 0)) + 1
+			print("[ecdump] chunk (%d, %d): %d pieces %s centre %s box %s" % [ecx, ecz, (res3["pieces"] as Array).size(), str(names), str(res3["center"]), str(res3["box"])])
+			break
+		get_tree().quit()
+		return
+	if autoplay.has("stubstat"):   # --stubstat=name: candidates of that structure within 64 chunks: biome / corner checks
+		var sts2: Structures = gen.structures
+		for want in str(autoplay["stubstat"]).split(","):
+			_stubstat(sts2, want)
+		get_tree().quit()
+		return
+	if false:
+		var sts2: Structures = gen.structures
+		var want := ""
+		var nb := 0
+		var nbio := 0
+		var lows: Array = []
+		for sset2 in sts2.sets:
+			for e2 in sset2["entries"]:
+				if str(e2["name"]) != want:
+					continue
+				var cfg2: Dictionary = e2["cfg"]
+				for scv2 in sts2._candidates(sset2, 0, 0, 64):
+					nb += 1
+					var bx2: int = scv2.x * 16 + 8
+					var bz2: int = scv2.y * 16 + 8
+					if (cfg2["biomes"] as Dictionary).has(sts2.biome_id_at(bx2, sts2._stub_y(cfg2, bx2, bz2), bz2)):
+						nbio += 1
+						var lo3 := 1 << 30
+						for cc in [Vector2i(scv2.x * 16, scv2.y * 16), Vector2i(scv2.x * 16 + 21, scv2.y * 16 + 21)]:
+							lo3 = mini(lo3, sts2.base_height(cc.x, cc.y, false) - 1)
+						lows.append("%s:%d/ffh%d" % [str(scv2), lo3, sts2.first_free_height(bx2, bz2) - 1])
+		print("[stubstat] %s: %d candidates, %d in biome; lowest corner: %s" % [want, nb, nbio, " ".join(lows.slice(0, 20))])
+		get_tree().quit()
+		return
+	if autoplay.has("rpcheck"):   # --rpcheck=R: ruined portal starts within R chunks: placement, y, centre surface
+		var sts: Structures = gen.structures if gen != null and "structures" in gen else null
+		var rr := int(autoplay.get("rpcheck", "20"))
+		var pc0 := Vector2i(int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4)
+		var seen := {}
+		var lines: Array = []
+		if sts != null:
+			for sset in sts.sets:
+				var is_rp := false
+				for e in sset["entries"]:
+					if str(e["name"]).begins_with("ruined_portal"):
+						is_rp = true
+				if not is_rp:
+					continue
+				for cz3 in range(pc0.y - rr, pc0.y + rr + 1, 8):
+					for cx3 in range(pc0.x - rr, pc0.x + rr + 1, 8):
+						for scv in sts._candidates(sset, cx3, cz3):
+							if seen.has(scv):
+								continue
+							seen[scv] = true
+							var res: Dictionary = sts._start(sset, scv)
+							if res.is_empty() or not res.has("pieces"):
+								continue
+							var el: Dictionary = res["pieces"][0]["el"]
+							var tb: Array = el.get("tbox", res["box"])
+							var cxm: int = (tb[0].x + tb[1].x) / 2
+							var czm: int = (tb[0].z + tb[1].z) / 2
+							lines.append("%s %s %s y=%d surf=%d air=%s mirror=%s box=%s" % [res["structure"], str(scv), str(el.get("placement", "?")), int(res["pieces"][0]["pos"].y), sts.base_height(cxm, czm, false) - 1, str(not bool(el["legacy"])), str(el.get("mirror", false)), str(tb)])
+		for ln in lines:
+			print("[rpcheck] " + ln)
+		print("[rpcheck] %d portals" % lines.size())
+		get_tree().quit()
+		return
+	if autoplay.has("icegap"):   # --icegap=1 (with --atbiome=ice_spikes): air cells sandwiched in packed ice, by y
+		var tg0 := Time.get_ticks_msec()
+		while not spawn_ready and Time.get_ticks_msec() - tg0 < 60000:
+			await get_tree().process_frame
+		while cm.pending_jobs() > 0 and Time.get_ticks_msec() - tg0 < 90000:
+			await get_tree().process_frame
+		var pk := Res.blocks.default_state("packed_ice")
+		var pcg := Vector2i(int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4)
+		var by_y := {}
+		var samples: Array = []
+		for cz2 in range(pcg.y - 6, pcg.y + 7):
+			for cx2 in range(pcg.x - 6, pcg.x + 7):
+				var ch2: Chunk = cm.get_chunk(cx2, cz2)
+				if ch2 == null or ch2.state < Chunk.DECORATED:
+					continue
+				for lz in 16:
+					for lx in 16:
+						for yy in range(60, 220):
+							if ch2.get_block(lx, yy, lz) == 0 and ch2.get_block(lx, yy + 1, lz) == pk and ch2.get_block(lx, yy - 1, lz) == pk:
+								by_y[yy] = int(by_y.get(yy, 0)) + 1
+								if samples.size() < 12:
+									samples.append(Vector3i(cx2 * 16 + lx, yy, cz2 * 16 + lz))
+		var ys: Array = by_y.keys()
+		ys.sort_custom(func(a, b): return by_y[a] > by_y[b])
+		var top: Array = []
+		for yk in ys.slice(0, 12):
+			top.append("y%d:%d" % [yk, by_y[yk]])
+		print("[icegap] sandwiched air cells by y: %s | samples %s" % [" ".join(top), str(samples)])
+		if not samples.is_empty():
+			var s0: Vector3i = samples[0]
+			for yy2 in range(s0.y + 3, s0.y - 4, -1):
+				var row := ""
+				for dz2 in range(-3, 4):
+					for dx2 in range(-3, 4):
+						var st2: int = state_at(s0.x + dx2, yy2, s0.z + dz2)
+						row += "#" if st2 == pk else ("." if st2 == 0 else "o")
+					row += " "
+				print("[icegap] y%d %s" % [yy2, row])
+		get_tree().quit()
+		return
+	if autoplay.has("flowtest"):   # --flowtest=1: a water source on flat ground; water blocks per game tick (Java: +1 ring / 5 ticks)
+		var tf := Time.get_ticks_msec()
+		while not spawn_ready and Time.get_ticks_msec() - tf < 60000:
+			await get_tree().process_frame
+		for f11 in 60:
+			await get_tree().process_frame
+		var src := Vector3i(int(floor(player.pos.x)) + 6, int(floor(player.pos.y)), int(floor(player.pos.z)) + 6)
+		set_block(src.x, src.y, src.z, Res.blocks.WATER)
+		BlockUpdates.schedule(self, src, 1)
+		var t_start := game_time
+		var log := []
+		var last := -1
+		while game_time - t_start < 80:
+			await get_tree().process_frame
+			var cnt := 0
+			var maxd := 0
+			for dz in range(-9, 10):
+				for dx in range(-9, 10):
+					var s11: int = state_at(src.x + dx, src.y, src.z + dz)
+					if s11 > 0 and (Res.blocks.st_flags[s11] & BlockRegistry.F_LIQUID) != 0:
+						cnt += 1
+						maxd = maxi(maxd, absi(dx) + absi(dz))
+			if cnt != last:
+				last = cnt
+				log.append("t%d:%d(r%d)" % [game_time - t_start, cnt, maxd])
+		print("[flowtest] %s" % " ".join(log))
+		get_tree().quit()
+		return
+	if autoplay.has("dimtrip"):   # --dimtrip=1: overworld -> nether -> overworld; the way back adopts cached chunks
+		var t9 := Time.get_ticks_msec()
+		while not spawn_ready and Time.get_ticks_msec() - t9 < 60000:
+			await get_tree().process_frame
+		for f9 in 120:
+			await get_tree().process_frame
+		var home := player.pos
+		for leg in ["the_nether", "overworld"]:
+			var arr9 := {"kind": "nether_portal", "pos": Portals.scaled_target(dimension, leg, player.pos) if leg == "the_nether" else home, "axis": "x"}
+			var hits0 := ChunkManager.cache_hits
+			var tl := Time.get_ticks_msec()
+			change_dimension(leg, arr9)
+			while not spawn_ready and Time.get_ticks_msec() - tl < 60000:
+				await get_tree().process_frame
+			var t_spawn9 := Time.get_ticks_msec() - tl
+			var pc9 := Vector2i(int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4)
+			var shown := 0
+			while Time.get_ticks_msec() - tl < 30000:
+				shown = 0
+				for dz9 in range(-4, 5):
+					for dx9 in range(-4, 5):
+						var c9: Chunk = cm.get_chunk(pc9.x + dx9, pc9.y + dz9)
+						if c9 != null and c9.shown:
+							shown += 1
+				if shown >= 81:
+					break
+				await get_tree().process_frame
+			print("[dimtrip] %s: spawn ready %d ms, ring 4 visible %d ms (%d / 81), chunks from memory %d" % [leg, t_spawn9, Time.get_ticks_msec() - tl, shown, ChunkManager.cache_hits - hits0])
+			for f10 in 60:
+				await get_tree().process_frame
+		get_tree().quit()
+		return
 	if autoplay.has("loadtest"):
 		await LoadTest.run(self)
 		return
@@ -848,6 +1191,11 @@ func _auto_run() -> void:
 				if not known.has(inm) and not inm.ends_with("_spawn_egg") and not (inm in CreativeScreen.OP_ITEMS) and not (inm in CreativeTabs.EXCLUDED) and inm != "spawner" and inm != "trial_spawner":
 					miss.append(inm + "(" + CreativeScreen.category(ii).left(5) + ")")
 			print("[tabdump] %d items, %d not in the vanilla lists: %s" % [Res.items.names.size(), miss.size(), ", ".join(miss)])
+		if autoplay.has("cmds") and not autoplay.has("cam"):   # --cmds also before a --screen shot
+			for cl3 in str(autoplay["cmds"]).split(";"):
+				var cl4 := cl3.replace("+", " ").strip_edges()
+				if cl4 != "":
+					print("[cmds] %s -> %s" % [cl4, commands.execute(cl4)])
 		match sname:
 			"pause":
 				var pm = load("res://scripts/ui/pause_menu.gd").new()
@@ -884,6 +1232,18 @@ func _auto_run() -> void:
 				inv.set_slot(Inventory.ARMOR0 + 1, ItemStack.named("iron_chestplate"))
 				inv.set_slot(Inventory.ARMOR0 + 2, ItemStack.named("iron_leggings"))
 				inv.selected = 1
+			"cartography", "cartography_copy", "cartography_lock":   # cartography table with a map + paper / map / pane
+				var fm := Maps.new_map(self, player.pos.x, player.pos.z)
+				for i in 300:
+					Maps.update(self, Maps.map_id(fm))
+				var cws = load("res://scripts/ui/workstation_screen.gd").new()
+				cws.kind = "cartography_table"
+				open_screen(cws)
+				await get_tree().process_frame
+				cws.inp[0] = fm
+				cws.inp[1] = ItemStack.named({"cartography": "paper", "cartography_copy": "map", "cartography_lock": "glass_pane"}[sname], 1)
+				cws.on_changed()
+				print("[screen] cartography result %s x%d" % [cws.result.name(), cws.result.count])
 			"stats", "advancements":
 				var sc = load("res://scripts/ui/%s_screen.gd" % sname).new()
 				sc.world = self
@@ -1045,7 +1405,7 @@ func _auto_run() -> void:
 			Input.parse_input_event(mm)
 			for i in 30:
 				await get_tree().process_frame
-		var simg := get_viewport().get_texture().get_image()
+		var simg: Image = get_viewport().get_texture().get_image() if DisplayServer.get_name() != "headless" else null
 		if simg != null:
 			simg.save_png("user://autoplay/screen_%s.png" % sname)
 		print("[screen] %s size %s" % [sname, str(screen.size) if screen != null else "none"])
@@ -1722,7 +2082,11 @@ func _auto_run() -> void:
 		player.pos = Vector3(float(cp[0]), float(cp[1]), float(cp[2]))
 		player.prev_pos = player.pos
 		_update_origin(true)
+		var cw0 := Time.get_ticks_msec()
 		for i in 200:
+			await get_tree().process_frame
+		# --camwait=1: also wait until the chunks around the camera are generated (far --cam positions)
+		while autoplay.has("camwait") and cm.pending_jobs() > 0 and Time.get_ticks_msec() - cw0 < 60000:
 			await get_tree().process_frame
 		if autoplay.has("cmds"):   # --cmds="fill ...;setblock ...": build a test scene before the screenshot (render checks)
 			for cl0 in str(autoplay["cmds"]).split(";"):
@@ -1730,6 +2094,120 @@ func _auto_run() -> void:
 				if cl != "":
 					print("[cmds] %s -> %s" % [cl, commands.execute(cl)])
 			for i in 120:
+				await get_tree().process_frame
+			var cw1 := Time.get_ticks_msec()
+			while autoplay.has("camwait") and cm.pending_jobs() > 0 and Time.get_ticks_msec() - cw1 < 60000:
+				await get_tree().process_frame
+			for i in (60 if autoplay.has("camwait") else 0):
+				await get_tree().process_frame
+		if autoplay.has("spawnov"):   # --spawnov=x,z: structure spawn override on the top nether brick of a column
+			var so: PackedStringArray = str(autoplay["spawnov"]).split(",")
+			var sx := int(so[0])
+			var sz := int(so[1])
+			for yy in range(120, 20, -1):
+				if Res.blocks.name_of(maxi(0, state_at(sx, yy, sz))) == "nether_bricks" and state_at(sx, yy + 1, sz) == 0:
+					for cat in ["monster", "creature"]:
+						var ov = gen.structures.spawn_override(sx, yy + 1, sz, cat, "nether_bricks")
+						print("[spawnov] %d,%d,%d %s -> %s" % [sx, yy + 1, sz, cat, str(ov)])
+					break
+			print("[spawnov] off-structure -> %s" % str(gen.structures.spawn_override(sx + 400, 64, sz + 400, "monster", "netherrack")))
+		if autoplay.has("craftertest"):   # --craftertest=1: crafter -> chest in front, one log, redstone block power
+			var cp0 := Vector3i(int(floor(player.pos.x)) + 3, int(floor(player.pos.y)) + 2, int(floor(player.pos.z)))
+			var B0 := Res.blocks
+			set_block(cp0.x, cp0.y, cp0.z, B0.with_prop(B0.default_state("crafter"), "orientation", "north_up"))
+			BlockEntities.on_placed(self, cp0, state_at(cp0.x, cp0.y, cp0.z))
+			set_block(cp0.x, cp0.y, cp0.z - 1, B0.default_state("chest"))
+			BlockEntities.on_placed(self, cp0 + Vector3i(0, 0, -1), state_at(cp0.x, cp0.y, cp0.z - 1))
+			var cd0 := BlockEntities.get_data(self, cp0)
+			var it0: Array = cd0["items"]
+			it0[0] = ItemStack.named("oak_log", 1).to_dict()
+			cd0["items"] = it0
+			BlockEntities.set_data(self, cp0, cd0)
+			set_block(cp0.x + 1, cp0.y, cp0.z, B0.default_state("redstone_block"))
+			var tw0 := game_time
+			while game_time - tw0 < 20:
+				await get_tree().process_frame
+			var chest_items := []
+			for ci in BlockEntities.get_data(self, cp0 + Vector3i(0, 0, -1)).get("items", []):
+				var cs0 := ItemStack.from_dict(ci)
+				if not cs0.is_empty():
+					chest_items.append("%s x%d" % [cs0.name(), cs0.count])
+			print("[craftertest] crafter state %s, crafter slot0 %s, chest %s" % [B0.state_string(state_at(cp0.x, cp0.y, cp0.z)), str(BlockEntities.get_data(self, cp0)["items"][0]), str(chest_items)])
+		if autoplay.has("poolscan"):   # --poolscan=r: cave water (y < 50) with air beside / below, chunks within r of the camera
+			var pr := int(autoplay["poolscan"])
+			var pc0 := Vector2i(int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4)
+			var open := 0
+			var total := 0
+			var first := []
+			var wst: int = Res.blocks.WATER
+			for pcz in range(pc0.y - pr, pc0.y + pr + 1):
+				for pcx in range(pc0.x - pr, pc0.x + pr + 1):
+					var pch: Chunk = cm.get_chunk(pcx, pcz)
+					if pch == null or pch.state < Chunk.DECORATED:
+						continue
+					for ly in range(-50, 50):
+						for lz in 16:
+							for lx in 16:
+								if pch.get_block(lx, ly, lz) != wst:
+									continue
+								total += 1
+								var wx := pcx * 16 + lx
+								var wz := pcz * 16 + lz
+								for dv in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1), Vector3i(0, -1, 0)]:
+									var ns: int = state_at(wx + dv.x, ly + dv.y, wz + dv.z)
+									if ns == 0 or Res.blocks.name_of(ns) == "cave_air":
+										open += 1
+										if first.size() < 6:
+											first.append(Vector3i(wx, ly, wz))
+										break
+			print("[poolscan] cave water %d, open to air %d, e.g. %s" % [total, open, str(first)])
+		if autoplay.has("modebug"):   # --modebug=1: monument candidates near the player, stub biome / surroundings
+			var sts: Structures = gen.structures
+			for stx in sts.sets:
+				if str(stx["name"]) != "ocean_monuments":
+					continue
+				var cfgm: Dictionary = stx["entries"][0]["cfg"]
+				var nshow := 0
+				var cands: Array = sts._candidates(stx, 0, 0, int(autoplay["modebug"]))
+				print("[modebug] %d candidates, cfg type %s, biomes %d, placement %s" % [cands.size(), str(cfgm.get("type")), (cfgm["biomes"] as Dictionary).size(), str(stx["placement"])])
+				for scm in cands:
+					var bx := sts.biome_id_at(scm.x * 16 + 8, sts._stub_y(cfgm, scm.x * 16 + 8, scm.y * 16 + 8), scm.y * 16 + 8)
+					if not (cfgm["biomes"] as Dictionary).has(bx):
+						if nshow < 3:
+							print("[modebug] %s stub biome %s rejected" % [str(scm), biomes.names[bx]])
+							nshow += 1
+						continue
+					var ids: PackedInt32Array = Native.inst.tg_biomes_within(gen.native_tg, scm.x * 16 + 9, gen.sea_level, scm.y * 16 + 9, 29)[0]
+					var names := []
+					for bi in ids:
+						names.append(biomes.names[bi])
+					print("[modebug] %s stub %s ok=%s within %s" % [str(scm), biomes.names[bx], str(JavaPieces.monument_surroundings_ok(sts, scm)), str(names)])
+					nshow += 1
+					if nshow > 8:
+						break
+			print("[modebug] ring set %s" % str(JavaPieces._mo_ring.keys()))
+		if autoplay.has("shdump"):   # --shdump=1: nearest stronghold's layout (piece kinds, portal room centre)
+			var shc: Vector2i = gen.structures.nearest_stronghold(int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4)
+			var sht0 := Time.get_ticks_usec()
+			var shr := JavaPieces.stronghold(gen.structures, shc)
+			var kc := {}
+			for pc in shr["pieces"]:
+				kc[pc["el"]["k"]] = int(kc.get(pc["el"]["k"], 0)) + 1
+			print("[shdump] start chunk %s, %d pieces in %.1f ms, portal centre %s, box %s, kinds %s" % [str(shc), (shr["pieces"] as Array).size(), (Time.get_ticks_usec() - sht0) / 1000.0, str(shr["center"]), str(shr["box"]), str(kc)])
+			for pc2 in shr["pieces"]:
+				if pc2["el"]["k"] == "portal_room":
+					print("[shdump] portal room %s..%s facing %s" % [str(pc2["el"]["min"]), str(pc2["el"]["max"]), pc2["el"]["ori"]])
+		if autoplay.has("mapshot"):   # --mapshot=1: hold a fresh filled map (player marker / map colours check)
+			player.mode = Player.Mode.CREATIVE
+			player.inventory.set_slot(player.inventory.selected, Maps.new_map(self, player.pos.x, player.pos.z))
+			if autoplay.has("mapbanner"):   # --mapbanner=1: a named banner 12 blocks north-east, its marker toggled on
+				var bp0 := Vector3i(int(floor(player.pos.x)) + 12, int(floor(player.pos.y)) + 3, int(floor(player.pos.z)) - 12)
+				set_block(bp0.x, bp0.y, bp0.z, Res.blocks.default_state("red_banner"))
+				var bd0 := BlockEntities.get_data(self, bp0).duplicate()
+				bd0["CustomName"] = "Base"
+				BlockEntities.set_data(self, bp0, bd0)
+				print("[mapbanner] toggled %s" % str(Maps.toggle_banner(self, player.inventory.held(), bp0)))
+			for i in 400:
 				await get_tree().process_frame
 		if autoplay.has("propline"):   # --propline=x0,x1,y,z: wall / fence connection props along a row
 			var pl: PackedStringArray = str(autoplay["propline"]).split(",")
@@ -1805,9 +2283,73 @@ func _auto_run() -> void:
 			ks.sort()
 			print("[ffhcheck] diff histogram: %s" % ", ".join(ks.map(func(k): return "%d:%d" % [k, dh[k]])))
 			print("[ffhcheck] worst: %s" % "; ".join(worst))
+		if autoplay.has("raincheck") and weather_fx != null and DisplayServer.get_name() != "headless":
+			# --raincheck=1: the same frozen rain drawn as visible-texel runs (current) and as whole column quads (previous
+			# shader): images must match (third shot = current again, the noise floor)
+			player.yaw = float(autoplay.get("yaw", "0"))
+			player.pitch = float(autoplay.get("pitch", "40"))
+			raining = true
+			rain = 1.0
+			gamerules["doWeatherCycle"] = false
+			for i in 80:
+				await get_tree().process_frame
+			weather_fx.frozen = true
+			var rimgs: Array = []
+			for mode in [0, 1, 0]:
+				weather_fx.set_full_quad(mode == 1)
+				for i in 4:
+					await get_tree().process_frame
+				await RenderingServer.frame_post_draw
+				rimgs.append(get_viewport().get_texture().get_image())
+			var rdir := "user://autoplay"
+			DirAccess.make_dir_recursive_absolute(rdir)
+			for ri in rimgs.size():
+				(rimgs[ri] as Image).save_png(rdir.path_join("raincheck_%d.png" % ri))
+			for pair in [[0, 1], [0, 2]]:
+				var ia: Image = rimgs[pair[0]]
+				var ib: Image = rimgs[pair[1]]
+				var nd := 0
+				var md := 0.0
+				var dimg := Image.create(ia.get_width(), ia.get_height(), false, Image.FORMAT_RGB8)
+				var dlist: PackedStringArray = []
+				for py in range(90, ia.get_height()):   # (the top rows hold the FPS counter text)
+					for px in range(0, ia.get_width()):
+						var ca := ia.get_pixel(px, py)
+						var cb := ib.get_pixel(px, py)
+						var dd := maxf(maxf(absf(ca.r - cb.r), absf(ca.g - cb.g)), absf(ca.b - cb.b))
+						if dd > 0.0:
+							nd += 1
+							md = maxf(md, dd)
+							dimg.set_pixel(px, py, Color(1, 0, 0) if ca.get_luminance() > cb.get_luminance() else Color(0, 1, 0))
+							if dlist.size() < 12:
+								dlist.append("(%d,%d) %s vs %s" % [px, py, ca.to_html(false), cb.to_html(false)])
+				dimg.save_png(rdir.path_join("raincheck_diff_%d_%d.png" % [pair[0], pair[1]]))
+				print("[raincheck]   e.g. ", ", ".join(dlist))
+				print("[raincheck] shots %d vs %d: %d pixels differ, max channel difference %d / 255" % [pair[0], pair[1], nd, roundi(md * 255.0)])
+			# GPU time per frame (viewport timer, 120 frames each, twice): visible-texel runs, whole quads, no weather
+			var gvp := get_viewport().get_viewport_rid()
+			RenderingServer.viewport_set_measure_render_time(gvp, true)
+			var gsum := {"runs": 0.0, "full quads": 0.0, "none": 0.0}
+			for rep in 2:
+				for gm in ["runs", "full quads", "none"]:
+					weather_fx.set_full_quad(gm == "full quads")
+					weather_fx.visible = gm != "none"
+					for i in 20:
+						await get_tree().process_frame
+					for i in 120:
+						await get_tree().process_frame
+						gsum[gm] += RenderingServer.viewport_get_measured_render_time_gpu(gvp) / 240.0
+			weather_fx.visible = true
+			weather_fx.set_full_quad(false)
+			print("[raincheck] gpu ms per frame: visible-texel runs %.3f, whole column quads %.3f, no weather %.3f" % [gsum["runs"], gsum["full quads"], gsum["none"]])
+			weather_fx.frozen = false
 		if autoplay.has("locatest") and gen.get("structures") != null:   # --locatest=name: synchronous structure locate
-			var lr: Dictionary = gen.structures.locate(str(autoplay["locatest"]), int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4)
-			print("[locatest] %s %s" % [str(autoplay["locatest"]), str(lr)])
+			for lname0 in str(autoplay["locatest"]).split(","):
+				var lname := lname0.get_slice(":", 0)   # name[:radius in chunks]
+				var lrad := int(lname0.get_slice(":", 1)) if lname0.contains(":") else 100
+				var tl0 := Time.get_ticks_usec()
+				var lr: Dictionary = gen.structures.locate(lname, int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4, lrad)
+				print("[locatest] %s %s in %.1f ms" % [lname, str(lr), (Time.get_ticks_usec() - tl0) / 1000.0])
 		if autoplay.has("brushtest"):   # --brushtest=1: brush a suspicious sand block with desert-well loot to completion
 			var bpos := Vector3i(int(floor(player.pos.x)) + 2, int(floor(player.pos.y)), int(floor(player.pos.z)))
 			set_block(bpos.x, bpos.y - 1, bpos.z, Res.blocks.default_state("stone"))
@@ -2203,8 +2745,8 @@ func _auto_run() -> void:
 				entities.spawn_block_particles(Vector3i(at.floor()), Res.blocks.default_state(names[bi]))
 			for f in 3:
 				await get_tree().process_frame
-		await RenderingServer.frame_post_draw
-		if DisplayServer.get_name() != "headless":
+		if DisplayServer.get_name() != "headless":   # the dummy renderer never emits frame_post_draw (headless probes hung)
+			await RenderingServer.frame_post_draw
 			var img := get_viewport().get_texture().get_image()
 			var p := dir.path_join("%s_view%d.png" % [folder, vi])
 			img.save_png(p)
@@ -2608,8 +3150,6 @@ func _tick() -> void:
 	if hand_swing > 0:
 		hand_swing -= 1
 	var g4 := Time.get_ticks_usec()
-	if player.eyes_in_water and game_time % 10 == 0 and not player.is_creative():
-		Particles.emit("bubble", player.eye_pos() + player.look_dir() * 0.4, Vector3(0, 0.05, 0))
 	if use_cooldown > 0:
 		use_cooldown -= 1
 	if auto_use > 0:
@@ -3187,6 +3727,9 @@ func _screenshot() -> void:
 
 
 func _exit_tree() -> void:
+	ChunkManager._dc_mutex.lock()
+	ChunkManager.dim_cache.clear()
+	ChunkManager._dc_mutex.unlock()
 	if Collision.fast_world == self:
 		Collision.fast_cm = null
 		Collision.fast_world = null
@@ -3620,7 +4163,7 @@ func _apply_advanced(key := "") -> void:
 		return
 	cm.set_worker_count(int(Settings.get_v("adv_threads")))
 	if key == "adv_pin_main":
-		ChunkManager.pin_mode = (maxi(ChunkManager.pin_mode, 0) & ~1) | (1 if Settings.get_v("adv_pin_main") else 0)
+		ChunkManager.pin_mode = 3 if Settings.get_v("adv_pin_main") else 0   # workers re-pin on their next start
 		if Settings.get_v("adv_pin_main"):
 			ChunkManager.pin_thread(true)
 		elif Native.ok and Native.inst.has_method("set_thread_cpu_sets"):

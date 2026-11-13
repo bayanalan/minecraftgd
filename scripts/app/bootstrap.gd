@@ -689,7 +689,21 @@ func show_options(back: Callable) -> void:
 	_set_screen(o)
 
 
+var _locked_world := ""
+
+
 func start_world(folder: String, autoplay_opts: Dictionary = {}) -> void:
+	if not SaveManager.lock_world(folder):
+		# Java SystemToast.onWorldAccessFailure: the world stays closed
+		printerr("[world] %s is in use by another running game" % folder)
+		if not autoplay_opts.is_empty():
+			get_tree().quit(1)
+			return
+		show_world_list()
+		McConfirm.open(current, Res.tr_key("selectWorld.access_failure", "Failed to access world"), Res.tr_key("selectWorld.locked", "Locked by another running instance of Minecraft"),
+			Res.tr_key("gui.ok", "OK"), Res.tr_key("gui.back", "Back"), func(): pass)
+		return
+	_locked_world = folder
 	_set_screen(null)
 	var w = load("res://scripts/world/world_manager.gd").new()
 	w.app = self
@@ -704,11 +718,17 @@ func leave_world() -> void:
 		await world.save_and_close()
 		world.queue_free()
 	world = null
+	if _locked_world != "":
+		SaveManager.unlock_world(_locked_world)
+		_locked_world = ""
 	show_title()
 
 
 func quit() -> void:
 	if world != null and is_instance_valid(world):
 		await world.save_and_close()
+	if _locked_world != "":
+		SaveManager.unlock_world(_locked_world)
+		_locked_world = ""
 	Settings.save()
 	get_tree().quit()

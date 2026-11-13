@@ -3,6 +3,143 @@
 Moved out of PROGRESS.md (2026-11-12). Open work lives in PROGRESS.md (OPEN BUGS). Newest first.
 
 ## Fixed 2026-11-12 (from the user bug lists; screenshots: c:\Users\Gerbilicious_Dude\Pictures\Screenshots\Screenshot 2026-11-12 <time>.png)
+- [x] (Rendering) Rain cost ~35-75 % FPS [180829]: the 441 column quads shaded ~78 M fragments per frame at 2880x1800
+      and discarded 97.5 % of them (rain.png is 2.5 % opaque, snow.png 0.8 %). Each column is now drawn as one small
+      quad per vertical run of visible texels (WeatherFX._streak_mesh, 7 texture repeats, u wraps for snow), placed in
+      the shader exactly over the texels the whole quad sampled, light / fog interpolated from the whole quad's
+      corners. Frozen-weather A/B in one process (--raincheck): rain 2.75 -> 0.73 ms GPU per frame, snow 2.7 -> 1.0
+      ms; images equal except ~0.01 % of pixels on texel edges (float rounding of the old large texture coordinates)
+- [x] (Performance) Flight stutter from chunk streaming: chunk workers on the second Prime core cluster dragged the main
+      thread's clock down (main thread running 10-20x slower in bursts). Workers now run on the 6 Performance cores (lower
+      efficiency class) and use the second Prime cluster only during the loading screen, the first fill of the render
+      distance, or when 3+ rings behind. Flight bench (ARM64, 2880x1800, RD 16, same 65 chunks / s): avg 240 -> 390-430,
+      1 % low 70 -> 133-166, 0.1 % low 42 -> 81-95, worst frame 38 -> 14-17 ms; static views 465 / 1 % low 198. Also:
+      jigsaw assembly 3-10x faster (trial chambers 420 -> 40-60 ms, identical pieces), decorate 2.9 -> 1.5 ms / chunk.
+      Test / benchmark runs no longer draw their own FPS text (only with --benchoverlay)
+- [x] (Worldgen) Woodland mansions never generated: now Java's WoodlandMansionStructure + WoodlandMansionPieces
+      (MansionGrid: entrance block, recursive corridors, edge cleanup, 1x1 / 1x2 / 2x2 rooms with door / origin / stairs
+      flags, the third floor grown from a staircase room; MansionPiecePlacer: outer walls traced per floor (wall_flat /
+      wall_window, corners, inner turns), roofs + small walls + roof corners, corridor floors and carpets, indoor walls and
+      doors, one room template per room from the floor's collection with Java's rotations and mirrors). Templates get
+      both Mirror modes (FRONT_BACK and LEFT_RIGHT, door hinges swap), structure blocks are ignored and template air
+      hollows the interior; data markers place facing chests (chests/woodland_mansion), evokers, vindicators and
+      1-3 allays; the cobblestone foundation fills down to the ground (afterPlace); stub: lowest corner of the rotated
+      5 x 5 box >= 60, biome at chunk block 7, 7. /place structure now places a whole structure chunk by chunk without
+      the biome test (Java PlaceCommand). Verified by render (walls / corners / roofs meet) and grid invariant tests
+- [x] (Worldgen) Dappled forest poplars looked nothing like vanilla [174713] (diamond / spindle crowns): rebuilt from the vanilla
+      reference screenshots (2026-11-13 125709..125818) with the 26.3 parameters - dense rounded dome crowns (circular
+      layers, ellipse profile centred 60 % down, radius 5-8, 5-6 layers), 1-4 diagonal branches each under a small
+      crown lobe, rim-only side holes. The placer code itself is not public: shape matched visually, not block-for-block
+- [x] (Build) Two game instances could open (and both write) the same world: Java's session.lock - the world holds the owner's
+      process id; another running instance gets "Failed to access world" and cannot delete it, stale locks (crash) are
+      taken over, released on leaving / quitting
+- [x] (Rendering) Crafter did nothing and its screen threw errors (generic chest layout over 9 slots): now Java's crafter - 3 x 3
+      grid with clickable disabled slots, result preview, redstone indicator; crafts on a redstone rising edge after 4
+      ticks into the container in front or out of its face (remainders too), fail sound without a recipe, hoppers fill
+      the smallest stacks, comparators read filled + disabled slots, Java placement orientation (front / top)
+- [x] (Rendering) Pistons, dispensers, droppers placed while looking straight down faced down (Java: up, towards the player);
+      observers the reverse - vertical facing was inverted
+- [x] (Rendering) Headless autoplay probes never quit (awaited RenderingServer.frame_post_draw, which the dummy renderer never
+      emits); a UI smoke test of 28 screens now runs in minutes - all open without script errors
+- [x] (Rendering) Map markers: using a filled map on a banner toggles its marker (dye-coloured banner icon, its name under it in
+      the vanilla font on a 50 % black background, removed when the banner breaks / changes), a map in an item frame
+      shows the green frame marker, framed maps draw banner markers and turn in 90 deg steps (Java ItemFrameRenderer);
+      the held map's player marker no longer errors after the hand-shader swap (off-map / off-limits sprites work)
+- [x] (Worldgen) Cave water pools generate cut off [180044]: dripstone pools (water only where 4 sides + below are stone / water)
+      were opened by another chunk's carving feature decided on pristine terrain; decoration now skips an origin's air
+      writes on or beside a liquid another origin placed (Java: the lake sees the water and aborts, or the pool sees the
+      air), native + GDScript identical (nativecheck decorate 0 differing). Recheck in game
+- [x] (Worldgen) Parse Error: Could not resolve class "CreativeScreen": scripts/ui/container_ui.gd line 313 had a stray "o"
+      typed before draw_background (file saved 10:33 from the editor); removed. If the editor still shows it, don't save
+- [x] (Worldgen) /seed had no way to copy the seed: Java's copyOnClickText - green [seed], click copies to the clipboard, hover
+      shows "Click to Copy to Clipboard" (/locate coordinates now show "Click to teleport" on hover)
+- [x] (Rendering) Nether / any dimension fog stayed the default light blue after a teleport or portal trip while the player
+      stood still (biome blend taken before the chunks existed, only redone on camera block changes): now redone each
+      tick until the chunks around the camera are loaded
+- [x] (Worldgen) Maps: Java MapItem.update ported (reveal radius 128 >> scale - was 64 px, 1/16 of the columns per tick plus
+      changed neighbours, 2^scale blocks per pixel with the most common colour, height shading / (2^scale + 4), edge
+      checkerboard); the holder's arrow (22.5 deg steps, Nether spin) / off-map / off-limits dots like MapRenderer;
+      cartography table (zoom out with paper up to scale 4, lock with a glass pane, copy with an empty map, Java
+      screen with the scaled / duplicated / locked previews and error icon)
+- [x] (Worldgen) Structure data markers (TemplateStructurePiece.handleDataMarker) were ignored: shipwreck map / supply / treasure,
+      igloo and ocean ruin chests had no loot, ocean ruins no drowned, end cities no loot / shulkers / elytra. Now
+      handled per structure; end cities run Java's EndCityPieces (tower / bridge / house / fat tower generators, one
+      ship, batch collision rule, the y 60 corner check - also in /locate); buried treasure runs BuriedTreasurePieces
+- [x] (Worldgen) Deep dark had no sculk (the one vanilla feature type left unimplemented: sculk_patch): Java SculkPatchFeature +
+      the world-gen SculkSpreader ported natively (featx kind 32: charge cursors, sculk / sculk-vein behaviours,
+      MultifaceSpreader vein spreading, sensor / shrieker growths, decay penalties) - 2,356 sculk + 2,131 veins around
+      the seed 12345 ancient city; the GDScript placement loop for it (2.2 s per load test) is gone
+- [x] (Build) native/bin/recraft_native.x86_64.dll rebuilt (no longer locked); builds/windows-arm64 and builds/windows-x86_64 re-exported with every change of this round (2026-11-13 01:08)
+- [x] (Gameplay / UI) Elytra + firework: the boost is Java's (updateFallFlyingMovement + FireworkRocketEntity attached boost, life
+      10 x (flight + 1) + r6 + r7); using a rocket while gliding now spawns the attached rocket entity: rendered as the
+      item's camera-facing ground sprite (also free-flying rockets, were grey boxes), riding at the hand, a spark every
+      tick (gaussian 0.05, against the vertical motion), launch sound volume 3, at the end the star burst or Java's
+      2-4 POOF particles (new ExplodeParticle kind, also used for mob death poofs)
+- [x] (Gameplay / UI) Advancement toast text colours (challenge / goal); advancements screen like vanilla: AdvancementToast header
+      per frame (challenges pink 0xFF88FF, tasks / goals yellow), ToastManager 600 ms quadratic slide in / out with
+      ui.toast.in / out (+ challenge_complete), chat per frame type (made the advancement / reached the goal /
+      completed the challenge); the screen (tabs, window, tree layout, frames, visibility) renders like Java;
+      /advancement gained from / until / through and single criteria with Java's messages
+- [x] (Gameplay / UI) Waterlogging for every waterloggable block: placement into water, buckets (fill / empty) and flows already
+      handled; flows no longer waterlog (Java: a waterloggable block takes only a water source - canHoldSpecificFluid),
+      doors hold water back (canHoldAnyFluid), holes test the flowing fluid. Kelp / seagrass ocean renders show no air
+      pockets. Tests: fence passed by, two sources waterlog a stair
+- [x] (Gameplay / UI) Fire spread: Java FireBlock ported - scheduled tick 30..39, survive check (sturdy floor or burnable side), rain
+      burn-out, age, infiniburn floor per dimension type, checkBurnOut on the 6 sides (fire or gone, TNT primed), spread
+      into the 3 x 6 x 3 box by ignite odds / age / difficulty / humid biomes, the bootStrap odds table, side-attached
+      and soul fire states; LavaFluid.randomTick lights fires; fire from flint and steel / crystals uses the same state.
+      Probe: planks + leaves burn down over ~1200 ticks
+- [x] (Gameplay / UI) End crystal item (EndCrystalItem: obsidian / bedrock, empty above, no entity in the box, no base plate) and the
+      dragon respawn (tryRespawn: 4 crystals beside the exit portal; DragonRespawnAnimation START / PREPARING / pillars
+      rebuilt one per 40 ticks with invulnerable crystals beaming at (0, 128, 0) / SUMMONING / new dragon, crystal
+      beams, abort when a respawn crystal is destroyed); exit podium clears Java's 3.5 sphere (the egg stays).
+      --respawntest: 604 ticks, dragon back
+- [x] (End) End crystals too small [181845]; sometimes no fire / off [181912]; no healing beam: EndCrystalModel / Renderer
+      ported (scale 2, base plate around the bedrock, outer / inner glass and cube nested at 0.875, Ry(age * 3) * 60 deg
+      tumble, getY bob, random start time), EndCrystal.tick keeps a fire in its block in the End, EnderDragon
+      checkCrystals (tracked nearest crystal within the box + 32, re-picked 1 tick in 10, heals 1 / 10 ticks) with the
+      renderCrystalBeams beam (8 quads, scrolling end_crystal_beam texture, black at the dragon); destroying the
+      tracked crystal hits the head for 10, a holding dragon starts strafing
+- [x] (End) Dragon tail always straight; AI stiff (no curving / waving, drifts): Java EnderDragonModel rebuilt (head with
+      nostrils / scales + jaw, 5 neck + 12 tail segments with spine scales, body scales, wings + tips (mirrored left),
+      legs with tips and feet) and posed from a 64-tick flight history like Java: body yaw 7 ticks back + climb pitch,
+      neck / head / tail curving behind turns and waving with the flap phase, torso roll, legs tucked, root bob. AI is
+      the Java phase machine on the node graph (holding circle radius 60 like vanilla). --dragonshots=N renders it
+- [x] (Worldgen) Ruined nether portals generate inside terrain [180647]: ported RuinedPortalStructure / RuinedPortalPiece - setup
+      choice, air pocket (underground portals were placed without their air: sealed in stone), giant 5 %, rotation +
+      mirror about the template centre, findSuitableY (3 of 4 corner columns, from Java getBaseColumn: new native
+      tg_column = interpolated density + aquifer), biome test on the stub, cold check, processors (gold 30 % gone, lava
+      rules, netherrack -> magma, Java BlockAgeProcessor, protected blocks, lava-submerged, blackstone), netherrack /
+      magma spread + drip columns, vines and leaves (jungle / swamp). --rpcheck lists starts; renders checked
+- [x] (Worldgen) Check: 8 overworld blocks = 1 Nether block: scaled_target = coordinate scale ratio (1/8, 8), floored like
+      BlockPos.containing, clamped to the border; link search 16 (Nether) / 128 (Overworld) - matches Java
+- [x] (Worldgen) Ice spikes cut off naturally [180259]: the spike layer loop iterated [k, -k] by value, so the k = 0 layer was
+      skipped with its (non-existent) mirror: every spike missed its base slice (--icegap: sandwiched air cells per y
+      342 -> 13, the rest are Java's random edge notches / trunk-corner gaps)
+- [x] (Rendering) Gap glitch at the edge of ice [175817]; seams seen from under water [175857]: translucent cube faces (ice, glass,
+      slime, honey) are no longer merged by the greedy mesher (T-junction hairline cracks showed through translucent
+      layers; Java never merges), both meshers, --nativecheck mesh 0 diffs. Also: the camera-close bubble every 10
+      ticks under water is gone (Java: 8 bubbles around the body only when drowning damage hits)
+- [x] (Worldgen) Crimson roots floating; water in the Nether [181222] [181333]: roots / sprouts / fungi survival = Java mayPlaceOn
+      (#nylium, soul soil, #dirt, farmland) in both feature engines and block updates (they had no rule: placed anywhere);
+      water from buckets / dispensers evaporates where the dimension has minecraft:gameplay/water_evaporates (hiss + 8
+      large smoke), the Nether's fast_lava gives lava tick delay 10 / drop-off 1 / slope distance 4
+- [x] (Rendering) Water flow not identical [180119]; placed water low resolution [181222]; flow visible only every ~10 s: fluid
+      ticks ported from Java FlowingFluid (getNewLiquid, spread down first / sides, getSpread slope search 4 (lava 2/4),
+      holes, canBeReplacedWith, waterlogging spreadTo, lava spread delay x4); neighbour updates gave fluids a 1-tick
+      tick (flows raced); bucket first tick 5 / 30; animated textures (water_flow / lava_flow 32 px) kept at native
+      resolution; chunk relight / remesh after block changes now ahead of generation work (was behind it: seconds while
+      streaming) and batched 150 ms instead of 600 ms. --flowtest: ring per 5 ticks, radius 7 = 113 blocks at t31
+- [x] (Performance) Nether / End chunk generation very slow: 26.3 Nether feature types (netherrack_replace_blobs, delta_feature,
+      stepped_column_cluster, single_block_pillar, projected_random_patchy_square, random_neighbor_spread, huge_fungus)
+      and the count_on_every_layer modifier ported to the native feature engine (basalt delta chunk 215 -> ~3 ms of
+      feature work; --nativecheck in the Nether 0 differing write lists); the End is all-native (biome erosion sample
+      by native point evaluation instead of a GDScript density context per chunk: 8.1 -> 3.1 ms). Remaining GDScript
+      features: overlay (basalt_pillar), root_system, iceberg, fossil, bamboo, poplar / cherry trunks, spike, sculk,
+      large_dripstone, geode, end_spike / island / gateway, coral, chorus, blue_ice, block_blob
+- [x] (Performance) Keep the other dimension partially loaded: the decorated chunks within 10 of the player stay in memory per
+      dimension (ChunkManager.dim_cache) and are adopted on the way back instead of read / generated (--dimtrip: 126
+      chunks from memory on return)
 Rendering:
 - [x] Grass block sides darken the landscape from a distance [175238]: vanilla mip chains (cutout plants nearest-only like Java's unmipped cutout; transparent texels take neighbour colours before averaging)
 - [x] Bed item models wrong in the inventory [175344]: 26.x composite item models (head + foot translated (0, 0, 1))

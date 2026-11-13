@@ -807,7 +807,9 @@ bool fn_mesh(const Args &a, void *ret) {
 	static const int dir_step[6] = {-PL, PL, -PX, PX, -1, 1};
 	std::vector<int64_t> masks[6];
 	for (int d = 0; d < 6; d++) masks[d].assign(16 * 16 * GH, 0);
-	std::vector<uint8_t> mask_cls(6 * 16 * 16 * GH, 0);
+	static thread_local std::vector<uint8_t> tl_mask;
+	TLBuf<uint8_t> mask_buf(tl_mask, 6 * 16 * 16 * GH, 0);
+	std::vector<uint8_t> &mask_cls = mask_buf.v;
 	static thread_local FaceDescs fdesc;
 	fdesc.reset();
 	FaceLight res;
@@ -861,7 +863,9 @@ bool fn_mesh(const Args &a, void *ret) {
 						} else {
 							face_light(c, i, d, res);
 						}
-						int md = (c.opts & 2) ? 0 : face_mode(res);
+						// translucent cubes never merged (T-junction cracks show through translucent layers; see mesher.gd)
+						static const bool tr_merge = std::getenv("RC_TRMERGE") != nullptr;   // A/B: old merged translucent faces
+						int md = ((c.opts & 2) || (surf_cls == 2 && !tr_merge)) ? 0 : face_mode(res);
 						if (md != 0) {
 							uint64_t u0 = ((uint64_t)fdata & 0x0FFFFFFF) | (((uint64_t)tint & 0xFFFFFF) << 28) | ((uint64_t)res.center << 52) | ((uint64_t)md << 53);
 							uint64_t u1 = 0;

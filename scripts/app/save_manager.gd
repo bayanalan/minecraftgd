@@ -102,10 +102,40 @@ static func atomic_write(p: String, data: PackedByteArray) -> bool:
 	return DirAccess.rename_absolute(tmp, p) == OK
 
 
+## Java session.lock: a world in use by another running instance is not opened (two writers corrupt the save). The
+## lock holds the owner's process id; a lock whose process is gone (crash) is stale and taken over.
+static func lock_world(f: String) -> bool:
+	var dir := ROOT.path_join(f)
+	if not DirAccess.dir_exists_absolute(dir):
+		return true
+	var p := dir.path_join("session.lock")
+	if FileAccess.file_exists(p):
+		var t := FileAccess.get_file_as_string(p).strip_edges()
+		var pid := int(t) if t.is_valid_int() else 0
+		if pid > 0 and pid != OS.get_process_id() and OS.is_process_running(pid):
+			return false
+	var fa := FileAccess.open(p, FileAccess.WRITE)
+	if fa != null:
+		fa.store_string(str(OS.get_process_id()))
+		fa.close()
+	return true
+
+
+static func unlock_world(f: String) -> void:
+	var p := ROOT.path_join(f).path_join("session.lock")
+	if FileAccess.file_exists(p) and FileAccess.get_file_as_string(p).strip_edges() == str(OS.get_process_id()):
+		DirAccess.remove_absolute(p)
+
+
 static func delete_world(f: String) -> bool:
 	var p := ROOT.path_join(f)
 	if not DirAccess.dir_exists_absolute(p) or f.contains("..") or f.is_empty():
 		return false
+	var lk := p.path_join("session.lock")
+	if FileAccess.file_exists(lk):
+		var t := FileAccess.get_file_as_string(lk).strip_edges()
+		if t.is_valid_int() and int(t) != OS.get_process_id() and OS.is_process_running(int(t)):
+			return false   # in use by another running game
 	return _rm_rf(p)
 
 

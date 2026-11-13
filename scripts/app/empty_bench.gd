@@ -8,6 +8,9 @@ var _ft: Array = []
 var _t0 := 0
 var _last := 0
 var _vp: RID
+var _slow: Array = []
+var _nat: Object = null
+var _stall := false
 
 
 func _ready() -> void:
@@ -64,14 +67,26 @@ func _ready() -> void:
 	if args.has("--empty2d"):   # 3D disabled on the main viewport: canvas only (floor of a full-frame RD renderer)
 		RenderingServer.viewport_set_disable_3d(_vp, true)
 	RenderingServer.viewport_set_measure_render_time(_vp, true)
+	if args.has("--msgprobe") and ClassDB.class_exists("RecraftNative"):   # time the window's message handling
+		_nat = ClassDB.instantiate("RecraftNative")
+		print("[empty] wndproc probe: ", _nat.wndproc_probe(DisplayServer.window_get_native_handle(DisplayServer.WINDOW_HANDLE)))
+	if args.has("--stallprobe") and ClassDB.class_exists("RecraftNative"):   # main-thread stacks in frames > 2.5 ms
+		if _nat == null:
+			_nat = ClassDB.instantiate("RecraftNative")
+		_stall = true
+		print("[empty] stall sampler: ", _nat.stall_sampler(1))
 	_t0 = Time.get_ticks_usec()
 	_last = _t0
 
 
 func _process(_d: float) -> void:
+	if _stall:
+		_nat.frame_mark()
 	var now := Time.get_ticks_usec()
 	if now - _t0 > 2000000:   # 2 s warm-up
 		_ft.append((now - _last) / 1000.0)
+		if now - _last > 4000:   # slow frames (times since start): a periodic engine / OS stall shows as a 1 s rhythm
+			_slow.append(snappedf((now - _t0) / 1e6, 0.01))
 	_last = now
 	if now - _t0 > 10000000:
 		_ft.sort()
@@ -81,5 +96,22 @@ func _process(_d: float) -> void:
 		print("[empty] RESULT %s" % JSON.stringify({"window": DisplayServer.window_get_size(), "frames": _ft.size(),
 			"fps_avg": snappedf(1000.0 * _ft.size() / tot, 0.1), "fps_median": snappedf(1000.0 / _ft[_ft.size() / 2], 0.1),
 			"ms_p99": snappedf(_ft[int(_ft.size() * 0.99)], 0.001), "gpu_ms": snappedf(RenderingServer.viewport_get_measured_render_time_gpu(_vp), 0.001),
-			"render_cpu_ms": snappedf(RenderingServer.viewport_get_measured_render_time_cpu(_vp), 0.001)}))
+			"render_cpu_ms": snappedf(RenderingServer.viewport_get_measured_render_time_cpu(_vp), 0.001), "slow_frames_over_4ms": _slow.size(), "slow_at_s": _slow.slice(0, 16)}))
+		if _stall:
+			_nat.stall_sampler(0)
+			var rep: PackedByteArray = _nat.stall_report()[0]
+			print("[empty] stall stacks (samples: module+offset, innermost first):
+" + rep.get_string_from_utf8())
+		if _nat != null and not _stall:
+			var sl: Array = _nat.wndproc_slow()
+			var ws: PackedInt64Array = sl[0]
+			var parts: PackedStringArray = []
+			for k in range(0, mini(ws.size(), 60), 3):
+				parts.append("0x%x %d us at %.2f s" % [ws[k], ws[k + 1], ws[k + 2] / 1000.0])
+			print("[empty] window messages handled %d, slow (> 1 ms) %d: %s" % [int(sl[1]), ws.size() / 3, ", ".join(parts)])
+			var hs: PackedInt64Array = sl[2]
+			var hp: PackedStringArray = []
+			for k in range(0, hs.size(), 2):
+				hp.append("0x%x x%d" % [hs[k], hs[k + 1]])
+			print("[empty] message histogram: ", ", ".join(hp))
 		get_tree().quit()

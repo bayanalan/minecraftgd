@@ -466,7 +466,61 @@ static func rig(id: String) -> Dictionary:
 			return {"parts": LLAMA}
 		"phantom":
 			return {"parts": PHANTOM, "nest": PHANTOM_NEST}
+		"ender_dragon":
+			return {"parts": dragon_parts(), "nest": DRAGON_NEST, "children": {}}
+		"end_crystal":
+			return {"parts": CRYSTAL}
 	return {}
+
+
+## Java EnderDragonModel layer: head (upper lip, upper head, scales and nostrils, the -x pair mirrored) with the jaw, 5
+## neck and 12 tail segments (box + spine scale), the body with 3 back scales, wings with tips (left ones mirrored),
+## legs with tips and feet. Body, wings and legs hang off a 	orso pivot at model (0, 16, 0): Java rolls them
+## together about that point (renderToBuffer). Neck / head / tail / torso / legs are posed per frame from the flight
+## history (EntityManager._dragon_pose); every part's pivot here is its rest offset.
+const DRAGON_NEST := {"jaw": "head", "body": "torso", "left_wing": "torso", "left_wing_tip": "left_wing",
+	"right_wing": "torso", "right_wing_tip": "right_wing", "left_front_leg": "torso", "left_front_leg_tip": "left_front_leg",
+	"left_front_foot": "left_front_leg_tip", "right_front_leg": "torso", "right_front_leg_tip": "right_front_leg",
+	"right_front_foot": "right_front_leg_tip", "left_hind_leg": "torso", "left_hind_leg_tip": "left_hind_leg",
+	"left_hind_foot": "left_hind_leg_tip", "right_hind_leg": "torso", "right_hind_leg_tip": "right_hind_leg",
+	"right_hind_foot": "right_hind_leg_tip"}
+
+
+static func dragon_parts() -> Array:
+	var parts: Array = [["torso", [0, 16, 0], [0, 0, 0], [0, 0, 0], [0, 0], 0]]
+	parts.append(["body", [0, -12, 8], [-12, 0, -16], [24, 24, 64], [0, 0], 0, 0, 0, 0.0,
+		[["scale_a", [-1, -6, -10], [2, 6, 12], [220, 53], 0.0], ["scale_b", [-1, -6, 10], [2, 6, 12], [220, 53], 0.0],
+		["scale_c", [-1, -6, 30], [2, 6, 12], [220, 53], 0.0]]])
+	var seg_scale := [["spine", [-1, -9, -3], [2, 4, 6], [48, 0], 0.0]]
+	for i in 5:
+		parts.append(["neck%d" % i, [0, 20 - 0 * i, -12 - 10 * i], [-5, -5, -5], [10, 10, 10], [192, 104], 0, 0, 0, 0.0, seg_scale])
+	for j in 12:
+		parts.append(["tail%d" % j, [0, 10, 60 + 10 * j], [-5, -5, -5], [10, 10, 10], [192, 104], 0, 0, 0, 0.0, seg_scale])
+	parts.append(["head", [0, 20, -62], [-8, -8, -10], [16, 16, 16], [112, 30], 0, 0, 0, 0.0,
+		[["upperlip", [-6, -1, -24], [12, 5, 16], [176, 44], 0.0], ["scale_l", [-5, -12, -4], [2, 4, 6], [0, 0], 0.0, true],
+		["nostril_l", [-5, -3, -22], [2, 2, 4], [112, 0], 0.0, true], ["scale_r", [3, -12, -4], [2, 4, 6], [0, 0], 0.0],
+		["nostril_r", [3, -3, -22], [2, 2, 4], [112, 0], 0.0]]])
+	parts.append(["jaw", [0, 4, -8], [-6, 0, -16], [12, 4, 16], [176, 65], 0])
+	parts.append(["left_wing", [12, -11, 2], [0, -4, -4], [56, 8, 8], [112, 88], 0, 0, 0, 0.0, [["skin", [0, 0, 2], [56, 0, 56], [-56, 88], 0.0, true]], true])
+	parts.append(["left_wing_tip", [56, 0, 0], [0, -2, -2], [56, 4, 4], [112, 136], 0, 0, 0, 0.0, [["skin", [0, 0, 2], [56, 0, 56], [-56, 144], 0.0, true]], true])
+	parts.append(["right_wing", [-12, -11, 2], [-56, -4, -4], [56, 8, 8], [112, 88], 0, 0, 0, 0.0, [["skin", [-56, 0, 2], [56, 0, 56], [-56, 88], 0.0]]])
+	parts.append(["right_wing_tip", [-56, 0, 0], [-56, -2, -2], [56, 4, 4], [112, 136], 0, 0, 0, 0.0, [["skin", [-56, 0, 2], [56, 0, 56], [-56, 144], 0.0]]])
+	for sd in [["left", 1], ["right", -1]]:
+		var n: String = sd[0]
+		var sx: int = sd[1]
+		parts.append([n + "_front_leg", [12 * sx, 4, 2], [-4, -4, -4], [8, 24, 8], [112, 104], 0])
+		parts.append([n + "_front_leg_tip", [0, 20, -1], [-3, -1, -3], [6, 24, 6], [226, 138], 0])
+		parts.append([n + "_front_foot", [0, 23, 0], [-4, 0, -12], [8, 4, 16], [144, 104], 0])
+		parts.append([n + "_hind_leg", [16 * sx, 0, 42], [-8, -4, -8], [16, 32, 16], [0, 0], 0])
+		parts.append([n + "_hind_leg_tip", [0, 32, -4], [-6, -2, 0], [12, 32, 12], [196, 0], 0])
+		parts.append([n + "_hind_foot", [0, 31, 4], [-9, 0, -20], [18, 6, 24], [112, 0], 0])
+	return parts
+
+
+## Java EndCrystalModel: base plate, outer glass, inner glass, cube (the parts are placed per frame by
+## EntityManager._crystal_pose: the model is not flipped and is drawn at scale 2).
+const CRYSTAL := [["base", [0, 0, 0], [-6, 0, -6], [12, 4, 12], [0, 16], 0], ["outer_glass", [0, 0, 0], [-4, -4, -4], [8, 8, 8], [0, 0], 0],
+	["inner_glass", [0, 0, 0], [-4, -4, -4], [8, 8, 8], [0, 0], 0], ["crystal_cube", [0, 0, 0], [-4, -4, -4], [8, 8, 8], [32, 0], 0]]
 
 
 ## Texture coverage of a mob's rig (Java box UV): [percent of opaque texels no box uses, low-opacity boxes]. Used by the

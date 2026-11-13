@@ -55,7 +55,7 @@ Controls are the Java Edition defaults and can be rebound in Options → Control
 ## Building
 
 - **Release builds**: use the `Windows ARM64` and `Windows x86_64` export presets, for example
-  `godot --headless --path . --export-release "Windows ARM64" builds/windows-arm64/Recraft2.exe`.
+  `godot --headless --path . --export-release "Windows ARM64" builds/windows-arm64/minecraftgd.exe`.
 - **Native library**: prebuilt DLLs for both architectures are in `native/bin/`. To rebuild them (MSVC required):
   `powershell -ExecutionPolicy Bypass -File tools/build_native.ps1 -Arch arm64|x86_64|all`.
 - **Checks and tests**: `powershell -ExecutionPolicy Bypass -File tools/check.ps1` compiles every script;

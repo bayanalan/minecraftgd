@@ -38,41 +38,88 @@ Assets: local MC 26.3 jar (read through the indexed JarAssetReader; private cach
 ## OPEN BUGS - remaining (fixed bugs and completed work: fixed.md)
 Screenshots: c:\Users\Gerbilicious_Dude\Pictures\Screenshots\Screenshot 2026-11-12 <time>.png
 Worldgen:
-- [~] Poplar trees not vanilla-shaped [174713]: the 26.3 poplar_trunk_placer / poplar_foliage_placer code is not public;
-      now a spindle (rhombus) crown with diamond layers and the branches inside it. APPROXIMATE: needs a vanilla reference
 - [~] Grass looks denser than vanilla: placement matches the 26.3 data (noise_threshold_count 5 / 10 x 32 tries, trapezoid
       offsets, air filter, survival check); the dense look was likely mipmapped cutout plants (vanilla mips now). Recheck in game
-- [ ] Cave water pools generate cut off [180044]
-- [ ] Ice spikes cut off naturally [180259] (reproduced: seed 12345 near 704, -768, a tall spike with missing layers)
-- [ ] Ruined nether portals generate inside terrain [180647]
-- [ ] Crimson roots floating; water generating in the Nether [181222] [181333]
-- [ ] Check: 8 overworld blocks = 1 Nether block
-- [ ] Village house placement wonky (earlier)
+- [~] Village house placement wonky (earlier): seed 12345 plains village (-144, -832) rendered - houses on beard terraces,
+      planks streets over water, farms at water level; matches Java's behaviour as far as visible. Needs the case you saw
+- [~] Hand-coded structures: swamp hut, jungle temple and desert pyramid now run Java's StructurePiece code (new JavaPieces: orientation transforms + state mirror / rotation, generateBox / selectors, fillColumnDown, reoriented
+      chests, trap dispensers, witch + cat), mineshafts run MineshaftPieces (room with dirt floor + entrances + dome,
+      corridors with supports / torches / cobwebs / rails / chests / cave-spider spawners and log pillars or chains,
+      crossings, stairs, recursive layout, moveBelowSeaLevel / mesa lift, liquid and deep-dark checks);
+      SinglePieceStructure sea-level corner check (also in /locate); /place
+      structure. Nether fortress now runs NetherFortressPieces (all 14 piece types, weighted picks with limits,
+      112-block reach, depth 30, moveInsideHeights 48..70, blaze spawner thrones, wart rooms, chests); structure
+      fences / bars get their connections after generation (Java SHAPE_CHECK_BLOCKS post-processing, also mineshafts);
+      natural spawning uses structure spawn_overrides (fortress enemies incl. wither skeletons, witches / cats in huts,
+      guardians, pillagers, nothing in trial chambers / ancient cities). Desert pyramid 1.20 cellar + suspicious sand
+      not reproduced. Stronghold now runs StrongholdPieces (11 weighted pieces + filler corridors, small doors -
+      openings / oak / iron with buttons / grates, forced five-way crossing, library min depth 4 / portal room 5,
+      retries until a portal room exists, moveBelowSeaLevel, bury terrain adaptation, libraries with chandeliers,
+      prison cells, chests, the silverfish spawner and 10 % eyes per frame). Neighbour chunks' features (ore blobs)
+      no longer overwrite structure blocks: a chunk's own writes are applied last at decoration. Ocean monument now
+      runs OceanMonumentPieces (building shell, wings, entrance, roof, pillars to the sea floor, the 5 x 5 x 3 room
+      graph with Java's pruning, 7 room fitters, sponge rooms, gold core, 3 elder guardians, the 29-block ocean
+      surroundings check via native getBiomesWithin). Woodland mansion now generated (see fixed.md)
 Rendering:
-- [ ] Gap glitch at the edge of ice [175817]; chunk-border ice glitch seen from under water [175857]
-- [ ] Water flow not identical to vanilla [180119]; placed water lower resolution [181222]; flow updates only every ~10 s
-- [~] Rain costs ~75% FPS [180829]: weather shader made cheaper (per-column light / fog, early discard; the column count
-      is already Java's 21 x 21). Measure in game
 End:
-- [ ] End crystals too small [181845]; sometimes no fire / off [181912]; no healing beam to the dragon
-- [ ] Dragon tail always straight; AI stiff (no curving / waving, drifts), stays away from the main island
 Performance:
-- [ ] FPS goals: 500 x86_64 (emulated), 800 ARM64 native; ARM build has lower average than expected (fewer stutters)
-- [ ] Nether / End chunk generation very slow (seconds per chunk)
-- [ ] Keep the other dimension partially loaded when travelling between dimensions
-- [ ] Loot generation, chunk loading, locating feel slow
+- [~] FPS goals: 500 x86_64 (emulated), 800 ARM64 native with 1 % lows 300-350 (ARM) / 100-150 (x64); stutters gone.
+      2026-11-13 (late): the flight stutter is chunk streaming, not rendering: flying in a circle over loaded terrain
+      (--fcircle=40) gives 1 % low 142-162 vs 76-96 straight. Cause: the chunk workers ran on the second Prime cluster
+      and dragged the main thread's cluster clock down (main thread running but 10-20x slower). Workers now use the 6
+      Performance cores (lower efficiency class; the second Prime cluster only while loading / the initial fill / when
+      falling 3+ rings behind): same 65 chunks / s in flight, flight avg 240 -> 390-430, 1 % low 70 -> 133-166, 0.1 %
+      low 42 -> 81-95, max 38 -> 14-17 ms, slowed main-thread frames 195 -> 8; static views avg 465 / 1 % low 198 /
+      0.1 % 121. Remaining: after ~25 s of uncapped load the laptop throttles (slowed frames cluster late in long
+      runs, thermal / power state), GPU p99 ~5.6 ms at 2880x1800
+      Once-a-second 3-9 ms hitch (every scene, also a bare Godot project and a plain Windows Forms window): the
+      ASUS ATKHotkey service broadcasts "ACPI Notification through ATKHotkey from BIOS" (registered message) to every
+      top-level window once a second; the game thread waits inside Windows' PeekMessage meanwhile (main-thread stack
+      sampler: --emptybench --stallprobe / --msgprobe; arrival times match the slow frames exactly). Not game code:
+      turning the ASUS hotkey service off removes it
+      2026-11-13: native per-job scratch (density evaluator caches ~2 MB, density array, decorate / light / mesh
+      buffers) now reused per thread instead of allocated, paged in and freed for every chunk: flight bench worst
+      frame 35.0 -> 18.3 ms, 0.1 % low 63 -> 76, 1 % low 125 -> 130, mesh job 1.1 -> 0.7 ms. Per-chunk generation
+      time still rises with more workers (12 -> 18 ms at 8 workers): all-core clock limit, not allocation
+      Remaining spikes: the main thread's fixed GDScript probe loop runs 10-17x slower (descheduled / throttled core);
+      the process now opts out of Windows power throttling (EcoQoS) at world start (--ecoqos keeps it for A/B)
+      Root cause of the remaining slow frames (2026-11-13, per-frame GPU time + main-thread cycle counter): in static views
+      (nothing streaming) CPU and GPU slow down together in bursts (main thread ~10x slower while running, GPU 2 -> 4-5
+      ms): the SoC power limit when running uncapped. Static 1 % low ~85-100 uncapped vs 137-160 at a 240 cap (main
+      thread pinned; unpinned 82-112). GPU per frame: p50 2.0, p95 4.6, p99 5.5 ms; Forward+ fixed passes at 5.2 MP
+      leave no room for 800 avg without a lower render scale / another renderer (both excluded). Fewer chunk workers
+      (--adapt: 2 when the near rings are complete) gave +20-30 % avg FPS but no better 1 % lows: opt-in only
+      Flight bench F (ARM64 release, 2880x1800, RD16): start of this round avg 282 / 1 % 80 / 0.1 % 53 / max 24-65 ms;
+      now avg 284-314 / 1 % 90-113 / 0.1 % 61-63 / max 17 ms. Done: TerrainRD vertex pages preallocated at load (new
+      64 MB pages mid-flight stalled the GPU 8-22 ms), full fast-core pinning (main + workers, default), advancement
+      criteria indexed by trigger (2 ms), wanted-chunk order sorted natively (12 ms), sky material params skipped when
+      SkyRD draws, SkyState split by dependency, unchanged shader globals not re-uploaded, snow / ice random ticks fast
+      path, leaf particle emission fast path, native leaf-filter buffers reused. Remaining slow frames are GPU time
+      (draw 4-5.5 ms vs 2.7 avg): Godot's fixed Forward+ passes cost ~2.2 ms at 2880x1800 (see fixed.md, round 3)
+- [~] Chunk generation "instant": RD16 fully visible 14.5 s -> 8.9 s (spawn 1.3 s, ring 8 3.9 s); per chunk gen
+      25.5 -> 10.7 ms (density: per-node cell corner cache, cell-order fill, provably-air cells skipped, whole-cell
+      batch evaluation of the final density - all bit-exact, --nativecheck 0 diffs), features 15 -> 6 ms (region
+      metadata native). Next: surface rules (4-7 ms / chunk, per stone block), dispatch utilisation (63 %), beard
+      chunks (per-block beard_at), more workers only while loading (8 workers: ring 16 7.3 s but -10 % FPS in flight)
+      2026-11-13: ring 16 now 12.5-13.3 s on this machine after hours of continuous load (gen 12 ms, features 9-12 ms,
+      utilisation 58-60 %). A/B tests rule out the new mineshafts, ruined portals, update priorities and translucent
+      face merging (all within noise); 8 / 10 workers give 11.3 / 11.6 s with gen 16 / 23 ms per chunk (contention).
+      Sculk patches moved native (the GDScript placement loop cost 2.2 s per run); mineshaft placement 2.8 -> 1.5 s
+      2026-11-13 (late): jigsaw assembly without per-jigsaw dictionary copies, name-filtered attach candidates and
+      replayed random calls for repeat candidates that already failed (trial chambers 420 -> 40-60 ms per start, 20
+      starts identical piece for piece); template state rotation / mirror cached; decorate's liquid-origin map is a
+      flat per-thread array instead of a hash map (decorate 2.9 -> 1.5 ms / chunk)
+- [~] Loot generation, chunk loading, locating feel slow: /locate measured 1-233 ms for 14 structure types (seed 12345;
+      stronghold / buried treasure slowest), now with Java's generation-point checks (temples, end cities) so it never
+      points at a spot where nothing generates; chunk loading: see the chunk generation entry above
 Gameplay / UI:
-- [ ] Waterlogging for every waterloggable block
-- [ ] Advancement toast text colours (challenge / goal); advancements screen like vanilla
-- [ ] Elytra + firework: boost feel, firework rocket rendered as a camera-facing sprite, vanilla particles, trail from
-      the held item in first person
 - [~] Mob animation smooth + modern AI (interpolation, look / body rotation controls, A* pathfinding, arm poses):
       verify in game; probe timing split (15 ms worst step)
 Build:
-- [ ] native/bin/recraft_native.x86_64.dll is stale (locked by the running x64 Godot): rebuild with tools/build_native.ps1 -Arch x86_64 once it is closed. builds/windows-x86_64 already has the fresh DLL (built with -OutDir)
-Earlier, still open: vanilla template structures (shipwreck, ocean ruins, ruined portal, igloo, fossils, end city),
-hand-coded structures (desert pyramid, jungle temple, swamp hut, stronghold, fortress, monument, mansion), map zoom /
-cartography, banners, offhand, recipe book search; parched arm / leg wraps; nautilus exact model.
+- [ ] Copper Age content: copper golems exist as mobs but do not sort items (copper chest -> chests), no copper golem
+      statue; shelves have no slot interaction / hotbar swapping. Exact 26.3 mechanics need a reference (not guessed)
+Earlier, still open (re-checked 2026-11-13): parched arm / leg
+wraps; nautilus exact model. (Recipe book search, loom banners and offhand use exist - see fixed.md.)
 
 ## Key performance findings (see DECISIONS.md)
 - GDScript function calls, member access on other objects, String-keyed Dictionary lookups and object creation contend across threads (8 threads: 8–25x slower per op). Local math, packed arrays, builtins, int-key dicts scale. => hot loops hoist members to locals and inline helpers; hot worker loops moved to native (see Performance overhaul); workers = clamp(cpu/3, 2, 5) (`ChunkManager.max_jobs`).

@@ -57,6 +57,10 @@ func tick() -> void:
 	if not ready:
 		_try_init()
 		return
+	if respawn_stage >= 0:
+		_respawn_tick()
+		respawn_time += 1
+		return
 	if not bool(state["killed"]) and _find("ender_dragon") == null and world.entities.ents.size() < 2000:
 		_spawn_dragon()
 
@@ -323,6 +327,21 @@ static func tick_dragon(em: EntityManager, e: EntityManager.Ent, p: Player, gs: 
 	var pod := fight.podium() if fight != null else Vector3(0.5, 64, 0.5)
 	var crystals := fight.crystals_alive() if fight != null else 0
 	var yr: float = e.rt.get("yr", fposmod(e.yaw + 180.0, 360.0))
+	# Java DragonFlightHistory.record(y, yRot) every tick (64 samples; the renderer curves the neck / tail from it)
+	var hist: PackedFloat32Array = e.rt.get("hist", PackedFloat32Array())
+	var hi: int = int(e.rt.get("hist_i", -1))
+	if hist.size() != 128:
+		hist.resize(128)
+		for k in 64:
+			hist[k * 2] = wrapf(yr, -180.0, 180.0)
+			hist[k * 2 + 1] = e.pos.y
+		hi = 0
+	hi = (hi + 1) & 63
+	hist[hi * 2] = wrapf(yr, -180.0, 180.0)
+	hist[hi * 2 + 1] = e.pos.y
+	e.rt["hist"] = hist
+	e.rt["hist_i"] = hi
+	e.rt["egg_d"] = e.pos.distance_to(pod)
 	var t: int = int(e.rt.get("t", 0)) + 1
 	e.rt["t"] = t
 	var fly_speed := 0.6
@@ -505,12 +524,34 @@ static func tick_dragon(em: EntityManager, e: EntityManager.Ent, p: Player, gs: 
 			p.vel += Vector3(kb.x / kd * 4.0, 0.2, kb.z / kd * 4.0)
 			p.hurt(5.0, "mob")
 			e.attack_cd = 10
-	# crystal healing (1 HP every 10 ticks from a crystal within 32 blocks)
-	if e.age % 10 == 0 and e.hp < float(e.def["hp"]):
+	_check_crystals(em, e)
+
+
+## Java EnderDragon.checkCrystals: heal 1 every 10 ticks from the tracked crystal (the healing beam is drawn to it);
+## 1 tick in 10 the nearest crystal within the dragon's box grown by 32 becomes the tracked one (or none).
+static func _check_crystals(em: EntityManager, e: EntityManager.Ent) -> void:
+	var nc = e.rt.get("crystal")
+	if nc != null:
+		if not (nc is EntityManager.Ent) or (nc as EntityManager.Ent).dead or not em.ents.has(nc):
+			e.rt.erase("crystal")
+		elif e.age % 10 == 0 and e.hp < float(e.def["hp"]):
+			e.hp = minf(e.hp + 1.0, float(e.def["hp"]))
+	if em.rng.randi_range(0, 9) == 0:
+		var best = null
+		var bd := INF
+		var hw := 8.0 + 32.0   # Java dragon box 16 x 8, inflated by 32
 		for o in em.ents:
-			if o.kind == "mob" and o.id == "end_crystal" and o.pos.distance_to(e.pos) < 32.0:
-				e.hp = minf(e.hp + 1.0, float(e.def["hp"]))
-				break
+			if o.kind == "mob" and o.id == "end_crystal" and not o.dead:
+				var d: Vector3 = o.pos - e.pos
+				if absf(d.x) <= hw and absf(d.z) <= hw and d.y >= -32.0 - 2.0 and d.y <= 8.0 + 32.0:
+					var ds := d.length_squared()
+					if ds < bd:
+						bd = ds
+						best = o
+		if best == null:
+			e.rt.erase("crystal")
+		else:
+			e.rt["crystal"] = best
 
 
 ## Java EnderDragon.aiStep flap time: 0.2 / (horizontal speed * 10 + 1) * 2^vy per tick (0.1 perched).
@@ -526,3 +567,162 @@ static func _flap(e: EntityManager.Ent, sitting: bool) -> void:
 static func start_dying(e: EntityManager.Ent) -> void:
 	_set_phase(e, Ph.DYING)
 	e.hp = 1.0
+
+# ------------------------------------------------------------------ dragon respawn (Java EndDragonFight.tryRespawn,
+# DragonRespawnAnimation): 4 crystals on the exit portal's sides -> crystals beam up, the pillars are blown up and
+# rebuilt one by one (with invulnerable crystals beaming at the centre), the crystals explode, a new dragon spawns.
+enum Rs { START, PREPARING, PILLARS, SUMMONING, END }
+var respawn_stage := -1
+var respawn_time := 0
+var respawn_crystals: Array = []
+
+
+func try_respawn() -> void:
+	if not bool(state["killed"]) or respawn_stage >= 0:
+		return
+	var py := int(state.get("podium_y", -1))
+	if py < 0:
+		return
+	var found: Array = []
+	for d in [Vector3i(0, 0, -2), Vector3i(2, 0, 0), Vector3i(0, 0, 2), Vector3i(-2, 0, 0)]:
+		var bmin := Vector3(d.x, py + 1, d.z)
+		var lst: Array = []
+		for e in world.entities.ents:
+			if e.kind == "mob" and e.id == "end_crystal" and not e.dead:
+				if e.pos.x + 1.0 > bmin.x and e.pos.x - 1.0 < bmin.x + 1.0 and e.pos.z + 1.0 > bmin.z and e.pos.z - 1.0 < bmin.z + 1.0 and e.pos.y + 2.0 > bmin.y and e.pos.y < bmin.y + 1.0:
+					lst.append(e)
+		if lst.is_empty():
+			return
+		found.append_array(lst)
+	# respawnDragon: the exit portal goes back to an inactive one
+	FeaturesExt.end_podium(writer(), null, Vector3i(0, py, 0), false)
+	respawn_stage = Rs.START
+	respawn_time = 0
+	respawn_crystals = found
+
+
+func _set_stage(st: int) -> void:
+	respawn_time = -1   # incremented after this tick
+	if st == Rs.END:
+		respawn_stage = -1
+		respawn_crystals = []
+		state["killed"] = false
+		_spawn_dragon()
+	else:
+		respawn_stage = st
+
+
+func _beam_all(target) -> void:
+	for c in respawn_crystals:
+		if target == null:
+			c.data.erase("BeamTarget")
+		else:
+			c.data["BeamTarget"] = target
+
+
+func _roar() -> void:
+	Audio.play("entity.ender_dragon.growl", world.player.pos, "Hostile", 1.0, 0.8 + world.rng.randf() * 0.3)
+
+
+func _respawn_tick() -> void:
+	var t := respawn_time
+	var centre := Vector3i(0, 128, 0)
+	match respawn_stage:
+		Rs.START:
+			_beam_all(centre)
+			_set_stage(Rs.PREPARING)
+		Rs.PREPARING:
+			if t < 100:
+				if t == 0 or t == 50 or t == 51 or t == 52 or t >= 95:
+					_roar()
+			else:
+				_set_stage(Rs.PILLARS)
+		Rs.PILLARS:
+			var start := t % 40 == 0
+			var done := t % 40 == 39
+			if start or done:
+				var spikes := FeaturesExt.end_spikes_for_seed(int(world.level.get("seed", 0)))
+				var j := t / 40
+				if j < spikes.size():
+					var sp: Array = spikes[j]
+					if start:
+						_beam_all(Vector3i(int(sp[0]), int(sp[3]) + 1, int(sp[1])))
+					else:
+						_rebuild_spike(sp)
+				elif start:
+					_set_stage(Rs.SUMMONING)
+		Rs.SUMMONING:
+			if t >= 100:
+				_reset_spike_crystals()
+				for c in respawn_crystals:
+					c.data.erase("BeamTarget")
+					if not c.dead:
+						world.entities.explode(c.pos, 6.0, false)
+						world.entities._remove(c)
+				_set_stage(Rs.END)
+			elif t >= 80:
+				_roar()
+			elif t == 0:
+				_beam_all(centre)
+			elif t < 5:
+				_roar()
+
+
+## The respawn step for one pillar: clear a 21^3 box around its top, a power 5 explosion, then SpikeFeature again
+## with an invulnerable crystal beaming at (0, 128, 0).
+func _rebuild_spike(sp: Array) -> void:
+	var cx: int = sp[0]
+	var cz: int = sp[1]
+	var h: int = sp[3]
+	for y in range(h - 10, h + 11):
+		for z in range(cz - 10, cz + 11):
+			for x in range(cx - 10, cx + 11):
+				if world.state_at(x, y, z) > 0:
+					world.set_block(x, y, z, 0)
+	world.entities.explode(Vector3(cx + 0.5, h, cz + 0.5), 5.0, true)
+	var lw := writer()
+	var shim := SpikeShim.new()
+	shim.lw = lw
+	FeaturesExt.place_spike(shim, null, sp)
+	for e in world.entities.ents:
+		if e.kind == "mob" and e.id == "end_crystal" and not e.dead and absf(e.pos.x - (cx + 0.5)) < 1.0 and absf(e.pos.z - (cz + 0.5)) < 1.0 and absf(e.pos.y - (h + 1)) < 2.0:
+			world.entities._remove(e)
+	var ce = world.entities.spawn_mob("end_crystal", Vector3(cx + 0.5, h + 1, cz + 0.5))
+	if ce != null:
+		ce.persistent = true
+		ce.data["Invulnerable"] = true
+		ce.data["BeamTarget"] = Vector3i(0, 128, 0)
+
+
+## resetSpikeCrystals: the spike crystals become vulnerable and stop beaming.
+func _reset_spike_crystals() -> void:
+	for e in world.entities.ents:
+		if e.kind == "mob" and e.id == "end_crystal" and not respawn_crystals.has(e):
+			e.data.erase("Invulnerable")
+			e.data.erase("BeamTarget")
+
+
+## EndDragonFight.onCrystalDestroyed: destroying one of the respawn crystals aborts the sequence (spike crystals reset,
+## the exit portal back to active).
+func on_crystal_destroyed(c) -> void:
+	if respawn_stage >= 0 and respawn_crystals.has(c):
+		respawn_stage = -1
+		respawn_time = 0
+		_reset_spike_crystals()
+		for o in respawn_crystals:
+			o.data.erase("BeamTarget")
+		respawn_crystals = []
+		FeaturesExt.end_podium(writer(), null, Vector3i(0, int(state.get("podium_y", 64)), 0), true)
+
+
+## Lets FeaturesExt.place_spike (worldgen signature: f.blocks, f.gen.gen_min_y, f.set_block) write live blocks.
+class SpikeShim:
+	var lw: LiveWriter
+	var blocks: BlockRegistry:
+		get:
+			return Res.blocks
+	var gen: Dictionary = {"gen_min_y": 0}
+
+	func set_block(_c, p: Vector3i, st: int, _mode: int = 0) -> void:
+		if lw.world.state_at(p.x, p.y, p.z) != st:
+			lw.world.set_block(p.x, p.y, p.z, st)

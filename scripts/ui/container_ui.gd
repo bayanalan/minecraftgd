@@ -19,6 +19,7 @@ var _has_player_inv := false
 var _last_click := 0
 var _last_slot := -1
 var extra_draw: Callable
+var slot_toggle: Callable   # called with the slot index for a plain click on an empty "toggle" slot (crafter)
 # recipe book (RecipeBook): grid size, grid accessors (i) -> ItemStack / (i, ItemStack), toggle button position
 var rb_gw := 0
 var rb_gh := 0
@@ -583,6 +584,9 @@ func _gui_input(event: InputEvent) -> void:
 				_drag = true
 				_drag_btn = btn
 				_drag_slots = []
+		elif cur0.is_empty() and not shift and slot_toggle.is_valid() and bool(slots[hover].get("toggle", false)) and (slots[hover]["get"].call() as ItemStack).is_empty():
+			slot_toggle.call(hover)
+			_skip_release = true
 		elif cur0.is_empty():
 			if shift and btn == MOUSE_BUTTON_LEFT:
 				quick_move(hover)

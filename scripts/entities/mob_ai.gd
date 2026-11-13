@@ -65,6 +65,11 @@ static func tick_special(em: EntityManager, e: EntityManager.Ent, p: Player, gs:
 		return
 	if def.get("crystal", false):
 		e.vel = Vector3.ZERO
+		# Java EndCrystal.tick: with a dragon fight (the End) the crystal keeps a fire burning in its block
+		if em.world.dimension == "the_end" and em.world.get("dragon_fight") != null:
+			var bp := Vector3i(e.pos.floor())
+			if em.world.state_at(bp.x, bp.y, bp.z) == 0:
+				em.world.set_block(bp.x, bp.y, bp.z, BlockUpdates.fire_state(em.world, bp))
 		return
 	if def.get("swims", false):
 		_swimmer(em, e, p, gs, blocks, dist, fl)

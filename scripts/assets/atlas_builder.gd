@@ -80,13 +80,22 @@ func layer_for(name: String) -> int:
 			frames.append(img.get_region(Rect2i(0, i * w, w, w)))
 	else:
 		frames.append(img)
+	# animated textures keep their frames at native resolution (water_flow / lava_flow are 32 px: Java shows a 16 px
+	# window of them per block; downscaled to 16 px, flowing water had half the texel density of everything else)
+	var native_px: int = (frames[0] as Image).get_width() if frames.size() > 1 and (frames[0] as Image).get_width() > TILE else TILE
 	for i in frames.size():
 		var f: Image = frames[i]
-		if f.get_width() != TILE:
-			f.resize(TILE, TILE, Image.INTERPOLATE_NEAREST)
-	var l := _add(name, frames[0])
+		if f.get_width() != native_px:
+			f.resize(native_px, native_px, Image.INTERPOLATE_NEAREST)
+	var base: Image = frames[0]
+	if native_px != TILE:
+		base = (frames[0] as Image).duplicate()
+		base.resize(TILE, TILE, Image.INTERPOLATE_NEAREST)
+	var l := _add(name, base)
 	if hi != null and frames.size() == 1:
 		hires[l] = hi
+	elif native_px != TILE:
+		hires[l] = frames[0]
 	if frames.size() > 1:
 		var meta = mcmeta_source.call(name)
 		var a: Dictionary = meta.get("animation", {}) if meta is Dictionary and meta.get("animation") is Dictionary else {}
@@ -226,8 +235,8 @@ func tick(game_ticks: int) -> void:
 			if a["interp"]:
 				var nxt: Image = frames[clampi(int(seq[(idx + 1) % seq.size()]), 0, frames.size() - 1)]
 				out = cur.duplicate()
-				for y in TILE:
-					for x in TILE:
+				for y in cur.get_height():
+					for x in cur.get_width():
 						out.set_pixel(x, y, cur.get_pixel(x, y).lerp(nxt.get_pixel(x, y), frac))
 			up = out.duplicate()
 			if up.get_width() != layer_px:

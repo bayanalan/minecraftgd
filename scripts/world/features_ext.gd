@@ -581,12 +581,12 @@ static func _end_spikes(f: Features, c: Features.FCtx, o: Vector3i) -> bool:
 	return any
 
 
-static func place_spike(f: Features, c: Features.FCtx, sp: Array) -> void:
+static func place_spike(f, c, sp: Array) -> void:   # f: Features or DragonFight.SpikeShim (live)
 	var cx: int = sp[0]
 	var cz: int = sp[1]
 	var rad: int = sp[2]
 	var hgt: int = sp[3]
-	var obs := f.blocks.default_state("obsidian")
+	var obs: int = f.blocks.default_state("obsidian")
 	for y in range(f.gen.gen_min_y, hgt + 11):
 		for z in range(cz - rad, cz + rad + 1):
 			for x in range(cx - rad, cx + rad + 1):
@@ -597,7 +597,7 @@ static func place_spike(f: Features, c: Features.FCtx, sp: Array) -> void:
 				elif y > 65:
 					f.set_block(c, Vector3i(x, y, z), 0)
 	if sp[4]:
-		var bars := f.blocks.default_state("iron_bars")
+		var bars: int = f.blocks.default_state("iron_bars")
 		for k in range(-2, 3):
 			for l in range(-2, 3):
 				for m in range(0, 4):
@@ -607,7 +607,7 @@ static func place_spike(f: Features, c: Features.FCtx, sp: Array) -> void:
 					if b1 or b2 or b3:
 						var b4 := k == -2 or k == 2 or b3
 						var b5 := l == -2 or l == 2 or b3
-						var st := f.blocks.with_prop(bars, "north", str(b4 and l != -2))
+						var st: int = f.blocks.with_prop(bars, "north", str(b4 and l != -2))
 						st = f.blocks.with_prop(st, "south", str(b4 and l != 2))
 						st = f.blocks.with_prop(st, "west", str(b5 and k != -2))
 						st = f.blocks.with_prop(st, "east", str(b5 and k != 2))
@@ -717,16 +717,18 @@ static func end_podium(f, c, o: Vector3i, active: bool) -> void:
 		for z in range(-4, 5):
 			for x in range(-4, 5):
 				var p := o + Vector3i(x, y, z)
-				var dist := sqrt(float(x * x + z * z))
-				if dist <= 3.5:
+				# Vec3i.closerThan: 3D squared distance (above the rim only a 3.5 sphere is cleared: the egg stays)
+				var d2 := x * x + y * y + z * z
+				if d2 < 12.25:
+					var inner := d2 < 6.25
 					if y < 0:
-						if dist <= 2.5:
+						if inner:
 							f.set_block(c, p, bed)
-						elif y < 0:
+						else:
 							f.set_block(c, p, es)
 					elif y > 0:
 						f.set_block(c, p, 0)
-					elif dist > 2.5:
+					elif not inner:
 						f.set_block(c, p, bed)
 					elif active:
 						f.set_block(c, p, portal)
@@ -920,9 +922,12 @@ static func _spike(f: Features, c: Features.FCtx, cf: Dictionary, o: Vector3i) -
 			for n in range(-l, l + 1):
 				var h := float(absi(n)) - 0.25
 				if (m == 0 and n == 0 or g * g + h * h <= fr * fr) and (m != -l and m != l and n != -l and n != l or r.next_float() <= 0.75):
-					for yy in [k, -k]:
-						if yy == -k and (k == 0 or l <= 1):
+					for half in 2:
+						# the layer itself, then its mirror below (Java: only when k != 0 and l > 1). Iterating [k, -k] by
+						# value skipped the k = 0 layer too (0 == -0): every ice spike had a missing slice at its base
+						if half == 1 and (k == 0 or l <= 1):
 							continue
+						var yy := k if half == 0 else -k
 						var q := p + Vector3i(m, yy, n)
 						if f.test(c, cf["can_replace"], q) or _air(f, c, q):
 							f.set_block(c, q, st)

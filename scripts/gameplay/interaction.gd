@@ -195,7 +195,9 @@ static func placement_state(base: int, hit: Dictionary, p: Player) -> int:
 		elif name.ends_with("_trapdoor"):
 			st = blocks.with_prop(st, "facing", opposite(look) if n.y != 0 else face)
 		elif name == "piston" or name == "sticky_piston" or name == "dispenser" or name == "dropper" or name == "observer":
-			var pitch_dir := "down" if p.pitch > 45 else ("up" if p.pitch < -45 else opposite(look))
+			# Java getNearestLookingDirection().getOpposite(): looking down (pitch > 45) faces up, towards the player;
+			# observers take the looking direction itself (their face looks away)
+			var pitch_dir := "up" if p.pitch > 45 else ("down" if p.pitch < -45 else opposite(look))
 			if name == "observer":
 				pitch_dir = opposite(pitch_dir) if pitch_dir in ["up", "down"] else look
 			st = blocks.with_prop(st, "facing", pitch_dir)
@@ -205,6 +207,16 @@ static func placement_state(base: int, hit: Dictionary, p: Player) -> int:
 			st = blocks.with_prop(st, "facing", face)
 		else:
 			st = blocks.with_prop(st, "facing", opposite(look))
+	if name == "crafter":
+		# Java CrafterBlock.getStateForPlacement: front = nearest looking direction reversed; top = up, or for a vertical
+		# front the horizontal facing (front up) / its opposite (front down); triggered when placed powered
+		var front := "up" if p.pitch > 45 else ("down" if p.pitch < -45 else opposite(look))
+		var topd := "up"
+		if front == "down":
+			topd = opposite(look)
+		elif front == "up":
+			topd = look
+		st = blocks.with_prop(st, "orientation", front + "_" + topd)
 	if blocks.has_prop(st, "half"):
 		var top: bool = (n.y < 0) or (n.y == 0 and fy > 0.5)
 		var hv := blocks.get_prop(st, "half")
@@ -256,6 +268,10 @@ static func use_item_on(world, held: ItemStack, hit: Dictionary) -> bool:
 			world.player.inventory.consume_held()
 		world.inv_changed()
 		return true
+	if held.name() == "filled_map" and Res.blocks.name_of(int(hit["state"])).ends_with("_banner"):
+		# Java MapItem.useOn a banner: toggle its map marker
+		Maps.toggle_banner(world, held, hit["pos"])
+		return true
 	var blocks := Res.blocks
 	var p: Player = world.player
 	var pos: Vector3i = hit["pos"]
@@ -301,7 +317,7 @@ static func use_item_on(world, held: ItemStack, hit: Dictionary) -> bool:
 		if world.state_at(fp.x, fp.y, fp.z) == 0:
 			# fire inside an obsidian frame opens a nether portal (Java BaseFireBlock.onPlace -> PortalShape)
 			if not Portals.try_light(world, fp):
-				world.set_block(fp.x, fp.y, fp.z, blocks.default_state("fire"))
+				world.set_block(fp.x, fp.y, fp.z, BlockUpdates.fire_state(world, fp))
 			Audio.play("item.flintandsteel.use" if iname == "flint_and_steel" else "item.firecharge.use", Vector3(fp), "Blocks")
 			if iname == "flint_and_steel":
 				damage_tool(p, 1)
@@ -340,6 +356,28 @@ static func use_item_on(world, held: ItemStack, hit: Dictionary) -> bool:
 				Audio.play("item.bucket.fill", Vector3(fp3), "Players")
 				return true
 		return false
+	if iname == "end_crystal":
+		# Java EndCrystalItem.useOn: on obsidian / bedrock with an empty block above and no entity in the 1 x 2 x 1 box
+		# there; no base plate; in the End it may start the dragon respawn
+		if tname != "obsidian" and tname != "bedrock":
+			return false
+		var ab := pos + Vector3i(0, 1, 0)
+		if world.state_at(ab.x, ab.y, ab.z) != 0:
+			return false
+		for oe in world.entities.ents:
+			if oe.dead:
+				continue
+			if oe.pos.x + oe.w / 2.0 > ab.x and oe.pos.x - oe.w / 2.0 < ab.x + 1 and oe.pos.z + oe.w / 2.0 > ab.z and oe.pos.z - oe.w / 2.0 < ab.z + 1 and oe.pos.y + oe.h > ab.y and oe.pos.y < ab.y + 2:
+				return false
+		var ce = world.entities.spawn_mob("end_crystal", Vector3(ab) + Vector3(0.5, 0, 0.5))
+		if ce != null:
+			ce.data["ShowBottom"] = false
+			ce.persistent = true
+		if not p.is_creative():
+			p.inventory.consume_held()
+		if world.dimension == "the_end" and world.dragon_fight != null:
+			world.dragon_fight.try_respawn()
+		return true
 	if iname.begins_with("spawn_egg") or iname.ends_with("_spawn_egg"):
 		var mob := iname.trim_suffix("_spawn_egg")
 		world.entities.spawn_mob(mob, Vector3(pos + n) + Vector3(0.5, 0, 0.5))
@@ -538,7 +576,13 @@ static func use_item(world, held: ItemStack) -> void:
 		if p.fall_flying:
 			var fl := int((held.components.get("minecraft:fireworks", {}) as Dictionary).get("flight_duration", 1)) if held.components.get("minecraft:fireworks") is Dictionary else 1
 			p.rocket_ticks = 10 * (fl + 1) + randi_range(0, 5) + randi_range(0, 6)
-			Audio.play("entity.firework_rocket.launch", p.pos, "Ambient")
+			# the rocket entity riding at the hand (sprite, sparks, launch sound, the end-of-life burst)
+			world.entities.spawn_projectile("firework_rocket", p.pos, Vector3.ZERO, p)
+			var rk = world.entities.ents.back() if not world.entities.ents.is_empty() else null
+			if rk != null and rk.id == "firework_rocket":
+				rk.data["attached"] = true
+				rk.data["life"] = p.rocket_ticks
+				rk.stack = held.copy()
 			if not p.is_creative():
 				p.inventory.consume_held()
 			world.inv_changed()
@@ -602,12 +646,17 @@ static func use_item(world, held: ItemStack) -> void:
 		# Java BucketItem.emptyContents: a waterloggable clicked block takes the water itself (slabs, stairs, ...)
 		var dest: Vector3i = t if (Res.blocks.st_flags[hst] & BlockRegistry.F_REPLACEABLE) or (iname == "water_bucket" and Res.blocks.has_prop(hst, "waterlogged") and Res.blocks.get_prop(hst, "waterlogged") == "false") else t + hit["normal"]
 		var cur: int = world.state_at(dest.x, dest.y, dest.z)
+		if iname == "water_bucket" and water_evaporates(world) and cur >= 0 and ((Res.blocks.st_flags[cur] & BlockRegistry.F_REPLACEABLE) or Res.blocks.has_prop(cur, "waterlogged")):
+			evaporate(world, dest)
+			_replace_held(p, "bucket")
+			return
 		if iname == "water_bucket" and cur > 0 and Res.blocks.has_prop(cur, "waterlogged"):
 			world.set_block(dest.x, dest.y, dest.z, Res.blocks.with_prop(cur, "waterlogged", "true"))
 			BlockUpdates.schedule(world, dest, 5)
 		elif cur >= 0 and (Res.blocks.st_flags[cur] & BlockRegistry.F_REPLACEABLE):
 			world.set_block(dest.x, dest.y, dest.z, Res.blocks.WATER if iname == "water_bucket" else Res.blocks.LAVA)
-			BlockUpdates.schedule(world, dest, 1)
+			# Java FlowingFluid.getTickDelay: water 5, lava 30 (10 where lava is fast: the Nether's fast_lava attribute)
+			BlockUpdates.schedule(world, dest, 5 if iname == "water_bucket" else BlockUpdates.lava_delay(world))
 		else:
 			return
 		Audio.play("item.bucket.empty" + ("_lava" if iname == "lava_bucket" else ""), Vector3(dest), "Players")
@@ -716,7 +765,7 @@ static func use_block(world, hit: Dictionary) -> bool:
 		return true
 	if name.ends_with("_bed"):
 		return world.entities.try_sleep(pos, st)
-	if name in ["enchanting_table", "anvil", "chipped_anvil", "damaged_anvil", "grindstone", "smithing_table", "stonecutter", "loom"]:
+	if name in ["enchanting_table", "anvil", "chipped_anvil", "damaged_anvil", "grindstone", "smithing_table", "stonecutter", "loom", "cartography_table"]:
 		var ws = load("res://scripts/ui/workstation_screen.gd").new()
 		ws.kind = "anvil" if name.ends_with("anvil") else name
 		ws.pos = pos
@@ -727,7 +776,7 @@ static func use_block(world, hit: Dictionary) -> bool:
 		cs.grid_size = 3
 		world.open_screen(cs)
 		return true
-	if name in ["furnace", "blast_furnace", "smoker", "chest", "trapped_chest", "barrel", "hopper", "dispenser", "dropper", "ender_chest", "brewing_stand"] or name.ends_with("shulker_box") or name.ends_with("copper_chest"):
+	if name in ["furnace", "blast_furnace", "smoker", "chest", "trapped_chest", "barrel", "hopper", "dispenser", "dropper", "crafter", "ender_chest", "brewing_stand"] or name.ends_with("shulker_box") or name.ends_with("copper_chest"):
 		var cont = load("res://scripts/ui/container_screen.gd").new()
 		cont.pos = pos
 		cont.kind = name
@@ -826,3 +875,17 @@ static func on_block_broken(world, pos: Vector3i, st: int) -> void:
 	BlockEntities.on_removed(world, pos, st)
 	BlockUpdates.schedule_neighbors(world, pos)
 	Redstone.on_changed(world, pos)
+
+
+## Dimension attribute minecraft:gameplay/water_evaporates (26.3 dimension_type data; the Nether): placed water vanishes.
+static func water_evaporates(world) -> bool:
+	var at = world.dim_type.get("attributes", {})
+	return at is Dictionary and bool((at as Dictionary).get("minecraft:gameplay/water_evaporates", false))
+
+
+## Java BucketItem.emptyContents with WATER_EVAPORATES: fire extinguish sound (0.5, 2.6 + (r - r) * 0.8), 8 large smoke
+## particles at random points of the block.
+static func evaporate(world, pos: Vector3i) -> void:
+	Audio.play("block.fire.extinguish", Vector3(pos) + Vector3(0.5, 0.5, 0.5), "Blocks", 0.5, 2.6 + (randf() - randf()) * 0.8)
+	for i in 8:
+		Particles.emit("large_smoke", Vector3(pos) + Vector3(randf(), randf(), randf()))

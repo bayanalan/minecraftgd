@@ -109,6 +109,7 @@ func _setup() -> void:
 	surface = SurfaceRules.new(self)
 	surface.setup(str(settings_json.get("material_rule", settings_json.get("surface_rule", "minecraft:overworld"))))
 	features = Features.new(self)
+	ShapeUpdates.prime()
 	features.setup()
 	carvers = Carvers.new(self)
 	if structures_enabled:
@@ -219,7 +220,8 @@ func generate(ch: Chunk) -> void:
 	var t0 := Time.get_ticks_usec()
 	# the GDScript density context is only needed by fallback paths; allocating it costs ~90 ms per chunk under
 	# multi-threaded contention, so the all-native path skips it
-	var all_native := native_tg >= 0 and Native.density_ok and Native.surface_ok and Native.climate_ok and not profile and not end_biomes
+	# (the End's biome source needs one erosion sample per chunk: native point evaluation, end_biome_at)
+	var all_native := native_tg >= 0 and Native.density_ok and Native.surface_ok and Native.climate_ok and not profile
 	var ctx: DensityFunctions.Ctx = null
 	var blocks_pts: DensityFunctions.Pts = null
 	if not all_native:
@@ -241,6 +243,9 @@ func generate(ch: Chunk) -> void:
 			print("   node %d %s %s: %.1f ms incl, calls %d, pts %d" % [id, DensityFunctions.K.keys()[node.k], node.name, ctx.prof[id][0] / 1000.0, ctx.prof[id][1], ctx.prof[id][2]])
 		ctx.prof.clear()
 	var tb := Time.get_ticks_usec()
+	if _gprof_init == 0:
+		_gprof_init = 1
+		_gprof = OS.has_environment("RC_DFPROF")
 	# native path: density + noise fill + aquifer (+ carvers below) in RecraftNative (bit-exact, see --nativecheck)
 	var tg_job := -1
 	var native_bio := PackedByteArray()
@@ -248,7 +253,9 @@ func generate(ch: Chunk) -> void:
 	var skip_above := gen_min_y + gen_depth
 	var dens: PackedFloat64Array
 	# Java Beardifier pieces (structure starts are computed here, before the noise, as Java's STRUCTURE_STARTS status)
+	var tbp := Time.get_ticks_usec()
 	var beard := structures.beard_pieces(ch.cx, ch.cz) if beard_top and structures != null else PackedInt32Array()
+	var tbp1 := Time.get_ticks_usec()
 	if native_tg >= 0 and Native.density_ok:
 		var tg: Array = Native.inst.tg_begin(native_tg, ch.cx, ch.cz, beard)
 		tg_job = tg[0]
@@ -322,16 +329,20 @@ func generate(ch: Chunk) -> void:
 				top = Coords.MIN_Y + ly + 1
 				break
 		hm[c] = top
+	var tsf0 := Time.get_ticks_usec()
 	if native_surface:
 		col = Native.inst.tg_surface(tg_job, col, ch.biomes)[0]
 	else:
 		surface.apply_chunk(ctx, blocks_pts, col, ch.biomes, hm, stone)
+	var tsf1 := Time.get_ticks_usec()
 	var tc0 := Time.get_ticks_usec()
 	if tg_job >= 0:
 		col = Native.inst.tg_carve(tg_job, col, PackedInt32Array() if Native.climate_ok else carvers.source_biomes(ch.cx, ch.cz))[0]
 		Native.inst.tg_end(tg_job)
 	else:
 		carvers.carve(col, ch.cx, ch.cz, aq)
+	if _gprof:
+		print("[genprof] beard %.2f | begin %.2f | biomes %.2f | surface %.2f | carve %.2f ms" % [(tbp1 - tbp) / 1000.0, (t1 - tbp1) / 1000.0, (t2 - t1) / 1000.0, (tsf1 - tsf0) / 1000.0, (Time.get_ticks_usec() - tc0) / 1000.0])
 	_mutex.lock()
 	stats["carve_ms"] = lerpf(stats.get("carve_ms", 0.0), (Time.get_ticks_usec() - tc0) / 1000.0, 0.1)
 	_mutex.unlock()
@@ -575,7 +586,15 @@ func find_biome(bid: int, x: int, y: int, z: int, radius: int = 2048, step: int 
 func end_biome_at(ctx: DensityFunctions.Ctx, cx: int, cz: int) -> int:
 	if cx * cx + cz * cz <= 4096:
 		return int(biome_ids.get("the_end", 0))
-	var d := r_eros.point(ctx, cx * 16 + 8, 0, cz * 16 + 8)
+	var d: float
+	if ctx == null and native_graph >= 0 and Native.density_ok:
+		# Java TheEndBiomeSource: erosion (end islands) at the chunk centre, y 0; native point mode (no GDScript context:
+		# building one per chunk cost ~90 ms under contention)
+		d = float((Native.inst.df_points(native_graph, PackedInt32Array([r_eros.id]), PackedInt32Array([cx * 16 + 8]), PackedInt32Array([0]), PackedInt32Array([cz * 16 + 8]), cx, cz, 0)[0] as PackedFloat64Array)[0])
+	else:
+		if ctx == null:
+			ctx = DensityFunctions.Ctx.new(dfc.node_count())
+		d = r_eros.point(ctx, cx * 16 + 8, 0, cz * 16 + 8)
 	var nm := "small_end_islands"
 	if d > 0.25:
 		nm = "end_highlands"
@@ -603,3 +622,7 @@ func compute_features(c: Chunk, region: ChunkRegion) -> PackedInt32Array:
 func decorate(ch: Chunk, region: ChunkRegion) -> void:
 	if not features.apply(ch, region.chunks):
 		ch.recompute_heightmap(blocks)
+
+
+static var _gprof := false
+static var _gprof_init := 0

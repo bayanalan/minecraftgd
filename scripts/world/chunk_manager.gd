@@ -24,9 +24,68 @@ var loading := false
 var _base_jobs := -1
 
 
-## Advanced video "Chunk Builder Threads": 0 = auto (1/3 of the CPU threads, 2..5), else that many workers.
+## Adaptive workers (Chunk Builder Threads = auto): the full count only while a chunk within ADAPT_NEAR_RING is still
+## missing (spawn, teleport, fast travel into new land), ADAPT_LOW_JOBS otherwise. Busy workers on every core cost the
+## main thread and the GPU their shared power budget / clocks on SoC laptops: flight bench at 2 workers ran +30 % avg
+## FPS and +15 % 1 % low (fewer main-thread slowdowns); the far rings fill in a little later under the fog.
+const ADAPT_NEAR_RING := 8
+const ADAPT_LOW_JOBS := 2
+var adaptive_jobs: bool = OS.get_cmdline_user_args().has("--adapt")   # off by default: avg FPS +20 %, 1 % lows not yet better
+var _full_jobs := 4
+var adapt_boosted := true
+
+
+var _inner_since := 0
+var _fill_phase := false
+var _fill_t0 := 0
+static var _pininfo: bool = OS.get_cmdline_user_args().has("--pininfo")
+
+
+func _adapt_workers() -> void:
+	# background cluster set: wide (every cluster but the main thread's) while loading or while incomplete chunks lie
+	# 3+ rings inside the render distance (initial fill, after a teleport, falling behind); the low-class cluster once
+	# only the outer rings stream (steady flight keeps up there at 65 chunks / s)
+	# (0.4 s hysteresis: the frontier restarts at the centre whenever the wanted list moves and catches up over a few
+	# frames)
+	var inner := false
+	var fring := 1 << 20
+	if _frontier < _wanted_n:
+		var fw0: Vector2i = _w_at(_frontier)
+		fring = maxi(absi(fw0.x - _center.x), absi(fw0.y - _center.y))
+		inner = fring <= radius - 3
+	# the fill after a loading screen stays wide until every ring inside the render distance is complete once
+	if _fill_phase and not loading and (fring >= radius or Time.get_ticks_msec() - _fill_t0 > 30000):
+		_fill_phase = false
+	if not inner:
+		_inner_since = 0
+	elif _inner_since == 0:
+		_inner_since = Time.get_ticks_usec()
+	var wide := loading or _fill_phase or (inner and Time.get_ticks_usec() - _inner_since > 400000)
+	if wide != bg_wide:
+		if _pininfo:
+			print("[pin] %d ms: background clusters %s (frontier ring inner %s, loading %s)" % [Time.get_ticks_msec(), "wide" if wide else "low", str(inner), str(loading)])
+		bg_wide = wide
+		pin_epoch += 1
+	if loading or not adaptive_jobs:
+		return
+	var near := false
+	if _frontier < _wanted_n:
+		var fw: Vector2i = _w_at(_frontier)
+		near = maxi(absi(fw.x - _center.x), absi(fw.y - _center.y)) <= ADAPT_NEAR_RING
+	adapt_boosted = near
+	var want := _full_jobs if near else mini(ADAPT_LOW_JOBS, _full_jobs)
+	if want != max_jobs:
+		max_jobs = want
+		if near:
+			kick()
+
+
+## Advanced video "Chunk Builder Threads": 0 = auto (1/3 of the CPU threads, 2..5, adaptive), else that many workers.
 func set_worker_count(n: int) -> void:
 	var base := clampi(OS.get_processor_count() / 3, 2, 5) if n <= 0 else clampi(n, 1, 16)
+	_full_jobs = base
+	if n > 0:
+		adaptive_jobs = false
 	if loading:
 		_base_jobs = base
 		max_jobs = maxi(max_jobs, base)
@@ -55,6 +114,12 @@ func set_loading(on: bool) -> void:
 	if on == loading:
 		return
 	loading = on
+	if on:
+		_fill_phase = true
+		_fill_t0 = Time.get_ticks_msec()
+	if on and not bg_wide:
+		bg_wide = true
+		pin_epoch += 1
 	if on:
 		_base_jobs = max_jobs
 		max_jobs = clampi(OS.get_processor_count() * 2 / 3, max_jobs, 10)
@@ -119,7 +184,7 @@ var _upd_inflight := 0
 var _next_update: Dictionary = {}    # key -> earliest usec for the next non-urgent update job
 var _urgent_until: Dictionary = {}   # key -> usec until which updates of this chunk are urgent (player edits)
 const MESH_UPDATE_US := 300000
-const LIGHT_UPDATE_US := 600000
+const LIGHT_UPDATE_US := 150000   # per-chunk relight batching for frequent changes (flowing water, TNT); was 600 ms
 var thread_registries: bool = not OS.get_cmdline_user_args().has("--sharedreg")   # A/B: --sharedreg = old shared registries
 var _tl_gens: Dictionary = {}         # worker thread id -> private WorldGenerator (avoids shared-refcount contention)
 var _tl_mutex := Mutex.new()
@@ -153,6 +218,7 @@ func setup(p_blocks: BlockRegistry, p_biomes: BiomeRegistry, p_gen: WorldGenerat
 	# lighting, meshing and most features native, the real-game load test (--loadtest) peaks at 5 workers on the
 	# 18-thread reference machine (6+ only raise frame times: the remaining GDScript features still contend).
 	max_jobs = clampi(OS.get_processor_count() / 3, 2, 5)
+	_full_jobs = max_jobs
 
 
 ## Thread-local generator: identical config/seed, separate object graph per worker thread.
@@ -466,17 +532,24 @@ func _rebuild_wanted(pcx: int, pcz: int, forward: Vector3) -> bool:
 		var fd := Vector2.ZERO
 		if bucket >= 0:
 			fd = Vector2(cos(bucket * TAU / 32.0), sin(bucket * TAU / 32.0))
-		var tmp: Array = []
+		# packed (priority in 1/1000 units << 20 | index) keys sorted natively: the GDScript sort_custom over the
+		# (2r+3)^2 entries cost up to ~12 ms in the frame a new heading bucket first appeared (a flight stutter)
+		var keys := PackedInt64Array()
+		var side := 2 * r + 1
+		keys.resize(side * side)
+		var ki := 0
 		for dz in range(-r, r + 1):
 			for dx in range(-r, r + 1):
 				var d2 := dx * dx + dz * dz
 				var pri := float(maxi(absi(dx), absi(dz))) * 100.0 + float(d2) * 0.01
 				if d2 > 4 and bucket >= 0:
 					pri -= 60.0 * Vector2(dx, dz).normalized().dot(fd)
-				tmp.append([pri, dx, dz])
-		tmp.sort_custom(func(a, b): return a[0] < b[0])
-		for t in tmp:
-			offs.append(((int(t[1]) + 512) << 10) | (int(t[2]) + 512))
+				keys[ki] = (int(roundf((pri + 10000.0) * 1000.0)) << 20) | ki
+				ki += 1
+		keys.sort()
+		for k2 in keys:
+			var idx := k2 & 0xFFFFF
+			offs.append(((idx % side - r + 512) << 10) | (idx / side - r + 512))
 		_order_cache[ck] = offs
 	_wanted_offs = offs
 	_wanted_c = Vector2i(pcx, pcz)
@@ -537,6 +610,7 @@ func _kz(key: int) -> int:
 
 
 func _dispatch(pcx: int, pcz: int) -> void:
+	_adapt_workers()
 	var now := Time.get_ticks_usec()
 	if now >= _disp_wake_us:
 		# wake only the throttled chunks whose own update timer expired; the rest keep waiting for theirs
@@ -751,6 +825,11 @@ static var thread_prio: bool = not OS.get_cmdline_user_args().has("--noprio") an
 ## main thread's L2 cache or cluster clock. Soft preference (SetThreadSelectedCpuSets).
 static var _pin_main := PackedInt32Array()
 static var _pin_bg := PackedInt32Array()
+static var _pin_bg_wide := PackedInt32Array()   # every cluster but the main thread's (world loading: speed over FPS)
+## true while the loading screen runs (set_loading): background threads may use every cluster but the main thread's;
+## workers re-pin when pin_epoch changes
+static var bg_wide := false
+static var pin_epoch := 0
 static var _pin_ready := false
 
 
@@ -762,7 +841,10 @@ static var pin_mode := -1
 
 static func pin_thread(main: bool) -> void:
 	if pin_mode < 0:
-		pin_mode = 1 if Settings.get_v("adv_pin_main") else 0   # Advanced video "Fast-Core Pinning"
+		# Advanced video "Fast-Core Pinning": main thread on the fastest cluster AND the chunk workers off it (flight
+		# benchmark, Snapdragon X2: both 383 / 1 % low 104 FPS; main only 308 / 74; workers only 257 / 71; off 291 / 68;
+		# since 2026-11-13 the workers use the lower-class cluster only: 415 / 166)
+		pin_mode = 3 if Settings.get_v("adv_pin_main") else 0
 		for a in OS.get_cmdline_user_args():
 			if a.begins_with("--pin="):
 				pin_mode = int(a.substr(6))
@@ -771,6 +853,8 @@ static func pin_thread(main: bool) -> void:
 	if not _pin_ready:
 		_pin_ready = true
 		var a: PackedInt32Array = Native.inst.cpu_sets()[0]
+		if OS.get_cmdline_user_args().has("--pininfo"):
+			print("[pin] cpu sets (id, logical, core, llc, eff class): ", a)
 		var best := -1
 		var llcs := {}
 		for i in range(0, a.size(), 5):
@@ -782,20 +866,53 @@ static func pin_thread(main: bool) -> void:
 				main_llc = int(l)
 		if llcs.size() < 2 or main_llc < 0:
 			return
+		# --pinbg=L1,L2: background threads only on these last-level-cache clusters (experiments)
+		var bg_only := {}
+		for arg in OS.get_cmdline_user_args():
+			if arg.begins_with("--pinbg="):
+				for s in arg.substr(8).split(","):
+					bg_only[int(s)] = true
+		# background threads: the clusters of a lower efficiency class when the CPU has them (Snapdragon X2: the 6
+		# Performance cores), else every cluster but the main thread's. Workers on the second Prime cluster pulled the
+		# main thread's clock down with them (flight bench, same 65 chunks / s: avg 240 -> 415 FPS, 1 % low 70 -> 166,
+		# max 38 -> 17 ms; slowed main-thread frames 195 -> 8)
+		var low_bg := PackedInt32Array()
 		for i in range(0, a.size(), 5):
 			if a[i + 3] == main_llc:
 				_pin_main.append(a[i])
 			else:
 				_pin_bg.append(a[i])
-	var ids := _pin_main if main else _pin_bg
+				if a[i + 4] < best:
+					low_bg.append(a[i])
+		_pin_bg_wide = _pin_bg.duplicate()
+		if low_bg.size() >= 4 and not OS.get_cmdline_user_args().has("--pinprime"):
+			_pin_bg = low_bg
+		if not bg_only.is_empty():
+			_pin_bg.clear()
+			for i in range(0, a.size(), 5):
+				if bg_only.has(a[i + 3]):
+					_pin_bg.append(a[i])
+			_pin_bg_wide = _pin_bg.duplicate()
+	var ids := _pin_main if main else (_pin_bg_wide if bg_wide and not _pin_bg_wide.is_empty() else _pin_bg)
 	if not ids.is_empty():
 		Native.inst.set_thread_cpu_sets(ids)
+
+## --ecoworkers: chunk workers under EcoQoS (efficiency cores, lower clocks) - their load kept off the main thread's
+## cluster and power budget (experiment: main-thread slowdowns follow worker activity).
+static var eco_workers: bool = OS.get_cmdline_user_args().has("--ecoworkers")
+
 
 func _worker_loop() -> void:
 	if thread_prio and Native.inst.has_method("set_thread_priority"):
 		Native.inst.set_thread_priority(-1)
+	if eco_workers and Native.inst.has_method("thread_eco"):
+		Native.inst.thread_eco(1)
 	pin_thread(false)
+	var my_epoch := pin_epoch
 	while true:
+		if my_epoch != pin_epoch:   # loading screen started / ended: background cluster set changed
+			my_epoch = pin_epoch
+			pin_thread(false)
 		_q_mutex.lock()
 		if _q.is_empty() or shutting_down or _alive > max_jobs:   # (more workers than wanted after the loading screen)
 			_alive -= 1
@@ -834,10 +951,54 @@ func _start_gen(c: Chunk) -> void:
 	_submit(_job_gen.bind(c, c.mesh_epoch), _pri(c, 4))
 
 
+## Chunks of dimensions the player left (decorated data kept in memory, entities stored, modified ones also saved):
+## dimension -> {chunk key: Chunk}. A chunk wanted again is adopted from here instead of being read from the region
+## files or generated (WorldManager.change_dimension fills it; cleared when a world closes).
+static var dim_cache: Dictionary = {}
+static var _dc_mutex := Mutex.new()
+static var cache_hits := 0
+var dim_name := ""
+
+
+static func cache_take(dim: String, key: int) -> Chunk:
+	_dc_mutex.lock()
+	var m = dim_cache.get(dim)
+	var r: Chunk = null
+	if m != null:
+		r = (m as Dictionary).get(key)
+		if r != null:
+			(m as Dictionary).erase(key)
+			cache_hits += 1
+	_dc_mutex.unlock()
+	return r
+
+
+## Takes over a cached chunk's data (same result as SaveManager.apply_chunk_data on its saved form).
+static func adopt(c: Chunk, src: Chunk) -> void:
+	c.sections = src.sections
+	c.biomes = src.biomes
+	c.gen_surface = src.gen_surface
+	c.gen_top = src.gen_top
+	c.gen_floor = src.gen_floor
+	c.heightmap = src.heightmap
+	c.block_entities = src.block_entities
+	c.saved_entities = src.saved_entities
+	c.scheduled = src.scheduled
+	c.feature_writes = src.feature_writes
+	c.unknown_states = src.unknown_states
+	c.features_ready = true
+	c.modified = src.modified
+
+
 func _job_gen(c: Chunk, epoch: int) -> void:
 	var t0 := Time.get_ticks_usec()
 	var loaded := false
-	if load_chunk_fn.is_valid():
+	if dim_name != "":
+		var cached := cache_take(dim_name, Coords.chunk_key(c.cx, c.cz))
+		if cached != null:
+			adopt(c, cached)
+			loaded = true
+	if not loaded and load_chunk_fn.is_valid():
 		var saved = load_chunk_fn.call(c.cx, c.cz)
 		if tracing:
 			_gen_load_us += Time.get_ticks_usec() - t0
@@ -978,7 +1139,9 @@ func _start_light(c: Chunk, update := false) -> void:
 				c.light_partial = true
 			snaps.append(_snap(n) if n != null else null)
 			hms.append((n.heightmap.duplicate() if has_skylight else no_sky) if n != null else null)
-	_submit(_job_light.bind(c, snaps, hms, c.light_epoch, update), _pri(c, 1) + (50 if update else 0))
+	# updates of chunks on screen (block changes: flowing water, player edits) go before generation work: behind the
+	# generation queue they waited seconds while terrain streamed in
+	_submit(_job_light.bind(c, snaps, hms, c.light_epoch, update), _pri(c, 1) - (1000 if update else 0))
 
 
 func _job_light(c: Chunk, snaps: Array, hms: Array, epoch: int, update: bool) -> void:
@@ -1006,7 +1169,7 @@ func _start_mesh(c: Chunk, g: int, update := false) -> void:
 	if tracing:
 		_mt("  tints", Time.get_ticks_usec() - tt)
 	var job := {"snaps": snaps, "light": c.light_halo_secs, "group": g, "tints": tints, "opts": mesh_opts}   # registry: the worker's own
-	_submit(_job_mesh.bind(c, g, job, c.mesh_epoch, update, trd != null), _pri(c, 0) + (50 if update else 0))
+	_submit(_job_mesh.bind(c, g, job, c.mesh_epoch, update, trd != null), _pri(c, 0) - (1000 if update else 0))
 	if tracing:
 		_mt("  start_mesh", Time.get_ticks_usec() - tsm)
 
@@ -1180,6 +1343,7 @@ func _commit_one(kind: String, r: Array, c: Chunk, key: int, alive: bool) -> voi
 				c.feature_writes = r[3]
 				if r.size() > 7 and r[7] != null:
 					c.feature_bes = (r[7] as Chunk).feature_bes   # computed on the pristine twin
+					c.feature_postproc = (r[7] as Chunk).feature_postproc
 				c.features_ready = true
 				_tr(c, "feat_s", r[5])
 				_tr(c, "feat_e", r[6])

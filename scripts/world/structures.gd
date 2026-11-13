@@ -1,4 +1,4 @@
-## Structures — 26.3 data-driven structure generation (source D: Java ChunkGenerator.createStructures,
+## Structures â€” 26.3 data-driven structure generation (source D: Java ChunkGenerator.createStructures,
 ## RandomSpreadStructurePlacement, ConcentricRingsStructurePlacement, JigsawPlacement/Placer, pool elements,
 ## processors) plus template-based simple structures and approximate legacy-piece structures (StructuresLegacy).
 ## Starts are computed once per (structure set, start chunk) in a shared thread-safe cache; every chunk places only
@@ -326,6 +326,71 @@ func _start(st: Dictionary, sc: Vector2i) -> Dictionary:
 	return res
 
 
+var _spawn_sets: Array = []
+var _spawn_sets_ready := false
+var _spawn_q: Dictionary = {}   # start keys computed in the background for spawn lookups
+
+
+## Java NaturalSpawner.mobsAt + ChunkGenerator.getMobsAt, the structure part: a monster on nether bricks inside a
+## fortress's box gets the fortress enemies; otherwise the first structure here with spawn_overrides for the category
+## (by piece or by its whole box) replaces the biome list. Returns the spawner entries, [] for "nothing spawns", or
+## null (the biome list applies). Main thread: only cached starts are read, missing ones are made on a worker.
+func spawn_override(x: int, y: int, z: int, category: String, below_name: String):
+	if not _spawn_sets_ready:
+		_spawn_sets_ready = true
+		for st in sets:
+			if str((st["placement"] as Dictionary).get("type", "")).trim_prefix("minecraft:") != "random_spread":
+				continue
+			for e in st["entries"]:
+				var cfg0: Dictionary = e.get("cfg", {})
+				if cfg0.has("spawn_overrides") and not (cfg0["spawn_overrides"] as Dictionary).is_empty():
+					_spawn_sets.append(st)
+					break
+	if _spawn_sets.is_empty():
+		return null
+	var p := Vector3i(x, y, z)
+	var hits: Array = []
+	for st in _spawn_sets:
+		for sc in _candidates(st, x >> 4, z >> 4):
+			var key := "%s|%s|%d|%d,%d" % [gen.dimension, st["name"], gen.seed, sc.x, sc.y]
+			_sm.lock()
+			var res = _starts.get(key)
+			_sm.unlock()
+			if res == null:
+				if not _spawn_q.has(key):
+					if _spawn_q.size() > 2048:
+						_spawn_q.clear()
+					_spawn_q[key] = true
+					WorkerThreadPool.add_task(_start.bind(st, sc))
+				continue
+			if (res as Dictionary).is_empty():
+				continue
+			var b: Array = res["box"]
+			if p.x >= b[0].x and p.x <= b[1].x and p.y >= b[0].y and p.y <= b[1].y and p.z >= b[0].z and p.z <= b[1].z:
+				hits.append(res)
+	if hits.is_empty():
+		return null
+	if category == "monster" and below_name == "nether_bricks":
+		for res2 in hits:
+			if str(res2["structure"]) == "fortress":
+				return structures["fortress"]["spawn_overrides"]["monster"]["spawns"]
+	for res3 in hits:
+		var cfg: Dictionary = structures.get(str(res3["structure"]), {})
+		var ovs: Dictionary = cfg.get("spawn_overrides", {})
+		if not ovs.has(category):
+			continue
+		var ov: Dictionary = ovs[category]
+		var ok := str(ov.get("bounding_box", "piece")) == "full"
+		if not ok:
+			for pc in res3.get("pieces", []):
+				var pb: Array = pc.get("sbox", pc["box"])
+				if p.x >= pb[0].x and p.x <= pb[1].x and p.y >= pb[0].y and p.y <= pb[1].y and p.z >= pb[0].z and p.z <= pb[1].z:
+					ok = true
+					break
+		if ok:
+			return ov.get("spawns", [])
+	return null
+
 ## /locate: nearest start of the named structure within max_r chunks (placement + biome stub check only).
 func locate(name: String, cx: int, cz: int, max_r: int = 100) -> Dictionary:
 	if name == "stronghold":
@@ -386,6 +451,42 @@ func _stub_ok(cfg: Dictionary, sc: Vector2i) -> bool:
 			return false
 		var c: Vector3i = stub["center"]
 		return (cfg["biomes"] as Dictionary).has(biome_id_at(c.x, c.y, c.z))
+	var t := str(cfg.get("type", "")).trim_prefix("minecraft:")
+	if t == "woodland_mansion":
+		# WoodlandMansionStructure.findGenerationPoint: lowest corner of the rotated 5 x 5 box >= 60, biome at the stub
+		var mrot := r.next_int_bound(4)
+		var mi := -5 if mrot == 1 or mrot == 2 else 5
+		var mj := -5 if mrot == 2 or mrot == 3 else 5
+		var mk := sc.x * 16 + 7
+		var ml := sc.y * 16 + 7
+		var mlo := 1 << 30
+		for cxz in [Vector2i(mk, ml), Vector2i(mk, ml + mj), Vector2i(mk + mi, ml), Vector2i(mk + mi, ml + mj)]:
+			mlo = mini(mlo, base_height(cxz.x, cxz.y, false) - 1)
+		return mlo >= 60 and (cfg["biomes"] as Dictionary).has(biome_id_at(mk, mlo, ml))
+	if t == "end_city":
+		# EndCityStructure.findGenerationPoint: the lowest corner of the rotated 5 x 5 box must reach y 60
+		var rot := r.next_int_bound(4)
+		var ci := -5 if rot == 1 or rot == 2 else 5
+		var cj := -5 if rot == 2 or rot == 3 else 5
+		var ek := sc.x * 16 + 7
+		var el := sc.y * 16 + 7
+		for cxz in [Vector2i(ek, el), Vector2i(ek, el + cj), Vector2i(ek + ci, el), Vector2i(ek + ci, el + cj)]:
+			if base_height(cxz.x, cxz.y, false) - 1 < 60:
+				return false
+	if t == "ocean_monument":
+		# the stub biome first (cheap), then the 29-block surrounding check
+		if not (cfg["biomes"] as Dictionary).has(biome_id_at(sc.x * 16 + 8, _stub_y(cfg, sc.x * 16 + 8, sc.y * 16 + 8), sc.y * 16 + 8)):
+			return false
+		return JavaPieces.monument_surroundings_ok(self, sc)
+	if t == "desert_pyramid" or t == "jungle_temple":
+		# SinglePieceStructure.findGenerationPoint: nothing when the lowest box corner is below sea level (Java's locate
+		# runs the same check through StructureCheck)
+		var size := Vector2i(21, 21) if t == "desert_pyramid" else Vector2i(12, 15)
+		var x0 := sc.x * 16
+		var z0 := sc.y * 16
+		for cxz in [Vector2i(x0, z0), Vector2i(x0, z0 + size.y), Vector2i(x0 + size.x, z0), Vector2i(x0 + size.x, z0 + size.y)]:
+			if base_height(cxz.x, cxz.y, false) - 1 < gen.sea_level:
+				return false
 	return (cfg["biomes"] as Dictionary).has(biome_id_at(sc.x * 16 + 8, _stub_y(cfg, sc.x * 16 + 8, sc.y * 16 + 8), sc.y * 16 + 8))
 
 
@@ -461,6 +562,10 @@ func _try_structure(cfg: Dictionary, sc: Vector2i) -> Dictionary:
 				return {}
 			res = _jigsaw_finish(cfg, stub, r)
 			stats["jigsaw_ms"] += (Time.get_ticks_usec() - tj) / 1000.0
+		"ruined_portal":
+			res = StructuresLegacy.generate(self, t, cfg, sc, r)   # biome test on its stub inside (y comes from the random)
+		"woodland_mansion":
+			res = MansionPieces.generate(self, cfg, sc, r)   # biome test on its stub (block 7, 7) inside
 		_:
 			var cx := sc.x * 16 + 8
 			var cz := sc.y * 16 + 8
@@ -472,6 +577,46 @@ func _try_structure(cfg: Dictionary, sc: Vector2i) -> Dictionary:
 	res["structure"] = cfg["name"]
 	res["step"] = cfg["step"]
 	return res
+
+
+## Java NoiseBasedChunkGenerator.getBaseColumn: the noise-stage block classes of column (x, z), index y - gen_min_y:
+## 0 air, 1 solid, 2 water, 3 lava (native: cell-interpolated final density + aquifer, no beard). Cached and shared.
+var _cols := {}
+
+
+func base_column(x: int, z: int) -> PackedByteArray:
+	var key := Vector2i(x, z)
+	_sm.lock()
+	var v = _cols.get(key)
+	_sm.unlock()
+	if v != null:
+		return v
+	var out := PackedByteArray()
+	if gen.native_tg >= 0 and Native.density_ok and Native.inst.has_method("tg_column"):
+		out = Native.inst.tg_column(gen.native_tg, x, z)[0]
+	else:
+		out.resize(gen.gen_depth)
+		var top := first_free_height(x, z, true)
+		for i in gen.gen_depth:
+			var y := gen.gen_min_y + i
+			out[i] = 1 if y < top else (2 if y < gen.sea_level and gen.dimension == "overworld" else 0)
+	_sm.lock()
+	if _cols.size() > 20000:
+		_cols.clear()
+	_cols[key] = out
+	_sm.unlock()
+	return out
+
+
+## Java ChunkGenerator.getBaseHeight: one above the top block the worldgen heightmap counts (WORLD_SURFACE_WG: any
+## non-air block, fluids included; OCEAN_FLOOR_WG: blocks motion).
+func base_height(x: int, z: int, ocean_floor: bool) -> int:
+	var col := base_column(x, z)
+	for i in range(col.size() - 1, -1, -1):
+		var k := col[i]
+		if (k == 1) if ocean_floor else (k != 0):
+			return gen.gen_min_y + i + 1
+	return gen.gen_min_y
 
 
 ## Noise-based first free height (ChunkGenerator.getFirstFreeHeight approx), cached and shared.
@@ -611,8 +756,19 @@ func _el_info(el: Dictionary, rot: int) -> Array:
 	var order: Array = prios.keys()
 	order.sort()
 	order.reverse()
-	# [box, jigsaws, expansion cache, distinct selection priorities (descending)]
-	var info := [_el_box_raw(el, Vector3i.ZERO, rot), jl, -1, order, sels]
+	# jigsaw name -> PackedByteArray mask over jl (attach candidates are filtered by name before any dictionary access)
+	var names := {}
+	for k in jl.size():
+		var nm: String = jl[k]["nm_s"]
+		if not names.has(nm):
+			var mk := PackedByteArray()
+			mk.resize(jl.size())
+			names[nm] = mk
+		var mk2: PackedByteArray = names[nm]
+		mk2[k] = 1
+		names[nm] = mk2
+	# [box, jigsaws, expansion cache, distinct priorities (descending), selection priorities, priorities packed, name masks]
+	var info := [_el_box_raw(el, Vector3i.ZERO, rot), jl, -1, order, sels, PackedInt32Array(order), names]
 	stats["elinfo_ms"] = float(stats.get("elinfo_ms", 0.0)) + (Time.get_ticks_usec() - tmiss) / 1000.0
 	stats["max_jigsaws"] = maxi(int(stats.get("max_jigsaws", 0)), jl.size())
 	_el_cache[key] = info
@@ -870,8 +1026,21 @@ func _try_children(cfg: Dictionary, pieces: Array, piece: Dictionary, free: Dict
 	var box: Array = piece["box"]
 	var i := int(box[0].y)
 	var interior: Dictionary = {}
-	for jb in _el_jigsaws(el, piece["pos"], piece["rot"], r):
-		var jpos: Vector3i = jb["pos"]
+	# index form (no per-jigsaw dictionary copies); the piece offset is added to each jigsaw position here
+	var ppos0: Vector3i = piece["pos"]
+	var pinfo: Array = _el_info(el, piece["rot"])
+	var pjl: Array = pinfo[1]
+	var pord: PackedInt32Array
+	if old_jig:
+		pjl = _el_jigsaws(el, Vector3i.ZERO, piece["rot"], r)
+		pord.resize(pjl.size())
+		for qq in pjl.size():
+			pord[qq] = qq
+	else:
+		pord = _el_jig_idx(pinfo, r)
+	for pji in pord:
+		var jb: Dictionary = pjl[pji]
+		var jpos: Vector3i = jb["pos"] + ppos0
 		var front: Vector3i = StructureTemplate.DIRS[jb["front"]]
 		var target_pos := jpos + front
 		var j := jpos.y - i
@@ -901,12 +1070,21 @@ func _try_children(cfg: Dictionary, pieces: Array, piece: Dictionary, free: Dict
 		stats["pool_len"] = maxi(int(stats.get("pool_len", 0)), cands.size())
 		stats["jigsaws_tried"] = int(stats.get("jigsaws_tried", 0)) + 1
 		var placed := false
+		var tg_want: String = jb["tg_s"]
+		var failed := {}   # element uids that attached in no rotation to this jigsaw (the shape only changes on a placement)
 		for el2 in cands:
 			if el2["t"] == "empty":
 				break
 			stats["cands"] = int(stats.get("cands", 0)) + 1
 			if f.trace_names:
 				printerr("[struct]           cand %s %s" % [str(el2.get("loc", el2["t"])), JSON.stringify(stats)])
+			var uid2 := int(el2["uid"])
+			if failed.has(uid2) and not old_jig:
+				# a repeat of an element that already failed here: same outcome, only its random calls are replayed
+				# (Java still shuffles the rotations and each rotation's jigsaw blocks)
+				for rot3 in _shuffled([0, 1, 2, 3], r):
+					_el_jig_idx(_el_info(el2, rot3), r)
+				continue
 			for rot2 in _shuffled([0, 1, 2, 3], r):
 				var t_ej := Time.get_ticks_usec()
 				var info2: Array = _el_info(el2, rot2)
@@ -919,6 +1097,12 @@ func _try_children(cfg: Dictionary, pieces: Array, piece: Dictionary, free: Dict
 						jord[qq] = qq
 					jl2 = jbs2
 				stats["eljig_ms"] = float(stats.get("eljig_ms", 0.0)) + (Time.get_ticks_usec() - t_ej) / 1000.0
+				# only jigsaws named like this one's target can attach
+				var nmv = null if old_jig else (info2[6] as Dictionary).get(tg_want)
+				if nmv == null and not old_jig:
+					continue
+				var use_mask := nmv != null
+				var nmask: PackedByteArray = nmv if use_mask else PackedByteArray()
 				var b2 := _el_box(el2, Vector3i.ZERO, rot2)
 				var mexp := 0
 				if expansion and b2[1].y - b2[0].y + 1 <= 16:
@@ -933,6 +1117,8 @@ func _try_children(cfg: Dictionary, pieces: Array, piece: Dictionary, free: Dict
 						info[2] = mm
 					mexp = int(info[2])
 				for jo in jord:
+					if use_mask and nmask[jo] == 0:
+						continue
 					var jb2: Dictionary = jl2[jo]
 					# JigsawBlock.canAttach
 					if (jb["fv"] as Vector3i) != -(jb2["fv"] as Vector3i):
@@ -978,6 +1164,7 @@ func _try_children(cfg: Dictionary, pieces: Array, piece: Dictionary, free: Dict
 					break
 			if placed:
 				break
+			failed[uid2] = true
 
 
 # ------------------------------------------------------------------ processors
@@ -1092,12 +1279,84 @@ static func process(f: Features, c: Features.FCtx, pr: Dictionary, st: int, wp: 
 			var ex := f.get_block(c, wp)
 			return -1 if ex >= 0 and (pr["ids"] as Dictionary).has(blocks.st_block[ex]) else st
 		"age":
-			var r3 := RandomSources.LegacyRandom.new(RandomSources.pos_seed(wp.x, wp.y, wp.z))
-			var nm := blocks.name_of(st)
-			if (nm == "stone_bricks" or nm == "cobblestone") and r3.next_float() < float(pr["moss"]):
-				return blocks.default_state("mossy_" + nm)
+			return _block_age(blocks, st, wp, float(pr["moss"]))
+		"lava_sub":
+			# LavaSubmergedBlockProcessor: lava already there stays unless the new block is a full cube
+			var ex2 := f.get_block(c, wp)
+			if ex2 > 0 and blocks.name_of(ex2) == "lava" and (st <= 0 or (blocks.st_flags[st] & BlockRegistry.F_FULL_SHAPE) == 0):
+				return blocks.default_state("lava")
 			return st
+		"blackstone":
+			return _blackstone(blocks, st)
 	return st
+
+
+## Java BlockAgeProcessor (ruined portals): stone bricks / stone / chiseled -> cracked or mossy bricks or random
+## stairs (50 %), stairs -> slabs or mossy stairs (50 %), slabs / walls -> mossy (mossiness), obsidian -> crying (15 %).
+static func _block_age(blocks: BlockRegistry, st: int, wp: Vector3i, moss: float) -> int:
+	if st <= 0:
+		return st
+	var r := RandomSources.LegacyRandom.new(RandomSources.pos_seed(wp.x, wp.y, wp.z))
+	var nm := blocks.name_of(st)
+	if nm == "stone_bricks" or nm == "stone" or nm == "chiseled_stone_bricks":
+		if r.next_float() >= 0.5:
+			return st
+		var s1 := _age_stairs(blocks, r, "stone_brick_stairs")
+		var s2 := _age_stairs(blocks, r, "mossy_stone_brick_stairs")
+		if r.next_float() < moss:
+			return [blocks.default_state("mossy_stone_bricks"), s2][r.next_int_bound(2)]
+		return [blocks.default_state("cracked_stone_bricks"), s1][r.next_int_bound(2)]
+	if Tags.has_block("#minecraft:stairs", nm):
+		if r.next_float() >= 0.5:
+			return st
+		if r.next_float() < moss:
+			var ms := blocks.with_prop(blocks.with_prop(blocks.default_state("mossy_stone_brick_stairs"), "facing", blocks.get_prop(st, "facing")), "half", blocks.get_prop(st, "half"))
+			return [ms, blocks.default_state("mossy_stone_brick_slab")][r.next_int_bound(2)]
+		return [blocks.default_state("stone_slab"), blocks.default_state("stone_brick_slab")][r.next_int_bound(2)]
+	if Tags.has_block("#minecraft:slabs", nm):
+		return blocks.default_state("mossy_stone_brick_slab") if r.next_float() < moss else st
+	if Tags.has_block("#minecraft:walls", nm):
+		return blocks.default_state("mossy_stone_brick_wall") if r.next_float() < moss else st
+	if nm == "obsidian":
+		return blocks.default_state("crying_obsidian") if r.next_float() < 0.15 else st
+	return st
+
+
+static func _age_stairs(blocks: BlockRegistry, r: RandomSources.LegacyRandom, nm: String) -> int:
+	var facing: String = ["north", "east", "south", "west"][r.next_int_bound(4)]
+	var half: String = ["top", "bottom"][r.next_int_bound(2)]
+	return blocks.with_prop(blocks.with_prop(blocks.default_state(nm), "facing", facing), "half", half)
+
+
+const BLACKSTONE := {"cobblestone": "blackstone", "mossy_cobblestone": "blackstone", "stone": "polished_blackstone",
+	"stone_bricks": "polished_blackstone_bricks", "mossy_stone_bricks": "polished_blackstone_bricks",
+	"cobblestone_stairs": "blackstone_stairs", "mossy_cobblestone_stairs": "blackstone_stairs",
+	"stone_stairs": "polished_blackstone_stairs", "stone_brick_stairs": "polished_blackstone_brick_stairs",
+	"mossy_stone_brick_stairs": "polished_blackstone_brick_stairs", "cobblestone_slab": "blackstone_slab",
+	"mossy_cobblestone_slab": "blackstone_slab", "smooth_stone_slab": "polished_blackstone_slab",
+	"stone_slab": "polished_blackstone_slab", "stone_brick_slab": "polished_blackstone_brick_slab",
+	"mossy_stone_brick_slab": "polished_blackstone_brick_slab", "stone_brick_wall": "polished_blackstone_brick_wall",
+	"mossy_stone_brick_wall": "polished_blackstone_brick_wall", "cobblestone_wall": "blackstone_wall",
+	"mossy_cobblestone_wall": "blackstone_wall", "chiseled_stone_bricks": "chiseled_polished_blackstone",
+	"cracked_stone_bricks": "cracked_polished_blackstone_bricks", "iron_bars": "iron_chain"}
+
+
+## Java BlackstoneReplaceProcessor: stone-family blocks -> blackstone family, properties kept.
+static func _blackstone(blocks: BlockRegistry, st: int) -> int:
+	if st <= 0:
+		return st
+	var to := str(BLACKSTONE.get(blocks.name_of(st), ""))
+	if to == "":
+		return st
+	if blocks.block_id(to) < 0 and to == "iron_chain":
+		to = "chain"
+	var out := blocks.default_state(to)
+	if out < 0:
+		return st
+	for pr in blocks.props_of(st):
+		if blocks.has_prop(out, pr):
+			out = blocks.with_prop(out, pr, blocks.get_prop(st, pr))
+	return out
 
 
 # ------------------------------------------------------------------ chunk placement
@@ -1153,7 +1412,7 @@ func beard_pieces(cx: int, cz: int) -> PackedInt32Array:
 				var el: Dictionary = pc["el"]
 				if str(el.get("proj", "rigid")) != "rigid":
 					continue
-				var delta := 0 if str(el.get("t", "")) in ["feature", "empty"] else 1
+				var delta := 0 if str(el.get("t", "")) in ["feature", "empty", "java"] else 1   # StructurePiece (non-pool): Rigid(box, adaptation, 0)
 				out.append_array([pb[0].x, pb[0].y, pb[0].z, pb[1].x, pb[1].y, pb[1].z, ad, delta])
 	return out
 
@@ -1336,6 +1595,68 @@ func _place_start(c: Features.FCtx, res: Dictionary, cmin: Vector3i, cmax: Vecto
 		if b[1].x < cmin.x or b[0].x > cmax.x or b[1].z < cmin.z or b[0].z > cmax.z:
 			continue
 		_place_element(c, p["el"], p["pos"], int(p["rot"]), cmin, cmax)
+	if str(res.get("after", "")) == "mansion":
+		_mansion_after(c, res, cmin, cmax)
+	elif str(res.get("after", "")) == "pyramid":
+		_pyramid_after(c, res, cmin, cmax)
+
+
+## DesertPyramidStructure.afterPlace for this chunk: the collapsed roof random block and the first 5..7 shuffled cellar
+## candidates become suspicious sand (loot archaeology/desert_pyramid), the other candidates sand.
+func _pyramid_after(c: Features.FCtx, res: Dictionary, cmin: Vector3i, cmax: Vector3i) -> void:
+	var sus := f.blocks.default_state("suspicious_sand")
+	var sand := f.blocks.default_state("sand")
+	var picks: Array = [res["sus_roof"]]
+	picks.append_array(res["sus"])
+	for q in picks:
+		var qv: Vector3i = q
+		if qv.x >= cmin.x and qv.x <= cmax.x and qv.z >= cmin.z and qv.z <= cmax.z:
+			f.set_block(c, qv, sus)
+			c.block_entities[qv] = {"id": "suspicious_sand", "loot_table": "archaeology/desert_pyramid", "loot_seed": 0}
+	for q2 in res["sand"]:
+		var qw: Vector3i = q2
+		if qw.x >= cmin.x and qw.x <= cmax.x and qw.z >= cmin.z and qw.z <= cmax.z:
+			f.set_block(c, qw, sand)
+
+
+## WoodlandMansionStructure.afterPlace: under every column of this chunk whose block at the structure's bottom layer is
+## not air and lies inside a piece, cobblestone replaces air and liquid downwards until the first other block.
+func _mansion_after(c: Features.FCtx, res: Dictionary, cmin: Vector3i, cmax: Vector3i) -> void:
+	var bb: Array = res["box"]
+	var y0: int = bb[0].y
+	var lo := f.gen.gen_min_y
+	var blocks := f.blocks
+	var cob := blocks.default_state("cobblestone")
+	var cave_air := blocks.default_state("cave_air")
+	var void_air := blocks.default_state("void_air")
+	var fl := blocks.st_flags
+	# only pieces spanning the bottom layer inside this chunk can contain the tested positions
+	var near: Array = []
+	for pc in res["pieces"]:
+		var pb: Array = pc["box"]
+		if pb[0].y <= y0 and pb[1].y >= y0 and pb[1].x >= cmin.x and pb[0].x <= cmax.x and pb[1].z >= cmin.z and pb[0].z <= cmax.z:
+			near.append(pb)
+	if near.is_empty():
+		return
+	for x in range(maxi(cmin.x, bb[0].x), mini(cmax.x, bb[1].x) + 1):
+		for z in range(maxi(cmin.z, bb[0].z), mini(cmax.z, bb[1].z) + 1):
+			var p := Vector3i(x, y0, z)
+			var b0 := f.get_block(c, p)
+			if b0 <= 0 or b0 == cave_air or b0 == void_air:
+				continue
+			var inside := false
+			for pb2 in near:
+				if _inside(pb2, p):
+					inside = true
+					break
+			if not inside:
+				continue
+			for m in range(y0 - 1, lo, -1):
+				var q := Vector3i(x, m, z)
+				var b := f.get_block(c, q)
+				if b > 0 and b != cave_air and b != void_air and (fl[b] & BlockRegistry.F_LIQUID) == 0:
+					break
+				f.set_block(c, q, cob)
 
 
 ## Java StructurePiece.isInInvalidLocation: liquid on the faces of the piece's box grown by 1, within this chunk.
@@ -1374,10 +1695,14 @@ func _place_element(c: Features.FCtx, el: Dictionary, pos: Vector3i, rot: int, c
 		"single":
 			var tpl := _el_template(el)
 			if tpl != null:
-				tpl.place(f, c, pos, rot, el["procs"], bool(el["legacy"]), el["proj"] == "terrain_matching", cmin, cmax)
+				tpl.place(f, c, pos, rot, el["procs"], bool(el["legacy"]), el["proj"] == "terrain_matching", cmin, cmax, 0, int(el.get("mirror", 0)), Vector3i.ZERO, str(el.get("markers", "")), not bool(el.get("noents", false)))
 		"list":
 			for s in el["subs"]:
 				_place_element(c, s, pos, rot, cmin, cmax)
+		"ruined_portal":
+			StructuresLegacy.place_ruined_portal(self, c, el, pos, rot, cmin, cmax)
+		"java":
+			JavaPieces.place(self, c, el, cmin, cmax)
 		"feature":
 			if pos.x >= cmin.x and pos.x <= cmax.x and pos.z >= cmin.z and pos.z <= cmax.z:
 				var pf := f._placed(str(el["feature"]))

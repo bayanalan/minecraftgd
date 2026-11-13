@@ -161,7 +161,9 @@ bool fn_light(const Args &a, void *ret) {
 			for (int x = 0; x < 16; x++)
 				hm[(cz * 16 + z) * W + cx * 16 + x] = h ? h[x + z * 16] : MAX_Y;
 	}
-	std::vector<uint8_t> sky(LAYER * HEIGHT, 0), blk(LAYER * HEIGHT, 0);
+	static thread_local std::vector<uint8_t> tl_sky, tl_blk;
+	TLBuf<uint8_t> sky_buf(tl_sky, LAYER * HEIGHT, 0), blk_buf(tl_blk, LAYER * HEIGHT, 0);
+	std::vector<uint8_t> &sky = sky_buf.v, &blk = blk_buf.v;
 	uint8_t touched[SECTIONS] = {};
 	std::vector<int32_t> q;
 	q.reserve(65536);

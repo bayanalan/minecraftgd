@@ -56,6 +56,8 @@ func _ready() -> void:
 		test_vanilla_dimensions()
 		test_vanilla_redstone()
 		test_vanilla_enchanting()
+		test_vanilla_fluids_fire()
+		test_vanilla_structure_ports()
 	print("RESULT %d passed, %d failed in %d ms" % [passed, failed, Time.get_ticks_msec() - t0])
 	_write_report()
 	get_tree().quit(mini(failed, 100))
@@ -683,7 +685,7 @@ class CmdEnts:
 		ents.erase(e)
 	func _damage(e, amt: float, _src) -> void:
 		e.hp -= amt
-	func spawn_item(_p, _s) -> void:
+	func spawn_item(_p, _s, _v = null) -> void:
 		pass
 
 
@@ -731,7 +733,7 @@ class AdvWorld:
 class AdvHud:
 	var toasts := 0
 	var last_title := ""
-	func toast(_a, _b, _c) -> void:
+	func toast(_a, _b, _c, _d = null) -> void:
 		toasts += 1
 	func chat_message(_t) -> void:
 		pass
@@ -781,6 +783,10 @@ func test_commands() -> void:
 	ok("cmd execute if/unless block", cp._get_score("Player", "kills") == 100)
 	cp.execute("/execute store result score Player kills run time query daytime")
 	ok("cmd execute store result", cp._get_score("Player", "kills") == 1000)
+	var seed_out := cp.execute("/seed")
+	ok("cmd seed: Seed: [42], click copies the seed", seed_out == "Seed: [42]" and cp.feedback_click == "copy:42", seed_out + " / " + cp.feedback_click)
+	cp.execute("/time set day")
+	ok("cmd: the copy click belongs only to /seed", cp.feedback_click == "")
 	cp.execute("/tag @e[type=pig] add marked")
 	cp.execute("/kill @e[tag=marked]")
 	ok("cmd tags + tag selector", pig.dead)
@@ -1158,3 +1164,524 @@ func test_vanilla_assets() -> void:
 	ok("vanilla: shulker box keeps contents (copy_components)", sbd.size() == 1 and (sbd[0] as ItemStack).components.get("minecraft:container", []).size() == 2 and (sbd[0] as ItemStack).components.get("minecraft:custom_name", "") == "Loot")
 	ok("vanilla: sound index", Res.asset_index.size() > 1000, str(Res.asset_index.size()))
 	ok("vanilla: music present", Res.sound_object_path("minecraft/sounds/music/menu/moog_city_2.ogg") != "" or int(Res.manifest.get("music_tracks", 0)) > 0)
+
+# ------------------------------------------------------------------ Java FlowingFluid / FireBlock / template ports
+
+class FluidWorld:
+	var blocks: Dictionary = {}
+	var game_time := 0
+	var rng := RandomNumberGenerator.new()
+	var entities := MockEntities.new()
+	var cm := MockCM.new()
+	var dim_type: Dictionary = {}
+	var raining := false
+	var difficulty := 2
+	var dimension := "overworld"
+
+	func state_at(x: int, y: int, z: int) -> int:
+		return blocks.get(Vector3i(x, y, z), 0)
+
+	func set_block(x: int, y: int, z: int, st: int, _notify := true) -> int:
+		var old: int = blocks.get(Vector3i(x, y, z), 0)
+		if st == 0:
+			blocks.erase(Vector3i(x, y, z))
+		else:
+			blocks[Vector3i(x, y, z)] = st
+		if old != st and st > 0 and Res.blocks.st_block[st] == BlockUpdates._fire_id() and (old == 0 or Res.blocks.st_block[old] != Res.blocks.st_block[st]):
+			BlockUpdates.fire_placed(self, Vector3i(x, y, z))
+		return old
+
+	func gamerule(_n, d = null):
+		return d
+
+	func weather_at(_p) -> String:
+		return "rain" if raining else "none"
+
+	func floor_at(y: int, r: int, st: int) -> void:
+		for x in range(-r, r + 1):
+			for z in range(-r, r + 1):
+				blocks[Vector3i(x, y, z)] = st
+
+	func run(ticks: int) -> void:
+		for i in ticks:
+			game_time += 1
+			BlockUpdates.tick_scheduled(self)
+
+
+func _fluid_world() -> FluidWorld:
+	BlockUpdates.queue.clear()
+	BlockUpdates.pending.clear()
+	var w := FluidWorld.new()
+	w.rng.seed = 1234
+	w.floor_at(-1, 12, Res.blocks.STONE)
+	return w
+
+
+func _lvl(w: FluidWorld, x: int, y: int, z: int) -> int:
+	var st := w.state_at(x, y, z)
+	if st <= 0 or (Res.blocks.st_flags[st] & BlockRegistry.F_LIQUID) == 0:
+		return -1
+	return Res.blocks.st_level[st]
+
+
+func test_vanilla_fluids_fire() -> void:
+	var b := Res.blocks
+	# water: 7 blocks out on a flat floor (amount 8 - distance), diagonal by Manhattan distance
+	var w := _fluid_world()
+	w.set_block(0, 0, 0, b.WATER)
+	BlockUpdates.schedule(w, Vector3i(0, 0, 0), 5)
+	w.run(200)
+	ok("water: level 3 three blocks out", _lvl(w, 3, 0, 0) == 3, str(_lvl(w, 3, 0, 0)))
+	ok("water: level 7 at the 7th block", _lvl(w, 7, 0, 0) == 7 and _lvl(w, -7, 0, 0) == 7 and _lvl(w, 0, 0, 7) == 7)
+	ok("water: nothing at 8 blocks", _lvl(w, 8, 0, 0) == -1 and _lvl(w, 0, 0, -8) == -1)
+	ok("water: diagonal by Manhattan distance", _lvl(w, 4, 0, 3) == 7 and _lvl(w, 4, 0, 4) == -1)
+	var wt := _fluid_world()
+	wt.set_block(0, 0, 0, b.WATER)
+	BlockUpdates.schedule(wt, Vector3i(0, 0, 0), 5)
+	wt.run(9)
+	var ring1 := _lvl(wt, 1, 0, 0) == 1 and _lvl(wt, 2, 0, 0) == -1
+	wt.run(1)
+	ok("water: spreads one ring per 5 ticks (WaterFluid tick delay)", ring1 and _lvl(wt, 2, 0, 0) == 2)
+	# slope search: only the direction of the nearest drop within 4 blocks
+	var w2 := _fluid_world()
+	w2.blocks.erase(Vector3i(3, -1, 0))
+	w2.set_block(0, 0, 0, b.WATER)
+	BlockUpdates.schedule(w2, Vector3i(0, 0, 0), 5)
+	w2.run(6)
+	ok("water: heads for the nearest drop (getSlopeDistance)", _lvl(w2, 1, 0, 0) == 1 and _lvl(w2, -1, 0, 0) == -1 and _lvl(w2, 0, 0, 1) == -1 and _lvl(w2, 0, 0, -1) == -1)
+	var w2b := _fluid_world()
+	w2b.blocks.erase(Vector3i(6, -1, 0))
+	w2b.set_block(0, 0, 0, b.WATER)
+	BlockUpdates.schedule(w2b, Vector3i(0, 0, 0), 5)
+	w2b.run(6)
+	ok("water: a drop 6 away is beyond the slope search (all 4 sides)", _lvl(w2b, 1, 0, 0) == 1 and _lvl(w2b, -1, 0, 0) == 1 and _lvl(w2b, 0, 0, 1) == 1)
+	# lava: drop-off 2 in the overworld, 1 with fast_lava (the Nether)
+	var w3 := _fluid_world()
+	w3.set_block(0, 0, 0, b.LAVA)
+	BlockUpdates.schedule(w3, Vector3i(0, 0, 0), 30)
+	w3.run(400)
+	ok("lava: 3 blocks in the overworld (levels 2 / 4 / 6)", _lvl(w3, 1, 0, 0) == 2 and _lvl(w3, 3, 0, 0) == 6 and _lvl(w3, 4, 0, 0) == -1, "%d %d %d" % [_lvl(w3, 1, 0, 0), _lvl(w3, 3, 0, 0), _lvl(w3, 4, 0, 0)])
+	var w4 := _fluid_world()
+	w4.dim_type = {"attributes": {"minecraft:gameplay/fast_lava": true}}
+	ok("lava: tick delay 10 with fast_lava, 30 without", BlockUpdates.lava_delay(w4) == 10 and BlockUpdates.lava_delay(w3) == 30)
+	w4.set_block(0, 0, 0, b.LAVA)
+	BlockUpdates.schedule(w4, Vector3i(0, 0, 0), 10)
+	w4.run(600)
+	ok("lava: 7 blocks with fast_lava (drop-off 1)", _lvl(w4, 7, 0, 0) == 7 and _lvl(w4, 8, 0, 0) == -1, "%d %d" % [_lvl(w4, 7, 0, 0), _lvl(w4, 8, 0, 0)])
+	# infinite water source
+	var w5 := _fluid_world()
+	w5.set_block(0, 0, 0, b.WATER)
+	w5.set_block(2, 0, 0, b.WATER)
+	BlockUpdates.schedule(w5, Vector3i(0, 0, 0), 5)
+	BlockUpdates.schedule(w5, Vector3i(2, 0, 0), 5)
+	w5.run(20)
+	ok("water: two sources make a third on a solid floor", _lvl(w5, 1, 0, 0) == 0)
+	# falling water
+	var w6 := _fluid_world()
+	w6.set_block(0, 5, 0, b.WATER)
+	BlockUpdates.schedule(w6, Vector3i(0, 5, 0), 5)
+	w6.run(60)
+	ok("water: falls first (level 8 below a source)", _lvl(w6, 0, 4, 0) == 8 and _lvl(w6, 0, 0, 0) == 8)
+	ok("water: a source in mid-air also spreads to its 4 sides (isSource -> spreadToSides)", _lvl(w6, 1, 5, 0) == 1 and _lvl(w6, 0, 5, -1) == 1)
+	ok("water: flowing water in mid-air only falls", _lvl(w6, 2, 5, 0) == -1)
+	# waterloggable blocks take only water sources (SimpleWaterloggedBlock.canPlaceLiquid)
+	var wl := _fluid_world()
+	var fence := b.default_state("oak_fence")
+	wl.blocks[Vector3i(1, 0, 0)] = fence
+	wl.set_block(0, 0, 0, b.WATER)
+	BlockUpdates.schedule(wl, Vector3i(0, 0, 0), 5)
+	wl.run(100)
+	ok("water: a flow passes a fence without waterlogging it (routes around: level 4 behind)", wl.state_at(1, 0, 0) == fence and _lvl(wl, 2, 0, 0) == 4, "%s %d" % [b.get_prop(wl.state_at(1, 0, 0), "waterlogged"), _lvl(wl, 2, 0, 0)])
+	var wl2 := _fluid_world()
+	var stair := b.default_state("oak_stairs")
+	wl2.blocks[Vector3i(1, 0, 0)] = stair
+	wl2.set_block(0, 0, 0, b.WATER)
+	wl2.set_block(2, 0, 0, b.WATER)
+	BlockUpdates.schedule(wl2, Vector3i(0, 0, 0), 5)
+	BlockUpdates.schedule(wl2, Vector3i(2, 0, 0), 5)
+	wl2.run(30)
+	ok("water: two sources beside a stair waterlog it (a new source)", b.get_prop(wl2.state_at(1, 0, 0), "waterlogged") == "true")
+	var wl3 := _fluid_world()
+	wl3.blocks[Vector3i(1, 0, 0)] = b.default_state("oak_door")
+	wl3.set_block(0, 0, 0, b.WATER)
+	BlockUpdates.schedule(wl3, Vector3i(0, 0, 0), 5)
+	wl3.run(40)
+	var od := b.with_prop(b.default_state("oak_door"), "open", "true")
+	ok("water: doors hold water back, open ones too (canHoldAnyFluid)", b.name_of(wl3.state_at(1, 0, 0)) == "oak_door" and BlockUpdates._can_hold(od, false) == false)
+	# lava meets water
+	var w7 := _fluid_world()
+	w7.set_block(0, 0, 0, b.LAVA)
+	w7.set_block(1, 0, 0, b.WATER)
+	BlockUpdates.schedule(w7, Vector3i(0, 0, 0), 30)
+	w7.run(40)
+	ok("lava source beside water -> obsidian", b.name_of(w7.state_at(0, 0, 0)) == "obsidian")
+	var w8 := _fluid_world()
+	w8.set_block(0, 0, 0, b.with_prop(b.LAVA, "level", "2"))
+	w8.set_block(1, 0, 0, b.WATER)
+	BlockUpdates.schedule(w8, Vector3i(0, 0, 0), 30)
+	w8.run(40)
+	ok("flowing lava beside water -> cobblestone", b.name_of(w8.state_at(0, 0, 0)) == "cobblestone")
+	# fire: odds table (FireBlock.bootStrap)
+	ok("fire odds: planks 5 / 20", BlockUpdates.ignite_odds(b.default_state("oak_planks")) == 5 and BlockUpdates.burn_odds(b.default_state("oak_planks")) == 20)
+	ok("fire odds: leaves 30 / 60, wool 30 / 60", BlockUpdates.ignite_odds(b.default_state("oak_leaves")) == 30 and BlockUpdates.burn_odds(b.default_state("white_wool")) == 60)
+	ok("fire odds: logs 5 / 5, stone 0, crimson planks 0", BlockUpdates.burn_odds(b.default_state("oak_log")) == 5 and BlockUpdates.ignite_odds(b.STONE) == 0 and BlockUpdates.ignite_odds(b.default_state("crimson_planks")) == 0)
+	ok("fire odds: waterlogged blocks never burn", BlockUpdates.ignite_odds(b.with_prop(b.default_state("oak_slab"), "waterlogged", "true")) == 0)
+	ok("fire odds: TNT 15 / 100, short grass 60 / 100", BlockUpdates.ignite_odds(b.default_state("tnt")) == 15 and BlockUpdates.burn_odds(b.default_state("short_grass")) == 100)
+	# fire survival and burn-out
+	var f1 := _fluid_world()
+	f1.set_block(0, 0, 0, b.default_state("fire"))
+	f1.run(2500)
+	ok("fire: burns out on stone without fuel", f1.state_at(0, 0, 0) == 0)
+	var f2 := _fluid_world()
+	f2.blocks[Vector3i(0, -1, 0)] = b.default_state("netherrack")
+	f2.set_block(0, 0, 0, b.default_state("fire"))
+	f2.run(2500)
+	ok("fire: burns forever on netherrack (infiniburn_overworld)", b.name_of(f2.state_at(0, 0, 0)) == "fire")
+	var f3 := _fluid_world()
+	f3.blocks[Vector3i(0, -1, 0)] = b.default_state("bedrock")
+	f3.dim_type = {"infiniburn": "#minecraft:infiniburn_end"}
+	f3.set_block(0, 0, 0, b.default_state("fire"))
+	f3.run(2500)
+	ok("fire: burns forever on bedrock in the End", b.name_of(f3.state_at(0, 0, 0)) == "fire")
+	ok("fire: no floor and no fuel -> cannot survive", not BlockUpdates.fire_can_survive(f1, Vector3i(0, 5, 0)))
+	f1.blocks[Vector3i(1, 5, 0)] = b.default_state("oak_planks")
+	ok("fire: survives in the air beside planks", BlockUpdates.fire_can_survive(f1, Vector3i(0, 5, 0)))
+	var fs := BlockUpdates.fire_state(f1, Vector3i(0, 5, 0))
+	ok("fire: side-attached to the burnable side", b.get_prop(fs, "east") == "true" and b.get_prop(fs, "west") == "false")
+	f1.blocks[Vector3i(0, 9, 0)] = b.default_state("soul_sand")
+	ok("fire: soul fire on soul sand", b.name_of(BlockUpdates.fire_state(f1, Vector3i(0, 10, 0))) == "soul_fire")
+	# fire spreads through planks and leaves
+	var f4 := _fluid_world()
+	var planks := b.default_state("oak_planks")
+	for x in range(-4, 5):
+		for z in range(-4, 5):
+			f4.blocks[Vector3i(x, 0, z)] = planks
+	f4.set_block(0, 1, 0, b.default_state("fire"))
+	f4.run(3000)
+	var left := 0
+	for x2 in range(-4, 5):
+		for z2 in range(-4, 5):
+			if f4.state_at(x2, 0, z2) == planks:
+				left += 1
+	ok("fire: spreads over a plank floor and burns it", left < 81, "%d of 81 planks left" % left)
+	var f5 := _fluid_world()
+	for x3 in range(-4, 5):
+		for z3 in range(-4, 5):
+			f5.blocks[Vector3i(x3, 0, z3)] = planks
+	f5.raining = true
+	f5.set_block(0, 1, 0, b.default_state("fire"))
+	f5.run(3000)
+	var fires := 0
+	for fp in f5.blocks:
+		if b.name_of(f5.blocks[fp]) == "fire":
+			fires += 1
+	ok("fire: rain puts it out", fires == 0, str(fires))
+
+
+func test_vanilla_structure_ports() -> void:
+	var b := Res.blocks
+	# StructureTemplate.transform with Mirror.FRONT_BACK and a pivot (Java formulas)
+	ok("template mirror: x negated", StructureTemplate.transform_m(Vector3i(2, 0, 1), 0, 1, Vector3i.ZERO) == Vector3i(-2, 0, 1))
+	ok("template mirror + cw90 about a pivot", StructureTemplate.transform_m(Vector3i(2, 0, 1), 1, 1, Vector3i(3, 0, 4)) == Vector3i(6, 0, -1))
+	ok("template 180 about a pivot", StructureTemplate.transform(Vector3i(1, 2, 1), 2, Vector3i(3, 0, 4)) == Vector3i(5, 2, 7))
+	var stairs := b.with_prop(b.default_state("stone_brick_stairs"), "facing", "east")
+	ok("mirror_state: east stairs face west", b.get_prop(StructureTemplate.mirror_state(b, stairs), "facing") == "west")
+	ok("mirror_state: north stays north", b.get_prop(StructureTemplate.mirror_state(b, b.with_prop(stairs, "facing", "north")), "facing") == "north")
+	var bars := b.with_prop(b.with_prop(b.default_state("iron_bars"), "east", "true"), "west", "false")
+	var mb := StructureTemplate.mirror_state(b, bars)
+	ok("mirror_state: east / west connections swap", b.get_prop(mb, "west") == "true" and b.get_prop(mb, "east") == "false")
+	var chest := b.with_prop(b.default_state("chest"), "type", "left")
+	ok("mirror_state: chest halves swap", b.get_prop(StructureTemplate.mirror_state(b, chest), "type") == "right")
+	# BlockAgeProcessor
+	var obs := b.default_state("obsidian")
+	var crying := 0
+	for i in 2000:
+		if b.name_of(Structures._block_age(b, obs, Vector3i(i, 64, i * 7), 0.0)) == "crying_obsidian":
+			crying += 1
+	ok("block age: obsidian -> crying obsidian ~15 %", crying > 240 and crying < 360, str(crying))
+	var mossy_kept := true
+	var changed := 0
+	for i2 in 400:
+		var st2 := b.with_prop(b.with_prop(b.default_state("stone_brick_stairs"), "facing", "south"), "half", "top")
+		var o := Structures._block_age(b, st2, Vector3i(i2, 70, -i2), 1.0)
+		if b.name_of(o) == "mossy_stone_brick_stairs":
+			changed += 1
+			mossy_kept = mossy_kept and b.get_prop(o, "facing") == "south" and b.get_prop(o, "half") == "top"
+	ok("block age: stairs become mossy keeping facing / half", changed > 50 and mossy_kept, str(changed))
+	ok("block age: cobblestone untouched (not in Java's list)", Structures._block_age(b, b.default_state("cobblestone"), Vector3i(5, 5, 5), 1.0) == b.default_state("cobblestone"))
+	var full_ok := true
+	for i3 in 200:
+		var o3 := b.name_of(Structures._block_age(b, b.default_state("stone_bricks"), Vector3i(i3, 1, 2), 0.0))
+		full_ok = full_ok and o3 in ["stone_bricks", "cracked_stone_bricks", "stone_brick_stairs"]
+	ok("block age: stone bricks -> cracked / stairs without moss", full_ok)
+	# BlackstoneReplaceProcessor
+	var bs_st := Structures._blackstone(b, b.with_prop(b.with_prop(b.default_state("stone_brick_stairs"), "facing", "south"), "half", "top"))
+	ok("blackstone: stairs keep their properties", b.name_of(bs_st) == "polished_blackstone_brick_stairs" and b.get_prop(bs_st, "facing") == "south" and b.get_prop(bs_st, "half") == "top")
+	ok("blackstone: cobblestone -> blackstone", b.name_of(Structures._blackstone(b, b.default_state("cobblestone"))) == "blackstone")
+	ok("blackstone: iron bars -> chain", b.name_of(Structures._blackstone(b, b.default_state("iron_bars"))).ends_with("chain"))
+	ok("blackstone: obsidian untouched", Structures._blackstone(b, obs) == obs)
+	# Java StructurePiece orientation (getWorldX / Z, setOrientation state transforms)
+	var jp := JavaPieces.P.new()
+	jp.b = b
+	jp.bmin = Vector3i(100, 64, 200)
+	jp.bmax = Vector3i(106, 70, 208)
+	jp.ori = "north"
+	ok("piece north: x = min x + x, z = max z - z", jp.wpos(1, 2, 3) == Vector3i(101, 66, 205))
+	jp.ori = "south"
+	ok("piece south: z = min z + z", jp.wpos(1, 2, 3) == Vector3i(101, 66, 203))
+	jp.bmax = Vector3i(108, 70, 206)
+	jp.ori = "west"
+	ok("piece west: x = max x - z, z = min z + x", jp.wpos(1, 2, 3) == Vector3i(105, 66, 201))
+	jp.ori = "east"
+	ok("piece east: x = min x + z", jp.wpos(1, 2, 3) == Vector3i(103, 66, 201))
+	var nst := b.with_prop(b.default_state("oak_stairs"), "facing", "north")
+	jp.ori = "south"
+	ok("piece south mirrors north stairs to south (Mirror.LEFT_RIGHT)", b.get_prop(jp.orient(nst), "facing") == "south")
+	jp.ori = "east"
+	ok("piece east turns north stairs east (CW90)", b.get_prop(jp.orient(nst), "facing") == "east")
+	jp.ori = "west"
+	ok("piece west: mirror then CW90 (north -> south -> west)", b.get_prop(jp.orient(nst), "facing") == "west")
+	ok("mirror_z: chest-less north / south connections swap", b.get_prop(JavaPieces.mirror_z(b, b.with_prop(b.default_state("oak_fence"), "north", "true")), "south") == "true")
+	# maps (MapItemSavedData.createFresh / scaled / locked)
+	var mw := CmdWorld.new()
+	var m0 := Maps.new_map(mw, 100.0, -100.0)
+	var mi0 := Maps.info(mw, m0)
+	ok("map centre on the 128 grid", int(mi0["x"]) == 128 and int(mi0["z"]) == -128 and int(mi0["scale"]) == 0, str(mi0))
+	var m1 := Maps.scaled_copy(mw, m0)
+	var mi1 := Maps.info(mw, m1)
+	ok("zoomed-out map: scale 1 on the 256 grid", int(mi1["scale"]) == 1 and int(mi1["x"]) == 64 and int(mi1["z"]) == -192, str(mi1))
+	ok("zoomed-out map is a new map id", Maps.map_id(m1) != Maps.map_id(m0))
+	var m2 := Maps.locked_copy(mw, m0)
+	ok("locked copy: new id, locked, same centre", Maps.map_id(m2) != Maps.map_id(m0) and bool(Maps.info(mw, m2).get("locked", false)) and int(Maps.info(mw, m2)["x"]) == 128)
+	var m4 := m1
+	for zi in 4:
+		m4 = Maps.scaled_copy(mw, m4)
+	ok("maps stop at scale 4", int(Maps.info(mw, m4)["scale"]) == 4)
+	# NetherFortressPieces: orientBox, generation invariants (Java generatePieces / moveInsideHeights)
+	ok("orientBox south", JavaPieces.orient_box(10, 64, 20, -1, -3, 0, 5, 10, 19, "south") == [Vector3i(9, 61, 20), Vector3i(13, 70, 38)])
+	ok("orientBox north", JavaPieces.orient_box(10, 64, 20, -1, -3, 0, 5, 10, 19, "north") == [Vector3i(9, 61, 2), Vector3i(13, 70, 20)])
+	ok("orientBox west", JavaPieces.orient_box(10, 64, 20, -1, -3, 0, 5, 10, 19, "west") == [Vector3i(-8, 61, 19), Vector3i(10, 70, 23)])
+	ok("orientBox east", JavaPieces.orient_box(10, 64, 20, -1, -3, 0, 5, 10, 19, "east") == [Vector3i(10, 61, 19), Vector3i(28, 70, 23)])
+	var nf_ok := true
+	var nf_msg := ""
+	var kinds_seen := {}
+	for fs in [Vector2i(3, -7), Vector2i(-17, -8), Vector2i(40, 12)]:
+		var fr := Structures.large_feature_seed(12345, fs.x, fs.y)
+		var fres := JavaPieces.fortress(null, fs, fr)
+		var fps: Array = fres["pieces"]
+		var counts := {}
+		var fmin := 1 << 30
+		var fmax := -(1 << 30)
+		for i in fps.size():
+			var a: Dictionary = fps[i]["el"]
+			counts[a["k"]] = int(counts.get(a["k"], 0)) + 1
+			kinds_seen[a["k"]] = true
+			fmin = mini(fmin, a["min"].y)
+			fmax = maxi(fmax, a["max"].y)
+			for j in range(i + 1, fps.size()):
+				var bb: Dictionary = fps[j]["el"]
+				if a["max"].x >= bb["min"].x and a["min"].x <= bb["max"].x and a["max"].y >= bb["min"].y and a["min"].y <= bb["max"].y and a["max"].z >= bb["min"].z and a["min"].z <= bb["max"].z:
+					nf_ok = false
+					nf_msg = "overlap %s %s" % [a["k"], bb["k"]]
+		var st0: Dictionary = fps[0]["el"]
+		if st0["k"] != "crossing" or st0["min"].x != fs.x * 16 + 2 or st0["min"].z != fs.y * 16 + 2 or st0["max"] - st0["min"] != Vector3i(18, 9, 18):
+			nf_ok = false
+			nf_msg = "start piece %s" % str(st0)
+		if int(counts.get("entrance", 0)) > 1 or int(counts.get("throne", 0)) > 2 or int(counts.get("c_stalk", 0)) > 2 or int(counts.get("crossing", 0)) > 5 or int(counts.get("c_balcony", 0)) > 2:
+			nf_ok = false
+			nf_msg = "piece limits %s" % str(counts)
+		if fmin < 48 or (fmax - fmin < 22 and fmax > 70):
+			nf_ok = false
+			nf_msg = "height %d..%d" % [fmin, fmax]
+		var again := JavaPieces.fortress(null, fs, Structures.large_feature_seed(12345, fs.x, fs.y))
+		if (again["pieces"] as Array).size() != fps.size():
+			nf_ok = false
+			nf_msg = "not deterministic"
+	ok("fortress: start crossing, no overlaps, piece limits, 48..70 band, deterministic", nf_ok, nf_msg)
+	ok("fortress: bridge and castle pieces both occur", kinds_seen.has("straight") and kinds_seen.has("c_corridor") and kinds_seen.has("end"), str(kinds_seen.keys()))
+	# StrongholdPieces: spiral stairs start, five-way crossing forced next, a portal room, no overlaps, below sea - 10
+	var sh_ok := true
+	var sh_msg := ""
+	for shc in [Vector2i(-40, 25), Vector2i(70, -3)]:
+		var shr := JavaPieces.stronghold_for(12345, 63, -64, shc)
+		var sps: Array = shr["pieces"]
+		var portals := 0
+		var top := -(1 << 30)
+		for i in sps.size():
+			var a: Dictionary = sps[i]["el"]
+			if a["k"] == "portal_room":
+				portals += 1
+			top = maxi(top, a["max"].y)
+			for j in range(i + 1, sps.size()):
+				var bb: Dictionary = sps[j]["el"]
+				if a["k"] == "filler" or bb["k"] == "filler":
+					continue   # FillerCorridor ends one block inside the piece it reaches (the doorway it punches)
+				if a["max"].x >= bb["min"].x and a["min"].x <= bb["max"].x and a["max"].y >= bb["min"].y and a["min"].y <= bb["max"].y and a["max"].z >= bb["min"].z and a["min"].z <= bb["max"].z:
+					sh_ok = false
+					sh_msg = "overlap %s %s" % [a["k"], bb["k"]]
+		var s0: Dictionary = sps[0]["el"]
+		if s0["k"] != "stairs_down" or s0["min"].x != shc.x * 16 + 2 or s0["max"] - s0["min"] != Vector3i(4, 10, 4):
+			sh_ok = false
+			sh_msg = "start %s" % str(s0)
+		if sps.size() < 2 or sps[1]["el"]["k"] != "five_crossing":
+			sh_ok = false
+			sh_msg = "second piece %s" % str(sps[1]["el"]["k"] if sps.size() > 1 else "-")
+		if portals != 1 or top > 53:
+			sh_ok = false
+			sh_msg = "portals %d top %d" % [portals, top]
+	ok("stronghold: stairs start, five-way crossing next, one portal room, no overlaps, top <= sea - 10", sh_ok, sh_msg)	# OceanMonumentPieces: building, entry + core rooms, every grid room fitted once, two wings + penthouse
+	var mo_ok := true
+	var mo_msg := ""
+	for msc in [Vector2i(8, -371), Vector2i(-245, -400), Vector2i(107, -336)]:
+		var mres := JavaPieces.monument_layout(msc, Structures.large_feature_seed(12345, msc.x, msc.y))
+		var mps: Array = mres["pieces"]
+		var kc := {}
+		var bld: Dictionary = mps[0]["el"]
+		for mp in mps:
+			var me: Dictionary = mp["el"]
+			kc[me["k"]] = int(kc.get(me["k"], 0)) + 1
+			if me["min"].x < bld["min"].x or me["max"].x > bld["max"].x or me["min"].z < bld["min"].z or me["max"].z > bld["max"].z:
+				mo_ok = false
+				mo_msg = "%s outside the building" % me["k"]
+		if bld["k"] != "building" or bld["min"] != Vector3i(msc.x * 16 - 29, 39, msc.y * 16 - 29) or bld["max"] - bld["min"] != Vector3i(57, 22, 57):
+			mo_ok = false
+			mo_msg = "building %s" % str(bld)
+		if kc.get("entry", 0) != 1 or kc.get("core", 0) != 1 or kc.get("wing", 0) != 2 or kc.get("penthouse", 0) != 1:
+			mo_ok = false
+			mo_msg = "kinds %s" % str(kc)
+		# room cells covered: 20 + 20 + 6 grid rooms = 46 cells, each fitted exactly once
+		var cells := 0
+		var sizes := {"entry": 1, "core": 8, "simple": 1, "simple_top": 1, "double_x": 2, "double_y": 2, "double_z": 2, "double_xy": 4, "double_yz": 4}
+		for k2 in kc:
+			cells += int(sizes.get(k2, 0)) * int(kc[k2])
+		if cells != 46:
+			mo_ok = false
+			mo_msg = "cells %d %s" % [cells, str(kc)]
+	ok("monument: building box, entry / core / wings / penthouse, all 46 grid cells fitted once", mo_ok, mo_msg)	# StructurePiece SHAPE_CHECK_BLOCKS: fences / bars get their connections after generation
+	# WoodlandMansionPieces: MansionGrid invariants (entrance, blocked rows, every room cell owned by a room with one
+	# origin cell, one third-floor staircase pair or a blocked third floor), placer output, LEFT_RIGHT state mirror
+	var wm_ok := true
+	var wm_msg := ""
+	for wseed in [1, 42, 12345, 987654321, -77]:
+		var mg := MansionPieces.MGrid.new(RandomSources.LegacyRandom.new(wseed))
+		var gb: MansionPieces.Grid = mg.base
+		if gb.at(7, 4) != 3 or gb.at(8, 5) != 3 or gb.at(3, 0) != 5 or gb.at(3, 10) != 5 or gb.at(9, 3) != 5:
+			wm_ok = false
+			wm_msg = "base grid entrance / blocked rows (seed %d)" % wseed
+		for fl in 2:
+			var rg: MansionPieces.Grid = mg.rooms[fl]
+			var origins := {}
+			for y in 11:
+				for x in 11:
+					if gb.at(x, y) == 2:
+						var q := rg.at(x, y)
+						if (q & MansionPieces.ID_MASK) < 10 or (q & MansionPieces.TYPE_MASK) == 0:
+							wm_ok = false
+							wm_msg = "room cell %d,%d floor %d without a room (seed %d)" % [x, y, fl, wseed]
+						if (q & MansionPieces.ORIGIN_FLAG) != 0:
+							origins[q & MansionPieces.ID_MASK] = int(origins.get(q & MansionPieces.ID_MASK, 0)) + 1
+			for id in origins:
+				if int(origins[id]) != 1:
+					wm_ok = false
+					wm_msg = "room %d has %d origin cells (seed %d)" % [id, origins[id], wseed]
+		var starts := 0
+		var blocked := 0
+		for y in 11:
+			for x in 11:
+				starts += int(mg.third.at(x, y) == 3)
+				blocked += int(mg.third.at(x, y) == 5)
+		if not (starts == 2 or blocked == 121):
+			wm_ok = false
+			wm_msg = "third floor: %d staircase cells, %d blocked (seed %d)" % [starts, blocked, wseed]
+		var pl := MansionPieces.new()
+		pl.r = RandomSources.LegacyRandom.new(wseed + 1)
+		pl.create(Vector3i(100, 70, 200), wseed & 3, mg)
+		var ent := 0
+		for pc in pl.pieces:
+			ent += int(str(pc["el"]["loc"]) == "woodland_mansion/entrance")
+		if ent != 1 or pl.pieces.size() < 60:
+			wm_ok = false
+			wm_msg = "placer: %d entrances, %d pieces (seed %d)" % [ent, pl.pieces.size(), wseed]
+	ok("mansion: grid entrance / rooms / origins / third floor, placer entrance + pieces", wm_ok, wm_msg)
+	var nst2 := b.with_prop(b.default_state("dark_oak_stairs"), "facing", "north")
+	ok("mirror LEFT_RIGHT: north stairs face south, east stays east", b.get_prop(StructureTemplate.mirror_state(b, nst2, 2), "facing") == "south" and b.get_prop(StructureTemplate.mirror_state(b, b.with_prop(nst2, "facing", "east"), 2), "facing") == "east")
+	ok("mirror: door hinge swaps (both modes)", b.get_prop(StructureTemplate.mirror_state(b, b.with_prop(b.default_state("dark_oak_door"), "hinge", "left"), 2), "hinge") == "right" and b.get_prop(StructureTemplate.mirror_state(b, b.with_prop(b.default_state("dark_oak_door"), "hinge", "left"), 1), "hinge") == "right")
+	ok("mirror LEFT_RIGHT: z negated", StructureTemplate.transform_m(Vector3i(2, 0, 1), 0, 2, Vector3i.ZERO) == Vector3i(2, 0, -1))
+	ok("shape check: nether brick fence, oak fence, iron bars; not stone", JavaPieces.shape_check(b, b.default_state("nether_brick_fence")) and JavaPieces.shape_check(b, b.default_state("oak_fence")) and JavaPieces.shape_check(b, b.default_state("iron_bars")) and not JavaPieces.shape_check(b, b.default_state("stone")))	# MapItemSavedData decorations: banner toggle (inside the map, same banner twice removes), frame marker facing
+	var bw := CmdWorld.new()
+	var bm := Maps.new_map(bw, 0.0, 0.0)
+	var bmid := Maps.map_id(bm)
+	bw.set_block(10, 64, -20, Res.blocks.default_state("red_banner"))
+	ok("map banner: toggling a banner adds its marker", Maps.toggle_banner(bw, bm, Vector3i(10, 64, -20)) and Maps.decorations(bw, bmid).size() == 1)
+	var bd: Array = Maps.decorations(bw, bmid)[0]
+	ok("map banner: red banner sprite, map coords (int)(2f + 0.5) toward zero, turned 180", bd[0] == "map/decorations/red_banner" and int(bd[1]) == 21 and int(bd[2]) == -38 and int(bd[3]) == 8, str(bd))
+	ok("map banner: toggling again removes it", Maps.toggle_banner(bw, bm, Vector3i(10, 64, -20)) and Maps.decorations(bw, bmid).is_empty())
+	bw.set_block(200, 64, 0, Res.blocks.default_state("blue_banner"))
+	ok("map banner: outside the map area does nothing", not Maps.toggle_banner(bw, bm, Vector3i(200, 64, 0)))
+	ok("map banner: not a banner does nothing", not Maps.toggle_banner(bw, bm, Vector3i(0, 64, 0)))
+	Maps.frame_added(bw, Vector3i(5, 70, 5), Vector3i(1, 0, 0), bm)
+	var fdec: Array = Maps.decorations(bw, bmid)
+	ok("map frame marker: east-facing frame -> rot 12, frame sprite, not on frames", fdec.size() == 1 and fdec[0][0] == "map/decorations/frame" and int(fdec[0][3]) == 12 and not bool(fdec[0][5]), str(fdec))
+	var rv0 := Maps.rev(bw, bmid)
+	Maps.frame_added(bw, Vector3i(5, 70, 5), Vector3i(1, 0, 0), bm)
+	ok("map frame marker: re-adding the same frame changes nothing", Maps.rev(bw, bmid) == rv0)
+	Maps.frame_removed(bw, Vector3i(5, 70, 5), bm)
+	ok("map frame marker: removed with the map", Maps.decorations(bw, bmid).is_empty())	# Crafter (CrafterBlockEntity / CrafterBlock): disabled slots, hopper filling, comparator, recipe preview
+	var cd := {"id": "crafter", "items": []}
+	Crafter.set_disabled(cd, 4, true)
+	ok("crafter: slot 4 disabled, others enabled", Crafter.disabled(cd, 4) and not Crafter.disabled(cd, 0))
+	var filled := 0
+	for k in 16:
+		if Crafter.insert_one(cd, ItemStack.named("oak_log", 1)):
+			filled += 1
+	var counts: Array = []
+	for k2 in 9:
+		counts.append(ItemStack.from_dict(cd["items"][k2]).count)
+	ok("crafter: hoppers fill the enabled slots evenly, never the disabled one", filled == 16 and counts[4] == 0 and counts.max() == 2 and counts.min() == 0 and counts.count(2) == 8, str(counts))
+	ok("crafter: comparator counts filled + disabled slots", Crafter.signal_strength(cd) == 9)
+	var g1: Array = []
+	for k3 in 9:
+		g1.append(ItemStack.named("oak_log", 1) if k3 == 4 else ItemStack.new())
+	var r1 := Crafter.result(g1)
+	ok("crafter: one log anywhere crafts 4 oak planks", r1.name() == "oak_planks" and r1.count == 4, r1.name() + " x" + str(r1.count))
+	var g2: Array = []
+	for k4 in 9:
+		g2.append(ItemStack.new())
+	ok("crafter: an empty grid has no result", Crafter.result(g2).is_empty())
+	Crafter.set_disabled(cd, 4, false)
+	ok("crafter: re-enabling a slot", not Crafter.disabled(cd, 4) and Crafter.signal_strength(cd) == 8)	# Java session.lock: a world held by another running process is neither opened nor deleted; stale locks are taken
+	var lkdir := SaveManager.ROOT.path_join("__locktest__")
+	DirAccess.make_dir_recursive_absolute(lkdir)
+	var other_pid := OS.create_process("ping", ["-n", "8", "127.0.0.1"])   # a running process that is not this one
+	var lkf := FileAccess.open(lkdir.path_join("session.lock"), FileAccess.WRITE)
+	lkf.store_string(str(other_pid))
+	lkf.close()
+	ok("session lock: a world locked by a running process is refused", not SaveManager.lock_world("__locktest__"))
+	ok("session lock: and cannot be deleted", not SaveManager.delete_world("__locktest__") and DirAccess.dir_exists_absolute(lkdir))
+	lkf = FileAccess.open(lkdir.path_join("session.lock"), FileAccess.WRITE)
+	lkf.store_string("987654321")   # no such process: stale
+	lkf.close()
+	ok("session lock: a stale lock is taken over", SaveManager.lock_world("__locktest__") and FileAccess.get_file_as_string(lkdir.path_join("session.lock")) == str(OS.get_process_id()))
+	if other_pid > 0:
+		OS.kill(other_pid)
+	SaveManager.unlock_world("__locktest__")
+	ok("session lock: released on leaving", not FileAccess.file_exists(lkdir.path_join("session.lock")))
+	SaveManager.delete_world("__locktest__")	# Nether coordinate scale
+	ok("nether portal target: x / 8 floored", Portals.scaled_target("overworld", "the_nether", Vector3(800.0, 70.0, -801.0)) == Vector3(100.0, 70.0, -101.0))
+	ok("nether portal target: x * 8 back", Portals.scaled_target("the_nether", "overworld", Vector3(100.5, 70.0, -101.0)) == Vector3(804.0, 70.0, -808.0))
+	# End crystal / dragon rigs
+	for i4 in 200:
+		var gy := EntityManager._crystal_y(i4 * 0.37)
+		if gy < -1.4001 or gy > -0.5999:
+			ok("end crystal bob in [-1.4, -0.6]", false, str(gy))
+			break
+		if i4 == 199:
+			ok("end crystal bob in [-1.4, -0.6]", true)
+	var dr := MobRigs.rig("ender_dragon")
+	ok("dragon rig: 37 Java parts", (dr.get("parts", []) as Array).size() == 37, str((dr.get("parts", []) as Array).size()))
+	ok("dragon rig: wings / legs hang off the torso", str((dr.get("nest", {}) as Dictionary).get("left_wing", "")) == "torso" and str((dr.get("nest", {}) as Dictionary).get("right_hind_foot", "")) == "right_hind_leg_tip")
+	ok("end crystal rig: base, 2 glass, cube", (MobRigs.rig("end_crystal").get("parts", []) as Array).size() == 4)
+	var built := EntityRenderer.build_rig(MobRegistry.get_def("ender_dragon"))
+	var m := built.get_node_or_null("model")
+	ok("dragon model builds with nested parts", m != null and m.find_child("left_front_foot", true, false) != null and m.find_child("jaw", true, false).get_parent().name == "head")
+	built.free()

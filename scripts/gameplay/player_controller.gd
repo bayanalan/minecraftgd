@@ -289,9 +289,7 @@ func _travel_elytra(gs: Callable, blocks: BlockRegistry) -> void:
 	vel *= Vector3(0.99, 0.98, 0.99)
 	if rocket_ticks > 0:
 		rocket_ticks -= 1
-		vel += look * 0.1 + (look * 1.5 - vel) * 0.5
-		if rocket_ticks % 2 == 0:
-			Particles.emit("firework", pos - look * 0.5, Vector3(randf_range(-0.05, 0.05), -0.05, randf_range(-0.05, 0.05)), Color.WHITE)
+		vel += look * 0.1 + (look * 1.5 - vel) * 0.5   # sparks: the attached rocket entity
 	var before := Vector2(vel.x, vel.z).length()
 	_move(vel, gs, blocks, 0.6)
 	if hcollide:
@@ -532,7 +530,10 @@ func _survival_tick(w, gs: Callable, blocks: BlockRegistry) -> void:
 	if eyes_in_water and _effect_amp("water_breathing") == 0:
 		air -= 1
 		if air <= -20:
+			# Java LivingEntity.baseTick: 8 bubbles around the body with the entity's motion, then 2 drowning damage
 			air = 0
+			for bi in 8:
+				Particles.emit("bubble", pos + Vector3(randf() - randf(), randf() - randf(), randf() - randf()), vel)
 			hurt(2.0, "drown")
 	else:
 		air = mini(300, air + 4)

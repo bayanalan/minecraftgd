@@ -31,6 +31,12 @@ static func reset() -> void:
 	_rt_hi = 0
 
 
+## Java LavaFluid.getTickDelay: 10 where lava is fast (dimension attribute minecraft:gameplay/fast_lava: the Nether), else 30.
+static func lava_delay(world) -> int:
+	var at = world.dim_type.get("attributes", {}) if world.dim_type is Dictionary else {}
+	return 10 if at is Dictionary and bool((at as Dictionary).get("minecraft:gameplay/fast_lava", false)) else 30
+
+
 static func schedule(world, p: Vector3i, delay: int) -> void:
 	var due: int = world.game_time + maxi(1, delay)
 	if pending.has(p) and int(pending[p]) <= due:
@@ -48,8 +54,16 @@ static func schedule_neighbors(world, p: Vector3i) -> void:
 		if st <= 0:
 			continue
 		var fl := Res.blocks.st_flags[st]
-		if fl & (BlockRegistry.F_LIQUID | BlockRegistry.F_WATERLOGGED):
-			schedule(world, q, 30 if fl & BlockRegistry.F_LAVA else 5)
+		if fl & BlockRegistry.F_LIQUID:
+			# only the fluid's own tick delay (water is non-colliding too: the generic 1-tick update below made flows
+			# advance every tick wherever neighbour updates fired)
+			schedule(world, q, lava_delay(world) if fl & BlockRegistry.F_LAVA else 5)
+			continue
+		if fl & BlockRegistry.F_WATERLOGGED:
+			schedule(world, q, 5)
+		if Res.blocks.st_block[st] == _fire_id():
+			fire_update_shape(world, q, st)   # FireBlock.updateShape: survive check now, its own tick keeps going
+			continue
 		if fl & (BlockRegistry.F_GRAVITY):
 			schedule(world, q, 2)
 		elif (fl & BlockRegistry.F_COLLIDE) == 0 or fl & BlockRegistry.F_MODEL:
@@ -102,12 +116,15 @@ static func _scheduled(world, p: Vector3i) -> void:
 		_fluid(world, p, st)
 		return
 	if fl & BlockRegistry.F_WATERLOGGED:
-		_spread_from(world, p, true, 1, false)
+		_spread_java(world, p, st, false)   # a waterlogged block spreads as a water source
 	if fl & BlockRegistry.F_GRAVITY and name != "scaffolding" and name != "pointed_dripstone":
 		var below: int = world.state_at(p.x, p.y - 1, p.z)
 		if below == 0 or (below > 0 and (blocks.st_flags[below] & (BlockRegistry.F_REPLACEABLE | BlockRegistry.F_LIQUID))):
 			world.set_block(p.x, p.y, p.z, 0)
 			world.entities.spawn_falling_block(p, st)
+		return
+	if blocks.st_block[st] == _fire_id():
+		fire_tick(world, p, st)
 		return
 	if Redstone.scheduled(world, p, st):
 		return
@@ -137,6 +154,9 @@ static func _has_support(world, p: Vector3i, st: int) -> bool:
 	var bname := blocks.name_of(maxi(below, 0))
 	if name in ["short_grass", "fern", "dandelion", "poppy", "tall_grass", "large_fern", "dead_bush", "sweet_berry_bush"] or name.ends_with("_tulip") or name.ends_with("_sapling") or name in ["allium", "azure_bluet", "oxeye_daisy", "cornflower", "lily_of_the_valley", "blue_orchid"]:
 		return below > 0 and (bname in ["grass_block", "dirt", "podzol", "coarse_dirt", "farmland", "moss_block", "mud", "rooted_dirt", "mycelium", "sand", "red_sand", "terracotta"] or bname == name and blocks.has_prop(st, "half"))
+	if name in ["crimson_roots", "warped_roots", "nether_sprouts", "crimson_fungus", "warped_fungus"]:
+		# Java RootsBlock / NetherSproutsBlock / FungusBlock.mayPlaceOn: #nylium, soul soil, #dirt (mycelium), farmland
+		return below > 0 and bname in ["crimson_nylium", "warped_nylium", "soul_soil", "grass_block", "dirt", "podzol", "coarse_dirt", "farmland", "moss_block", "mud", "rooted_dirt", "mycelium", "muddy_mangrove_roots", "pale_moss_block"]
 	if name in ["wheat", "carrots", "potatoes", "beetroots"] or name.ends_with("_stem"):
 		return bname == "farmland"
 	if name == "torch" or name == "redstone_torch" or name == "soul_torch" or name.ends_with("_carpet") or name.ends_with("_pressure_plate") or name == "redstone_wire" or name.ends_with("rail") or name == "snow":
@@ -176,63 +196,263 @@ static func _same_fluid(st: int, lava: bool) -> bool:
 	return (fl & (BlockRegistry.F_LIQUID | BlockRegistry.F_WATERLOGGED)) != 0 and (fl & BlockRegistry.F_LAVA) == 0
 
 
+## Java FlowingFluid.tick / spread / getSpread / getNewLiquid / getSlopeDistance for water and lava. Fluid states:
+## liquid blocks (level 0 source, 1..7 flowing with amount 8 - level, >= 8 falling with amount 8) and waterlogged
+## blocks (a water source). Horizontal order N, E, S, W (Direction.Plane.HORIZONTAL).
+const HDIRS := [Vector3i(0, 0, -1), Vector3i(1, 0, 0), Vector3i(0, 0, 1), Vector3i(-1, 0, 0)]
+
+
+static func _is_this(st: int, lava: bool) -> bool:
+	return _same_fluid(st, lava)
+
+
+static func _is_source_this(st: int, lava: bool) -> bool:
+	if not _same_fluid(st, lava):
+		return false
+	var fl := Res.blocks.st_flags[st]
+	return (fl & BlockRegistry.F_WATERLOGGED) != 0 or Res.blocks.st_level[st] == 0
+
+
+static func _fluid_amount(st: int) -> int:
+	if st <= 0:
+		return 0
+	var fl := Res.blocks.st_flags[st]
+	if fl & BlockRegistry.F_WATERLOGGED:
+		return 8
+	if fl & BlockRegistry.F_LIQUID:
+		return _amount(st)
+	return 0
+
+
+static func _falling(st: int) -> bool:
+	return st > 0 and (Res.blocks.st_flags[st] & BlockRegistry.F_LIQUID) != 0 and Res.blocks.st_level[st] >= 8
+
+
+## FlowingFluid.canHoldAnyFluid: liquid containers (waterloggable blocks) and non-motion-blocking blocks except doors,
+## signs, ladders, sugar cane, bubble columns, portals, gateways, structure voids.
+static func _can_hold(st: int, _lava: bool) -> bool:
+	if st == 0:
+		return true
+	var b := Res.blocks
+	if b.has_prop(st, "waterlogged"):
+		return true   # LiquidBlockContainer
+	var fl := b.st_flags[st]
+	if fl & BlockRegistry.F_LIQUID:
+		return true
+	if fl & BlockRegistry.F_COLLIDE:
+		return false   # blocksMotion
+	var nm := b.name_of(st)
+	if nm.ends_with("_door") or nm == "ladder" or nm.ends_with("_sign") or nm == "sugar_cane" or nm == "bubble_column" or nm == "nether_portal" or nm == "end_portal" or nm == "end_gateway" or nm == "structure_void":
+		return false
+	return true
+
+
+## FlowingFluid.canHoldSpecificFluid for the fluid about to go there: a waterloggable block takes only a water SOURCE
+## (SimpleWaterloggedBlock.canPlaceLiquid: fluid == Fluids.WATER) - flowing water passes stairs / fences / slabs by.
+static func _can_hold_specific(st: int, lava: bool, source: bool) -> bool:
+	if st > 0 and Res.blocks.has_prop(st, "waterlogged"):
+		return not lava and source and Res.blocks.get_prop(st, "waterlogged") == "false"
+	return _can_hold(st, lava)
+
+
+## FlowingFluid.canPassThroughWall, simplified: a full collision cube on either side blocks the face.
+static func _wall_ok(st: int) -> bool:
+	return st <= 0 or (Res.blocks.st_flags[st] & (BlockRegistry.F_FULL_SHAPE | BlockRegistry.F_COLLIDE)) != (BlockRegistry.F_FULL_SHAPE | BlockRegistry.F_COLLIDE)
+
+
+static func _flowing_state(lava: bool, amount: int, falling: bool) -> int:
+	var src := Res.blocks.LAVA if lava else Res.blocks.WATER
+	return Res.blocks.with_prop(src, "level", str(8 if falling else 8 - amount))
+
+
+static func _drop_off(world, lava: bool) -> int:
+	return (1 if lava_delay(world) == 10 else 2) if lava else 1
+
+
+## FlowingFluid.getNewLiquid: the fluid state this position should hold (0 = empty).
+static func _new_liquid(world, p: Vector3i, lava: bool) -> int:
+	var maxa := 0
+	var sources := 0
+	for d in HDIRS:
+		var q: Vector3i = p + d
+		var ns: int = world.state_at(q.x, q.y, q.z)
+		if _is_this(ns, lava) and _wall_ok(ns):
+			if _is_source_this(ns, lava):
+				sources += 1
+			maxa = maxi(maxa, _fluid_amount(ns))
+	if sources >= 2 and not lava and world.gamerule("waterSourceConversion", true):
+		var below: int = world.state_at(p.x, p.y - 1, p.z)
+		if (below > 0 and (Res.blocks.st_flags[below] & BlockRegistry.F_SOLID) != 0) or _is_source_this(below, lava):
+			return Res.blocks.WATER
+	if sources >= 2 and lava and world.gamerule("lavaSourceConversion", false):
+		var below2: int = world.state_at(p.x, p.y - 1, p.z)
+		if (below2 > 0 and (Res.blocks.st_flags[below2] & BlockRegistry.F_SOLID) != 0) or _is_source_this(below2, lava):
+			return Res.blocks.LAVA
+	var above: int = world.state_at(p.x, p.y + 1, p.z)
+	if _is_this(above, lava) and _wall_ok(above):
+		return _flowing_state(lava, 8, true)
+	var k := maxa - _drop_off(world, lava)
+	return 0 if k <= 0 else _flowing_state(lava, k, false)
+
+
 static func _fluid(world, p: Vector3i, st: int) -> void:
 	var blocks := Res.blocks
 	var lava := (blocks.st_flags[st] & BlockRegistry.F_LAVA) != 0
-	var drop := 2 if lava else 1
-	var lv := blocks.st_level[st]
-	var is_source := lv == 0
-	var src := blocks.LAVA if lava else blocks.WATER
-	# lava/water interactions
+	var is_source := blocks.st_level[st] == 0
+	# lava / water reactions (LiquidBlock.shouldSpreadLiquid on lava: obsidian from a source, else cobblestone)
 	if lava:
-		for d in [Vector3i(0, 1, 0), Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
+		for d in [Vector3i(0, 1, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(1, 0, 0)]:
 			var q: Vector3i = p + d
 			if _same_fluid(world.state_at(q.x, q.y, q.z), false):
 				world.set_block(p.x, p.y, p.z, blocks.default_state("obsidian" if is_source else "cobblestone"))
 				Audio.play("block.lava.extinguish", Vector3(p), "Blocks")
 				return
 	if not is_source:
-		var above: int = world.state_at(p.x, p.y + 1, p.z)
-		var best := 0
-		var sources := 0
-		if _same_fluid(above, lava):
-			best = 8
-		for d in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
-			var q: Vector3i = p + d
-			var ns: int = world.state_at(q.x, q.y, q.z)
-			if _same_fluid(ns, lava):
-				var a := _amount(ns) - drop
-				if (Res.blocks.st_flags[ns] & BlockRegistry.F_LIQUID) and Res.blocks.st_level[ns] == 0:
-					sources += 1
-					a = 8 - drop
-				elif Res.blocks.st_flags[ns] & BlockRegistry.F_WATERLOGGED:
-					sources += 1
-					a = 8 - drop
-				best = maxi(best, a)
-		var below: int = world.state_at(p.x, p.y - 1, p.z)
-		if not lava and sources >= 2 and world.gamerule("waterSourceConversion", true) and (below > 0 and ((blocks.st_flags[below] & BlockRegistry.F_COLLIDE) or (_same_fluid(below, false) and blocks.st_level[below] == 0))):
-			world.set_block(p.x, p.y, p.z, src)
+		var nl := _new_liquid(world, p, lava)
+		var delay := _spread_delay(world, lava, st, nl)
+		if nl == 0:
+			world.set_block(p.x, p.y, p.z, 0)
 			schedule_neighbors(world, p)
 			return
-		var new_state := 0
-		if best >= 8 and _same_fluid(above, lava):
-			new_state = blocks.with_prop(src, "level", "8")
-		elif best > 0:
-			new_state = blocks.with_prop(src, "level", str(8 - best))
-		if new_state != st:
-			world.set_block(p.x, p.y, p.z, new_state)
+		if nl != st:
+			world.set_block(p.x, p.y, p.z, nl)
+			schedule(world, p, delay)
 			schedule_neighbors(world, p)
-			if new_state == 0:
+			st = nl
+	_spread_java(world, p, st, lava)
+
+
+## LavaFluid.getSpreadDelay: x4 (3 in 4) when a non-falling flow rises; water: 5.
+static func _spread_delay(world, lava: bool, cur: int, nl: int) -> int:
+	if not lava:
+		return 5
+	var i := lava_delay(world)
+	if cur > 0 and nl > 0 and not _falling(cur) and not _falling(nl) and _fluid_amount(nl) > _fluid_amount(cur) and _rt_rng.randi_range(0, 3) != 0:
+		i *= 4
+	return i
+
+
+## FlowingFluid.spread: down first, then sideways (sources, or flows not standing over a hole).
+static func _spread_java(world, p: Vector3i, st: int, lava: bool) -> void:
+	var below_p := p + Vector3i(0, -1, 0)
+	var below: int = world.state_at(below_p.x, below_p.y, below_p.z)
+	if below >= 0 and not _is_source_this(below, lava) and _can_hold(below, lava) and _wall_ok(below):
+		var nb := _new_liquid(world, below_p, lava)
+		# FluidState.canBeReplacedWith(.., DOWN) of what is below: empty / non-fluid yes; the same fluid never (it
+		# updates itself on its own tick); water under falling lava turns to stone (LavaFluid.spreadTo); lava under
+		# water when at least 0.444 high (LavaFluid.canBeReplacedWith)
+		var replaceable := true
+		if below > 0 and _fluid_amount(below) > 0:
+			if _same_fluid(below, lava):
+				replaceable = false
+			elif lava:
+				world.set_block(below_p.x, below_p.y, below_p.z, Res.blocks.default_state("stone"))
+				Audio.play("block.lava.extinguish", Vector3(below_p), "Blocks")
 				return
-			st = new_state
-	_spread_from(world, p, not lava, _amount(st), lava)
+			else:
+				replaceable = _fluid_amount(below) >= 4
+		if replaceable and nb != 0 and _can_hold_specific(below, lava, Res.blocks.st_level[nb] == 0):
+			_spread_to(world, below_p, below, nb, lava)
+			var srcn := 0
+			for d in HDIRS:
+				var q: Vector3i = p + d
+				if _is_source_this(world.state_at(q.x, q.y, q.z), lava):
+					srcn += 1
+			if srcn >= 3:
+				_spread_sides(world, p, st, lava)
+			return
+	if _is_source_this(st, lava) or not _is_hole(world, p, lava, {}):
+		_spread_sides(world, p, st, lava)
+
+
+static func _spread_sides(world, p: Vector3i, st: int, lava: bool) -> void:
+	var i := _fluid_amount(st) - _drop_off(world, lava)
+	if _falling(st):
+		i = 7
+	if i <= 0:
+		return
+	var best := 1000
+	var targets: Array = []
+	var holes := {}
+	for d in HDIRS:
+		var q: Vector3i = p + d
+		var ns: int = world.state_at(q.x, q.y, q.z)
+		if ns < 0 or _is_source_this(ns, lava) or not _can_hold(ns, lava) or not _wall_ok(ns):
+			continue
+		var nf := _new_liquid(world, q, lava)
+		if not _can_hold_specific(ns, lava, nf > 0 and Res.blocks.st_level[nf] == 0):
+			continue
+		var j := 0 if _is_hole(world, q, lava, holes) else _slope_java(world, q, 1, -d, lava, holes)
+		if j < best:
+			targets.clear()
+		if j <= best:
+			# FluidState.canBeReplacedWith of what is there now
+			var ok := true
+			if ns > 0 and _fluid_amount(ns) > 0:
+				if _same_fluid(ns, lava):
+					ok = false   # the same fluid is never replaced sideways (it recomputes itself)
+				else:
+					ok = not lava and _fluid_amount(ns) >= 4   # water into lava >= 0.444 high; lava never into water
+			if ok and nf != 0:
+				targets.append([q, ns, nf])
+			best = j
+	for tg in targets:
+		_spread_to(world, tg[0], tg[1], tg[2], lava)
+
+
+## SpreadContext.isHole: the fluid can go down from q.
+static func _is_hole(world, q: Vector3i, lava: bool, cache: Dictionary) -> bool:
+	if cache.has(q):
+		return cache[q]
+	var b: int = world.state_at(q.x, q.y - 1, q.z)
+	var r := b >= 0 and _wall_ok(b) and (_is_this(b, lava) or (_can_hold(b, lava) and _can_hold_specific(b, lava, false)))
+	cache[q] = r
+	return r
+
+
+## FlowingFluid.getSlopeDistance (distance to the nearest hole, up to the slope find distance; 1000 = none).
+static func _slope_java(world, p: Vector3i, distance: int, from_dir: Vector3i, lava: bool, holes: Dictionary) -> int:
+	var best := 1000
+	var find := (4 if lava_delay(world) == 10 else 2) if lava else 4
+	for d in HDIRS:
+		if d == from_dir:
+			continue
+		var q: Vector3i = p + d
+		var ns: int = world.state_at(q.x, q.y, q.z)
+		if ns < 0 or _is_source_this(ns, lava) or not _can_hold(ns, lava) or not _wall_ok(ns):
+			continue
+		if _is_hole(world, q, lava, holes):
+			return distance
+		if distance < find:
+			best = mini(best, _slope_java(world, q, distance + 1, -d, lava, holes))
+	return best
+
+
+## FlowingFluid.spreadTo: waterloggable blocks take water as waterlogging; others are destroyed (drops; lava fizzes)
+## and replaced; the new fluid schedules its tick (LiquidBlock.onPlace).
+static func _spread_to(world, q: Vector3i, cur: int, nf: int, lava: bool) -> void:
+	var b := Res.blocks
+	if cur > 0 and b.has_prop(cur, "waterlogged"):
+		if not lava:
+			world.set_block(q.x, q.y, q.z, b.with_prop(cur, "waterlogged", "true"))
+			schedule(world, q, 5)
+		return
+	if cur > 0 and (b.st_flags[cur] & BlockRegistry.F_LIQUID) == 0:
+		if lava:
+			Audio.play("block.lava.extinguish", Vector3(q) + Vector3(0.5, 0.5, 0.5), "Blocks", 0.5, 2.6)
+		elif world.gamerule("doTileDrops", true):
+			for s in Loot.block_drops(cur, null, world, q):
+				world.entities.spawn_item(Vector3(q) + Vector3(0.5, 0.3, 0.5), s)
+	world.set_block(q.x, q.y, q.z, nf)
+	schedule(world, q, lava_delay(world) if lava else 5)
+	schedule_neighbors(world, q)
 
 
 static func _spread_from(world, p: Vector3i, _water: bool, amount: int, lava: bool) -> void:
 	var blocks := Res.blocks
 	var drop := 2 if lava else 1
 	var src := blocks.LAVA if lava else blocks.WATER
-	var delay := 30 if lava else 5
+	var delay := lava_delay(world) if lava else 5
 	var below: int = world.state_at(p.x, p.y - 1, p.z)
 	if below >= 0 and _can_flow_into(below, lava):
 		if _same_fluid(below, not lava) and below > 0:
@@ -748,3 +968,214 @@ static func bonemeal(world, p: Vector3i, st: int) -> bool:
 				world.set_block(q.x, q.y, q.z, grass if world.rng.randi_range(0, 7) > 0 else blocks.default_state("poppy" if world.rng.randf() < 0.5 else "dandelion"))
 		return true
 	return false
+
+# ------------------------------------------------------------------ fire (Java FireBlock)
+
+static var _fire_odds := PackedInt32Array()   # per block id: ignite odds << 8 | burn odds (FireBlock.bootStrap)
+static var _fire_b := -2
+
+
+static func _fire_id() -> int:
+	if _fire_b == -2:
+		_fire_b = Res.blocks.block_id("fire")
+	return _fire_b
+
+
+static func _fire_table() -> PackedInt32Array:
+	if not _fire_odds.is_empty():
+		return _fire_odds
+	var b := Res.blocks
+	var t := PackedInt32Array()
+	t.resize(b.names.size())
+	var put := func(nm: String, ig: int, bu: int) -> void:
+		var id := b.block_id(nm)
+		if id >= 0:
+			t[id] = (ig << 8) | bu
+	for w in ["oak", "spruce", "birch", "jungle", "acacia", "cherry", "dark_oak", "pale_oak", "mangrove", "bamboo"]:
+		for suf in ["_planks", "_slab", "_fence_gate", "_fence", "_stairs"]:
+			put.call(w + suf, 5, 20)
+	for nm in ["bamboo_mosaic", "bamboo_mosaic_slab", "bamboo_mosaic_stairs", "mangrove_roots", "composter", "beehive"]:
+		put.call(nm, 5, 20)
+	for w2 in ["oak", "spruce", "birch", "jungle", "acacia", "cherry", "dark_oak", "pale_oak", "mangrove"]:
+		for pre in ["", "stripped_"]:
+			put.call(pre + w2 + "_log", 5, 5)
+			put.call(pre + w2 + "_wood", 5, 5)
+	for nm2 in ["bamboo_block", "stripped_bamboo_block", "coal_block"]:
+		put.call(nm2, 5, 5)
+	for nm3 in Tags.blocks("#minecraft:leaves"):
+		put.call(nm3, 30, 60)
+	for nm4 in Tags.blocks("#minecraft:wool"):
+		put.call(nm4, 30, 60)
+	for nm5 in Tags.blocks("#minecraft:wool_carpets"):
+		put.call(nm5, 60, 20)
+	for nm6 in ["short_grass", "fern", "dead_bush", "sunflower", "lilac", "rose_bush", "peony", "tall_grass", "large_fern", "dandelion",
+			"poppy", "blue_orchid", "allium", "azure_bluet", "red_tulip", "orange_tulip", "white_tulip", "pink_tulip", "oxeye_daisy",
+			"cornflower", "lily_of_the_valley", "torchflower", "pitcher_plant", "wither_rose", "pink_petals", "wildflowers",
+			"open_eyeblossom", "closed_eyeblossom", "sweet_berry_bush", "spore_blossom", "leaf_litter", "short_dry_grass",
+			"tall_dry_grass", "bush", "firefly_bush", "cactus_flower", "golden_dandelion"]:
+		put.call(nm6, 60, 100)
+	for nm7 in [["bookshelf", 30, 20], ["chiseled_bookshelf", 30, 20], ["lectern", 30, 20], ["bee_nest", 30, 20], ["tnt", 15, 100],
+			["vine", 15, 100], ["hay_block", 60, 20], ["target", 15, 20], ["moss_carpet", 5, 100], ["pale_moss_carpet", 5, 100],
+			["dried_kelp_block", 30, 60], ["bamboo", 60, 60], ["scaffolding", 60, 60], ["azalea", 30, 60], ["flowering_azalea", 30, 60],
+			["cave_vines", 15, 60], ["cave_vines_plant", 15, 60], ["moss_block", 5, 100], ["big_dripleaf", 15, 100],
+			["big_dripleaf_stem", 15, 100], ["small_dripleaf", 15, 100], ["hanging_roots", 30, 60], ["glow_lichen", 15, 100],
+			["pale_hanging_moss", 5, 100], ["pale_moss_block", 5, 100]]:
+		put.call(str(nm7[0]), int(nm7[1]), int(nm7[2]))
+	_fire_odds = t
+	return t
+
+
+static func _wl(st: int) -> bool:
+	return Res.blocks.has_prop(st, "waterlogged") and Res.blocks.get_prop(st, "waterlogged") == "true"
+
+
+static func ignite_odds(st: int) -> int:
+	if st <= 0 or _wl(st):
+		return 0
+	return _fire_table()[Res.blocks.st_block[st]] >> 8
+
+
+static func burn_odds(st: int) -> int:
+	if st <= 0 or _wl(st):
+		return 0
+	return _fire_table()[Res.blocks.st_block[st]] & 255
+
+
+const DIRS6 := [Vector3i(0, -1, 0), Vector3i(0, 1, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(1, 0, 0)]
+
+
+static func _sturdy_up(st: int) -> bool:
+	if st <= 0:
+		return false
+	var fl := Res.blocks.st_flags[st]
+	return (fl & BlockRegistry.F_COLLIDE) != 0 and (fl & BlockRegistry.F_FULL_SHAPE) != 0
+
+
+static func _valid_fire_location(world, p: Vector3i) -> bool:
+	for d in DIRS6:
+		var q: Vector3i = p + d
+		if ignite_odds(world.state_at(q.x, q.y, q.z)) > 0:
+			return true
+	return false
+
+
+static func fire_can_survive(world, p: Vector3i) -> bool:
+	return _sturdy_up(world.state_at(p.x, p.y - 1, p.z)) or _valid_fire_location(world, p)
+
+
+## BaseFireBlock.getState + FireBlock.getStateForPlacement: soul fire on soul fire bases, else fire attached to the
+## burnable sides when the block below can neither burn nor hold it.
+static func fire_state(world, p: Vector3i, age: int = 0) -> int:
+	var b := Res.blocks
+	var below: int = world.state_at(p.x, p.y - 1, p.z)
+	if below > 0 and Tags.has_block("#minecraft:soul_fire_base_blocks", b.name_of(below)):
+		return b.default_state("soul_fire")
+	var st := b.with_prop(b.default_state("fire"), "age", str(age))
+	if ignite_odds(below) <= 0 and not _sturdy_up(below):
+		for dn in [["north", Vector3i(0, 0, -1)], ["south", Vector3i(0, 0, 1)], ["west", Vector3i(-1, 0, 0)], ["east", Vector3i(1, 0, 0)], ["up", Vector3i(0, 1, 0)]]:
+			var q: Vector3i = p + dn[1]
+			if b.has_prop(st, dn[0]):
+				st = b.with_prop(st, dn[0], "true" if ignite_odds(world.state_at(q.x, q.y, q.z)) > 0 else "false")
+	return st
+
+
+static func _raining_at(world, p: Vector3i) -> bool:
+	return world.weather_at(Vector3(p) + Vector3(0.5, 0.0, 0.5)) == "rain"
+
+
+static func _near_rain(world, p: Vector3i) -> bool:
+	for d in [Vector3i.ZERO, Vector3i(-1, 0, 0), Vector3i(1, 0, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1)]:
+		if _raining_at(world, p + d):
+			return true
+	return false
+
+
+## FireBlock.updateShape (neighbour changed): gone when it cannot survive, else its side attachments refresh.
+static func fire_update_shape(world, p: Vector3i, st: int) -> void:
+	if not fire_can_survive(world, p):
+		world.set_block(p.x, p.y, p.z, 0)
+		return
+	var ns := fire_state(world, p, int(Res.blocks.get_prop(st, "age")) if Res.blocks.has_prop(st, "age") else 0)
+	if ns != st and Res.blocks.st_block[ns] == Res.blocks.st_block[st]:
+		world.set_block(p.x, p.y, p.z, ns, false)
+
+
+## FireBlock.onPlace: the first tick in 30..39 ticks (WorldManager.set_block calls this for new fire).
+static func fire_placed(world, p: Vector3i) -> void:
+	schedule(world, p, 30 + world.rng.randi_range(0, 9))
+
+
+## FireBlock.tick: reschedule; burn out in rain, age, die without fuel (or at age 15 on a non-burnable floor, 1 in 4),
+## burn the 6 neighbours (checkBurnOut: replaced by fire or destroyed, TNT primed) and spread into the air cells of a
+## 3 x 6 x 3 box above-around (more likely next to better fuel, less likely higher up), all unless the floor is the
+## dimension's infiniburn block.
+static func fire_tick(world, p: Vector3i, st: int) -> void:
+	var rng: RandomNumberGenerator = world.rng
+	schedule(world, p, 30 + rng.randi_range(0, 9))
+	if not world.gamerule("doFireTick", true):
+		return
+	if not fire_can_survive(world, p):
+		world.set_block(p.x, p.y, p.z, 0)
+		return
+	var b := Res.blocks
+	var below: int = world.state_at(p.x, p.y - 1, p.z)
+	var inf_tag := str((world.dim_type as Dictionary).get("infiniburn", "#minecraft:infiniburn_overworld"))
+	var infini: bool = below > 0 and Tags.has_block(inf_tag if inf_tag.begins_with("#") else "#" + inf_tag, b.name_of(below))
+	var age := int(b.get_prop(st, "age")) if b.has_prop(st, "age") else 0
+	if not infini and world.raining and _near_rain(world, p) and rng.randf() < 0.2 + age * 0.03:
+		world.set_block(p.x, p.y, p.z, 0)
+		return
+	var age2 := mini(15, age + rng.randi_range(0, 2) / 2)
+	if age2 != age and b.has_prop(st, "age"):
+		st = b.with_prop(st, "age", str(age2))
+		world.set_block(p.x, p.y, p.z, st, false)
+	if not infini:
+		if not _valid_fire_location(world, p):
+			if not _sturdy_up(below) or age > 3:
+				world.set_block(p.x, p.y, p.z, 0)
+			return
+		if age == 15 and rng.randi_range(0, 3) == 0 and ignite_odds(below) <= 0:
+			world.set_block(p.x, p.y, p.z, 0)
+			return
+	var bio := -1
+	var ch: Chunk = world.cm.get_chunk(p.x >> 4, p.z >> 4)
+	if ch != null:
+		bio = ch.biome_at(p.x & 15, p.y, p.z & 15)
+	var humid := bio >= 0 and Tags.resolve("worldgen/biome", "#minecraft:increased_fire_burnout").has(str(world.biomes.names[bio]))
+	var k := -50 if humid else 0
+	for bo in [[Vector3i(1, 0, 0), 300], [Vector3i(-1, 0, 0), 300], [Vector3i(0, -1, 0), 250], [Vector3i(0, 1, 0), 250], [Vector3i(0, 0, -1), 300], [Vector3i(0, 0, 1), 300]]:
+		_check_burn_out(world, p + bo[0], int(bo[1]) + k, age)
+	for dx in range(-1, 2):
+		for dz in range(-1, 2):
+			for dy in range(-1, 5):
+				if dx == 0 and dy == 0 and dz == 0:
+					continue
+				var chance := 100 + ((dy - 1) * 100 if dy > 1 else 0)
+				var q := p + Vector3i(dx, dy, dz)
+				if world.state_at(q.x, q.y, q.z) != 0:
+					continue
+				var odds := 0
+				for d in DIRS6:
+					var r: Vector3i = q + d
+					odds = maxi(odds, ignite_odds(world.state_at(r.x, r.y, r.z)))
+				if odds <= 0:
+					continue
+				var m := (odds + 40 + int(world.difficulty) * 7) / (age2 + 30)
+				if humid:
+					m /= 2
+				if m > 0 and rng.randi_range(0, chance - 1) <= m and (not world.raining or not _near_rain(world, q)):
+					world.set_block(q.x, q.y, q.z, fire_state(world, q, mini(15, age2 + rng.randi_range(0, 4) / 4)))
+
+
+static func _check_burn_out(world, q: Vector3i, chance: int, age: int) -> void:
+	var rng: RandomNumberGenerator = world.rng
+	var st: int = world.state_at(q.x, q.y, q.z)
+	var bo := burn_odds(st)
+	if bo <= 0 or rng.randi_range(0, chance - 1) >= bo:
+		return
+	if rng.randi_range(0, age + 9) < 5 and not _raining_at(world, q):
+		world.set_block(q.x, q.y, q.z, fire_state(world, q, mini(age + rng.randi_range(0, 4) / 4, 15)))
+	else:
+		world.set_block(q.x, q.y, q.z, 0)
+	if Res.blocks.name_of(st) == "tnt":
+		MiscEntities.spawn_tnt(world.entities, Vector3(q) + Vector3(0.5, 0.0, 0.5), 80)   # TntBlock.prime

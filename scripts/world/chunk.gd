@@ -162,6 +162,7 @@ var decorated := false
 var features_ready := false
 var feature_writes := PackedInt32Array()  # [x,y,z,state,mode]* from Features.compute (origin = this chunk)
 var feature_bes: Dictionary = {}          # world Vector3i -> block entity data produced by this chunk's features/structures
+var feature_postproc := PackedInt32Array() # [x,y,z]* structure blocks marked for shape post-processing (Java markPosForPostprocessing)
 var light_valid := false
 var light_partial := false            # lit while some 3x3 neighbour was not yet decorated (relight pending)
 var light_halo_secs: Array = []       # 24 x (PackedByteArray 18x18x16 | int uniform), from Lighting.compute

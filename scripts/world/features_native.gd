@@ -427,7 +427,9 @@ func emit_mod(m: Dictionary) -> int:
 			return _node([14, _fl(float(raw.get("noise_level", 0.0))), int(raw.get("below_noise", 0)), int(raw.get("above_noise", 0))])
 		"noise_based_count":
 			return _node([15, _fl(float(raw.get("noise_factor", 1.0))), _fl(float(raw.get("noise_offset", 0.0))), int(raw.get("noise_to_count_ratio", 1))])
-		"count_on_every_layer", "randomly_selected", "cuboid", "fixed_placement":
+		"count_on_every_layer":
+			return _node([16, emit_ip(raw.get("count", 1)), _hm_code("MOTION_BLOCKING"), b.block_id("bedrock")])
+		"randomly_selected", "cuboid", "fixed_placement":
 			ok = false
 			if why == "":
 				why = "modifier " + str(m["t"])
@@ -602,6 +604,90 @@ func emit_cf(cf: Dictionary) -> int:
 			for k in rp:
 				nd10.append(int(k))
 			return _node(nd10)
+		# 26.3 Nether types (FeaturesExt; node layouts in featx.cpp)
+		"netherrack_replace_blobs":
+			return _node([25, int(cf["target"]), int(cf["state"]), emit_ip(cf["radius"])])
+		"delta_feature":
+			var bad: Array = []
+			for bn in ["bedrock", "nether_bricks", "nether_brick_fence", "nether_brick_stairs", "nether_wart", "chest", "spawner"]:
+				var bid := b.block_id(bn)
+				if bid >= 0:
+					bad.append(bid)
+			var ndd := [26, int(cf["contents"]), int(cf["rim"]), emit_ip(cf["size"]), emit_ip(cf["rim_size"]), b.st_block[maxi(int(cf["contents"]), 0)], bad.size()]
+			ndd.append_array(bad)
+			return _node(ndd)
+		"stepped_column_cluster":
+			var cannot: Dictionary = cf["cannot_on"]
+			var ndc2 := [27, emit_pv(cf["block"]), emit_pr(cf["can_replace"]), emit_pr(cf["continue"]), int(cf["cluster_reach"]),
+				int(cf["column_count"]), emit_ip(cf["column_reach"]), emit_ip(cf["height"]), cannot.size()]
+			for k2 in cannot:
+				ndc2.append(int(k2))
+			return _node(ndc2)
+		"single_block_pillar":
+			var cap: Dictionary = cf["cap"]
+			var cap_n := -1
+			if not cap.is_empty():
+				cap_n = emit_pf(cap)
+			return _node([28, emit_pv(cf["block"]), emit_pr(cf["can_replace"]), (cf["dir"] as Vector3i).y, _fl(float(cf["chance"])), cap_n])
+		"projected_random_patchy_square":
+			return _node([29, emit_pv(cf["block"]), int(cf["size"]), int(cf["proj"]), emit_pr(cf["through"])])
+		"random_neighbor_spread":
+			var accd: Dictionary = cf["accepted"]
+			var nds := [30, emit_pv(cf["block"]), emit_pr(cf["can_replace"]), int(cf["attempts"]), emit_ip(cf["xz"]), emit_ip(cf["y"]), accd.size()]
+			for k3 in accd:
+				nds.append(int(k3))
+			return _node(nds)
+		"sculk_patch":
+			# SculkPatchFeature (featx kind 32): config, growth / water states, block ids, the 128 sculk vein states
+			# (local index -> face mask | waterlogged << 6 and back), #sculk_replaceable_world_gen ids (sorted)
+			var raw: Dictionary = cf.get("raw", {})
+			var vein_b := b.block_id("sculk_vein")
+			if vein_b < 0:
+				ok = false
+				why = "sculk_vein missing"
+				return _node([0])
+			var first: int = b.block_first[vein_b]
+			var local := PackedInt32Array()
+			local.resize(128)
+			var bycode := PackedInt32Array()
+			bycode.resize(128)
+			var dn := ["down", "up", "north", "south", "west", "east"]
+			for k in 128:
+				var vs := first + k
+				var m := 0
+				for d in 6:
+					if b.get_prop(vs, dn[d]) == "true":
+						m |= 1 << d
+				if b.get_prop(vs, "waterlogged") == "true":
+					m |= 64
+				local[k] = m
+				bycode[m] = vs
+			var sensor := b.default_state("sculk_sensor")
+			var shriek := b.with_prop(b.default_state("sculk_shrieker"), "can_summon", "true")
+			var nsk := [32, int(raw.get("charge_count", 10)), int(raw.get("amount_per_charge", 32)), int(raw.get("spread_attempts", 64)),
+				int(raw.get("growth_rounds", 0)), int(raw.get("spread_rounds", 1)), emit_ip(raw["extra_rare_growths"]) if raw.has("extra_rare_growths") else -1,
+				b.default_state("sculk"), b.with_prop(sensor, "waterlogged", "false"), b.with_prop(sensor, "waterlogged", "true"),
+				b.with_prop(shriek, "waterlogged", "false"), b.with_prop(shriek, "waterlogged", "true"), b.WATER,
+				b.block_id("sculk"), vein_b, b.block_id("sculk_catalyst"), b.block_id("moving_piston"), b.block_id("water"),
+				b.block_id("sculk_sensor"), b.block_id("sculk_shrieker"), b.block_id("fire"), b.block_id("soul_fire"), first]
+			nsk.append_array(local)
+			nsk.append_array(bycode)
+			var rep: Array = []
+			for nm in Tags.blocks("#minecraft:sculk_replaceable_world_gen"):
+				var rb := b.block_id(nm)
+				if rb >= 0:
+					rep.append(rb)
+			rep.sort()
+			nsk.append(rep.size())
+			nsk.append_array(rep)
+			return _node(nsk)
+		"huge_fungus":
+			var tip := b.default_state("weeping_vines")
+			var ndf := [31, int(cf["stem"]), int(cf["hat"]), int(cf["decor"]), int(cf["base"]), emit_pr(cf["replace"]), 1 if cf["planted"] else 0,
+				1 if b.name_of(int(cf["hat"])) == "nether_wart_block" else 0, b.default_state("weeping_vines_plant")]
+			for age in [23, 24, 25]:
+				ndf.append(b.with_prop(tip, "age", str(age)))
+			return _node(ndf)
 	ok = false
 	if why == "":
 		why = "feature " + t
@@ -810,7 +896,8 @@ func _state_tables() -> Array:
 			bits |= 32
 		if nm == "ice" or nm == "packed_ice":
 			bits |= 64
-		if nm in ["grass_block", "mycelium", "podzol", "farmland"]:
+		# Java RootsBlock / NetherSproutsBlock / FungusBlock.mayPlaceOn: #nylium, soul soil, #dirt (mycelium), farmland
+		if (st > 0 and nm in dirt) or nm in ["crimson_nylium", "warped_nylium", "soul_soil"]:
 			bits |= 128
 		below[st] = bits
 		if st <= 0:
@@ -820,7 +907,9 @@ func _state_tables() -> Array:
 			c = 2 if nm == "mangrove_propagule" else 1
 		elif nm == "dead_bush" or nm.ends_with("dry_grass"):
 			c = 3
-		elif nm.ends_with("_mushroom") or nm in ["crimson_fungus", "warped_fungus"]:
+		elif nm in ["crimson_fungus", "warped_fungus", "crimson_roots", "warped_roots", "nether_sprouts"]:
+			c = 10
+		elif nm.ends_with("_mushroom"):
 			c = 4
 		elif nm == "cactus":
 			c = 5

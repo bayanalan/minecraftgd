@@ -362,14 +362,46 @@ static func _orient(node: Node3D, n: Vector3i) -> void:
 		node.rotation = Vector3(0, atan2(float(n.x), float(n.z)), 0)
 
 
+## The block an item frame occupies (Java HangingEntity.getPos).
+static func frame_cell(e) -> Vector3i:
+	var n_a: Array = e.data.get("n", [0, 0, 1])
+	var n := Vector3i(int(n_a[0]), int(n_a[1]), int(n_a[2]))
+	return Vector3i((e.pos + Vector3(0, 0.375, 0) + Vector3(n) * (0.5 - 1.0 / 32.0)).floor())
+
+
+static func _frame_n(e) -> Vector3i:
+	var n_a: Array = e.data.get("n", [0, 0, 1])
+	return Vector3i(int(n_a[0]), int(n_a[1]), int(n_a[2]))
+
+
 static func _refresh_frame(em, e) -> void:
 	var spr: Sprite3D = e.node.get_node("item")
 	spr.texture = ItemIcons.icon(e.stack.item) if not e.stack.is_empty() else null
 	spr.pixel_size = 0.03
+	for ch in spr.get_children():
+		ch.queue_free()
 	var mid := Maps.map_id(e.stack)
 	if mid >= 0:
 		spr.texture = Maps.texture(em.world, mid)
 		spr.pixel_size = 0.875 / 128.0
+		# Java ItemFrameRenderer: maps turn in 90 deg steps (rotation % 4 * 2 eighths); the banner markers are drawn on
+		# framed maps (MapDecorationType.showOnItemFrame), the frame / player markers are not
+		spr.rotation.z = -(int(e.data.get("rot", 0)) % 4) * PI / 2.0
+		e.data["map_rev"] = Maps.rev(em.world, mid)
+		var k := 0
+		for d in Maps.decorations(em.world, mid):
+			if not bool(d[5]):
+				continue
+			k += 1
+			var ds := Sprite3D.new()
+			ds.texture = UiKit.sprite(str(d[0]))
+			ds.pixel_size = 0.875 / 128.0
+			ds.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+			ds.alpha_cut = SpriteBase3D.ALPHA_CUT_DISCARD
+			ds.position = Vector3(float(d[1]) / 2.0, -float(d[2]) / 2.0, 0.002 * k) * (0.875 / 128.0)
+			ds.rotation.z = -float(d[3]) * TAU / 16.0
+			spr.add_child(ds)
+		return
 	spr.rotation.z = -int(e.data.get("rot", 0)) * PI / 4.0
 
 
@@ -383,6 +415,8 @@ static func interact(em, e, p: Player, held: ItemStack) -> bool:
 				e.stack.count = 1
 				if not p.is_creative():
 					p.inventory.consume_held()
+				if Maps.map_id(e.stack) >= 0:
+					Maps.frame_added(em.world, frame_cell(e), _frame_n(e), e.stack)
 				Audio.play("entity.item_frame.add_item", e.pos, "Blocks")
 			else:
 				e.data["rot"] = (int(e.data.get("rot", 0)) + 1) % 8
@@ -431,6 +465,8 @@ static func attack(em, e, p: Player) -> void:
 		"frame":
 			if not e.stack.is_empty():
 				drops.append(e.stack)
+				if Maps.map_id(e.stack) >= 0:
+					Maps.frame_removed(em.world, frame_cell(e), e.stack)
 				e.stack = ItemStack.new()
 				_refresh_frame(em, e)
 				Audio.play("entity.item_frame.remove_item", e.pos, "Blocks")
@@ -598,12 +634,20 @@ static func tick_cushion(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 static func tick_hanging(em, e) -> void:
 	if e.age % 20 != 0:
 		return
+	if e.kind == "frame" and Maps.map_id(e.stack) >= 0:
+		# framed map: keep its frame marker (Java ServerEntity ticks tickCarriedBy for framed maps) and redraw the
+		# banner markers when the map's decorations changed
+		Maps.frame_added(em.world, frame_cell(e), _frame_n(e), e.stack)
+		if int(e.data.get("map_rev", -1)) != Maps.rev(em.world, Maps.map_id(e.stack)):
+			_refresh_frame(em, e)
 	var n := Vector3i(e.data["n"][0], e.data["n"][1], e.data["n"][2])
 	var c: Vector3i = Vector3i((e.pos + Vector3(0, e.h / 2.0, 0) + Vector3(n) * 0.4).floor()) - n
 	var bs: int = em.world.state_at(c.x, c.y, c.z)
 	if bs <= 0 or (Res.blocks.st_flags[bs] & BlockRegistry.F_COLLIDE) == 0:
 		em.spawn_item(e.pos + Vector3(0, 0.4, 0), ItemStack.named(e.id if e.kind == "frame" else "painting", 1))
 		if e.kind == "frame" and not e.stack.is_empty():
+			if Maps.map_id(e.stack) >= 0:
+				Maps.frame_removed(em.world, frame_cell(e), e.stack)
 			em.spawn_item(e.pos + Vector3(0, 0.4, 0), e.stack)
 		em._remove(e)
 

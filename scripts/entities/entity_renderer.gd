@@ -85,11 +85,17 @@ static func material(path: String) -> ShaderMaterial:
 
 ## Box with Java box-UV. o = min corner (model px, Y down), s = size, uv = texture offset, ts = texture size.
 ## inflate: Java CubeDeformation (geometry grows on every side; UVs keep the base size).
-static func box_arrays(o: Vector3, s: Vector3, uv: Vector2, ts: Vector2, st: SurfaceTool, inflate: float = 0.0, tint: Color = Color.WHITE, y_up: bool = false) -> void:
+static func box_arrays(o: Vector3, s: Vector3, uv: Vector2, ts: Vector2, st: SurfaceTool, inflate: float = 0.0, tint: Color = Color.WHITE, y_up: bool = false, mirror: bool = false) -> void:
 	var x0 := o.x - inflate
 	var y0 := o.y - inflate
 	var z0 := o.z - inflate
 	var x1 := o.x + s.x + inflate
+	if mirror:
+		# Java ModelPart.Cube mirror: min / max x swapped (every face keeps its UV rect, so the texture is mirrored),
+		# polygons turned to face outward again (normal x flipped, vertex order reversed)
+		var xt := x0
+		x0 = x1
+		x1 = xt
 	var y1 := o.y + s.y + inflate
 	var z1 := o.z + s.z + inflate
 	var w := s.x
@@ -123,11 +129,11 @@ static func box_arrays(o: Vector3, s: Vector3, uv: Vector2, ts: Vector2, st: Sur
 		# the face normal in our model space (Java's flipped on x and y; f[2] lists x in Java's sense): the entity shader
 		# lights it like Java's entity shader (EntityRenderer.material sets lit_normals)
 		var fn: Vector3 = f[2]
-		var nrm := Vector3(-fn.x, fn.y, fn.z)
+		var nrm := Vector3(fn.x if mirror else -fn.x, fn.y, fn.z)
 		var pts: Array = []
 		for p in c:
 			pts.append(Vector3(-(p as Vector3).x, -(p as Vector3).y, (p as Vector3).z) / 16.0)
-		for idx in [0, 1, 2, 0, 2, 3]:
+		for idx in ([0, 2, 1, 0, 3, 2] if mirror else [0, 1, 2, 0, 2, 3]):
 			st.set_color(Color(tint.r, tint.g, tint.b))
 			st.set_normal(nrm)
 			st.set_uv(uvs[idx] / ts)
@@ -215,7 +221,7 @@ static func _add_parts(model: Node3D, parts: Array, ts: Vector2, mat: Material) 
 			var o: Array = p[2]
 			var s: Array = p[3]
 			var uv: Array = p[4]
-			box_arrays(Vector3(o[0], o[1], o[2]), Vector3(s[0], s[1], s[2]), Vector2(uv[0], uv[1]), ts, st, float(p[8]) if p.size() > 8 else 0.0)
+			box_arrays(Vector3(o[0], o[1], o[2]), Vector3(s[0], s[1], s[2]), Vector2(uv[0], uv[1]), ts, st, float(p[8]) if p.size() > 8 else 0.0, Color.WHITE, false, p.size() > 10 and bool(p[10]))
 			pm = st.commit()
 			_part_mesh_cache[pk] = pm
 		var mi := MeshInstance3D.new()
@@ -233,7 +239,7 @@ static func _add_parts(model: Node3D, parts: Array, ts: Vector2, mat: Material) 
 					var eo: Array = ex[1]
 					var es: Array = ex[2]
 					var eu: Array = ex[3]
-					box_arrays(Vector3(eo[0], eo[1], eo[2]), Vector3(es[0], es[1], es[2]), Vector2(eu[0], eu[1]), ts, st2, float(ex[4]))
+					box_arrays(Vector3(eo[0], eo[1], eo[2]), Vector3(es[0], es[1], es[2]), Vector2(eu[0], eu[1]), ts, st2, float(ex[4]), Color.WHITE, false, ex.size() > 5 and bool(ex[5]))
 					em = st2.commit()
 					_part_mesh_cache[ek] = em
 				var emi := MeshInstance3D.new()

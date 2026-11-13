@@ -496,6 +496,7 @@ func _mod(m) -> Dictionary:
 
 class FCtx:
 	var block_entities: Dictionary = {}   # Vector3i -> data (gateways etc.; applied with the writes)
+	var postproc := PackedInt32Array()    # [x,y,z]* positions whose shape is recomputed once the chunk is complete
 	var entities: Array = []              # serialized mobs from structure templates (inside the origin chunk)
 	var region: ChunkRegion
 	var r: RandomSources.Xoroshiro
@@ -954,7 +955,10 @@ func can_survive(c: FCtx, st: int, p: Vector3i) -> bool:
 		return _is_dirt(below)
 	if n == "dead_bush" or n.ends_with("dry_grass"):
 		return _is_dirt(below) or bn.contains("sand") or bn.contains("terracotta")
-	if n.ends_with("_mushroom") or n in ["crimson_fungus", "warped_fungus"]:
+	if n in ["crimson_fungus", "warped_fungus", "crimson_roots", "warped_roots", "nether_sprouts"]:
+		# Java RootsBlock / NetherSproutsBlock / FungusBlock.mayPlaceOn: #nylium, soul soil, #dirt (mycelium), farmland
+		return _is_dirt(below) or bn in ["crimson_nylium", "warped_nylium", "soul_soil"]
+	if n.ends_with("_mushroom"):
 		return below > 0 and (blocks.st_flags[below] & BlockRegistry.F_OPAQUE) != 0
 	if n == "cactus":
 		if not (bn == "sand" or bn == "red_sand" or bn == "cactus"):
@@ -1678,8 +1682,11 @@ func compute(origin: Chunk, region: ChunkRegion) -> PackedInt32Array:
 	var c := FCtx.new()
 	c.region = region
 	bounds = []
+	var tl0 := Time.get_ticks_usec() if profiling else 0
 	if not legacy_region:
 		_load_region(c, origin, region)
+	if profiling:
+		profile["<load region>"] = int(profile.get("<load region>", 0)) + Time.get_ticks_usec() - tl0
 	c.origin_chunk = origin
 	var present := {}
 	for i in origin.biomes.size():
@@ -1729,6 +1736,9 @@ func compute(origin: Chunk, region: ChunkRegion) -> PackedInt32Array:
 			var tp := Time.get_ticks_usec() if profiling else 0
 			bounds.append([nm, c.writes.size()])
 			var ni = nat_ids.get(nm)
+			if profiling:
+				var pk := "<native features>" if ni != null else "<gdscript features>"
+				profile[pk + " n"] = int(profile.get(pk + " n", 0)) + 1
 			if ni != null:
 				var res: Array = Native.inst.fx_run(nat["handle"], ni[0], ni[1], c.flat, c.info, c.gs, c.gf, c.bio, [c.r.lo, c.r.hi], org, c.hl)
 				c.r.lo = res[0]
@@ -1744,8 +1754,12 @@ func compute(origin: Chunk, region: ChunkRegion) -> PackedInt32Array:
 			else:
 				place_placed(c, pf, o)
 			if profiling:
-				profile[nm] = int(profile.get(nm, 0)) + Time.get_ticks_usec() - tp
+				var dtp := Time.get_ticks_usec() - tp
+				profile[nm] = int(profile.get(nm, 0)) + dtp
+				var pk2 := "<native features>" if ni != null else "<gdscript features>"
+				profile[pk2] = int(profile.get(pk2, 0)) + dtp
 	origin.feature_bes = c.block_entities
+	origin.feature_postproc = c.postproc
 	origin.saved_entities.append_array(c.entities)
 	return c.writes
 
@@ -1761,6 +1775,37 @@ func _load_region(c: FCtx, origin: Chunk, region: ChunkRegion) -> void:
 	c.bio.resize(9 * 1536)
 	var secs: Array = []
 	secs.resize(9)
+	if Native.ok and Native.inst.has_method("region_meta") and not OS.has_environment("RC_NOMETA"):
+		# surfaces / floors / biomes / primed heightmaps in one native call (the GDScript copy loops here were ~9 ms of
+		# the ~16 ms feature job, contended across the workers)
+		var sl: Array = []
+		var fl: Array = []
+		var bl: Array = []
+		sl.resize(9)
+		fl.resize(9)
+		bl.resize(9)
+		for ci in 9:
+			var ch0: Chunk = region.chunks[ci]
+			if ch0 == null:
+				continue
+			c.has[ci] = 1
+			secs[ci] = ch0.raw_sections() if ch0.state < Chunk.DECORATED else ch0.snapshot()
+			sl[ci] = ch0.gen_surface
+			fl[ci] = ch0.gen_floor
+			bl[ci] = ch0.biomes
+		var rm: Array = Native.inst.region_meta(sl, fl, bl)
+		c.gs = rm[0]
+		c.gf = rm[1]
+		c.bio = rm[2]
+		c.hl = rm[3]
+		c.hstate = rm[4]
+		c.info = PackedInt32Array([c.fx0, c.fz0])
+		for ci2 in 9:
+			c.info.append(c.has[ci2])
+		for ci3 in 9:
+			c.info.append(c.hstate[ci3])
+		c.flat = Native.inst.region_flat(secs)[0]
+		return
 	for ci in 9:
 		var ch: Chunk = region.chunks[ci]
 		if ch == null:
@@ -1819,9 +1864,34 @@ func apply(center: Chunk, nine: Array) -> bool:
 		if ch != null:
 			order.append(ch)
 	order.sort_custom(func(a, b): return a.cz < b.cz or (a.cz == b.cz and a.cx < b.cx))
+	# this chunk's own writes last: its structure pieces must win over neighbours' features decided on pristine
+	# terrain (Java: a neighbour's ore / tree placed first is overwritten by the piece, one placed later fails its
+	# target test against the piece's blocks - either way the piece stays intact)
+	for oi in order.size():
+		if order[oi].cx == center.cx and order[oi].cz == center.cz:
+			order.append(order.pop_at(oi))
+			break
 	var x0 := center.cx * 16
 	var z0 := center.cz * 16
+	# cross-origin carving beside another origin's liquid is skipped (same rule as the native chunk_decorate)
+	var liq := {}
+	var cave_air := blocks.default_state("cave_air")
+	if not (Native.ok and Native.chunkops_ok):
+		for oi2 in order.size():
+			var wl2: PackedInt32Array = order[oi2].feature_writes
+			for k2 in range(0, wl2.size(), 5):
+				var lx2 := wl2[k2]
+				var lz2 := wl2[k2 + 2]
+				if lx2 < x0 - 1 or lx2 > x0 + 16 or lz2 < z0 - 1 or lz2 > z0 + 16:
+					continue
+				var ls2 := wl2[k2 + 3]
+				if ls2 <= 0 or (blocks.st_flags[ls2] & BlockRegistry.F_LIQUID) == 0:
+					continue
+				var lk := Vector3i(lx2, wl2[k2 + 1], lz2)
+				liq[lk] = oi2 if not liq.has(lk) or liq[lk] == oi2 else -2
+	var oidx := -1
 	for ch in order:
+		oidx += 1
 		var w: PackedInt32Array = ch.feature_writes
 		for bp in ch.feature_bes:
 			var bv: Vector3i = bp
@@ -1837,6 +1907,8 @@ func apply(center: Chunk, nine: Array) -> bool:
 			var y := w[k + 1]
 			var st := w[k + 3]
 			var mode := w[k + 4]
+			if not liq.is_empty() and (st == 0 or st == cave_air) and _other_liquid(liq, x, y, z, oidx):
+				continue
 			if mode != W_FORCE:
 				var cur := center.get_block(x & 15, y, z & 15)
 				if mode == W_AIR and cur != 0 and (blocks.st_flags[cur] & BlockRegistry.F_REPLACEABLE) == 0:
@@ -1852,13 +1924,84 @@ func apply(center: Chunk, nine: Array) -> bool:
 			for tv in gen.biomes.temperature:
 				_temps.append(tv)
 		var kc := PackedInt32Array([BlockRegistry.F_REPLACEABLE, BlockRegistry.F_LEAVES, BlockRegistry.F_FULL_SHAPE, blocks.WATER,
-			blocks.default_state("ice"), blocks.default_state("snow"), blocks.block_id("ice"), blocks.block_id("packed_ice"), gen.sea_level])
+			blocks.default_state("ice"), blocks.default_state("snow"), blocks.block_id("ice"), blocks.block_id("packed_ice"), gen.sea_level,
+			BlockRegistry.F_LIQUID, blocks.default_state("cave_air")] if not _no_poolfix else [])
 		var res: Array = Native.inst.chunk_decorate(center.raw_sections(), wls, center.cx * 16, center.cz * 16, blocks.st_flags, blocks.st_opacity, kc,
 			center.biomes, _temps, blocks.st_block)
 		center.set_sections(res[0])
 		center.heightmap = res[1]
+		_post_process(center, nine)
 		return true
 	_freeze(center)
+	_post_process(center, nine)
+	return false
+
+
+## Java LevelChunk.postProcessGeneration: blocks a structure piece marked (fences, iron bars: StructurePiece
+## SHAPE_CHECK_BLOCKS) take their shape from the finished neighbourhood (Block.updateFromNeighbourShapes). Runs at
+## decoration, when every neighbour's features exist; a neighbour not decorated yet is read as its terrain plus its
+## own feature writes.
+func _post_process(center: Chunk, nine: Array) -> void:
+	var src: Chunk = nine[4] if nine.size() > 4 and nine[4] != null else center
+	var pp := src.feature_postproc
+	if pp.is_empty():
+		return
+	var rd := _PPReader.new()
+	rd.center = center
+	rd.nine = nine
+	for k in range(0, pp.size(), 3):
+		var x := pp[k]
+		var y := pp[k + 1]
+		var z := pp[k + 2]
+		var st := center.get_block(x & 15, y, z & 15)
+		if st <= 0:
+			continue
+		var ns := ShapeUpdates.computed(rd, Vector3i(x, y, z), st)
+		if ns != st:
+			center.set_block(x & 15, y, z & 15, ns)
+
+
+class _PPReader:
+	var center: Chunk
+	var nine: Array
+	var _over: Dictionary = {}   # neighbour index -> {Vector3i: state} from its own feature writes
+
+	func state_at(x: int, y: int, z: int) -> int:
+		if y < Coords.MIN_Y or y >= Coords.MAX_Y:
+			return 0
+		var dx := (x >> 4) - center.cx
+		var dz := (z >> 4) - center.cz
+		if dx == 0 and dz == 0:
+			return center.get_block(x & 15, y, z & 15)
+		if absi(dx) > 1 or absi(dz) > 1:
+			return 0
+		var i := (dz + 1) * 3 + dx + 1
+		var n: Chunk = nine[i]
+		if n == null:
+			return 0
+		if n.decorated:
+			return n.get_block(x & 15, y, z & 15)
+		if not _over.has(i):
+			var d := {}
+			var w := n.feature_writes
+			var x0 := n.cx * 16
+			var z0 := n.cz * 16
+			for k in range(0, w.size(), 5):
+				if w[k] >= x0 and w[k] < x0 + 16 and w[k + 2] >= z0 and w[k + 2] < z0 + 16:
+					d[Vector3i(w[k], w[k + 1], w[k + 2])] = w[k + 3]
+			_over[i] = d
+		var o = _over[i].get(Vector3i(x, y, z))
+		return int(o) if o != null else n.get_block(x & 15, y, z & 15)
+
+
+static var _no_poolfix := OS.get_environment("RC_NOPOOLFIX") != ""
+
+
+static func _other_liquid(liq: Dictionary, x: int, y: int, z: int, li: int) -> bool:
+	for d in [Vector3i.ZERO, Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 1, 0), Vector3i(0, -1, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
+		var o = liq.get(Vector3i(x, y, z) + d)
+		if o != null and int(o) != li:
+			return true
 	return false
 
 

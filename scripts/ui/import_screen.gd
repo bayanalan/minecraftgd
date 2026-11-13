@@ -40,6 +40,7 @@ func _ready() -> void:
 	list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	v.add_child(list)
 	status = Label.new()
+	status.autowrap_mode = TextServer.AUTOWRAP_WORD
 	v.add_child(status)
 	bar = ProgressBar.new()
 	bar.max_value = 1.0
@@ -65,11 +66,18 @@ func _fill() -> void:
 		list.add_item("%s%s  —  %s" % [f["version"], tag, f["jar"]])
 		if not best.is_empty() and f["jar"] == best["jar"]:
 			sel = i
+	var extra: Array = [Settings.get_v("custom_mc_dir")] if Settings.get_v("custom_mc_dir") != "" else []
 	if found.is_empty():
-		status.text = "No Minecraft: Java Edition installation was found. Install it with the official Minecraft Launcher, then press Retry — or browse to a custom launcher folder, or continue in Original Placeholder Mode."
+		status.text = "No Minecraft: Java Edition %s installation was found. Checked:\n%s\nOr browse to the folder of another launcher, or continue in Original Placeholder Mode." % [MinecraftLocator.TARGET_VERSION, "\n".join(MinecraftLocator.diagnose(extra))]
 	elif sel >= 0:
 		list.select(sel)
-		status.text = "Detected %s. Press Import Selected." % best["version"]
+		if best["version"] == MinecraftLocator.TARGET_VERSION:
+			status.text = "Detected %s. Press Import Selected." % best["version"]
+		else:
+			var d := MinecraftLocator.diagnose(extra)
+			status.text = "Only %s was found - this game is built for %s and needs its files (world generation data, models). %s" % [best["version"], MinecraftLocator.TARGET_VERSION, d[d.size() - 1] if not d.is_empty() else ""]
+	else:
+		status.text = "No usable version was found. Checked:\n%s" % "\n".join(MinecraftLocator.diagnose(extra))
 
 
 func _rescan() -> void:
@@ -83,6 +91,10 @@ func _browse() -> void:
 	fd.file_mode = FileDialog.FILE_MODE_OPEN_DIR
 	fd.access = FileDialog.ACCESS_FILESYSTEM
 	fd.title = "Select your .minecraft (game directory) folder"
+	fd.show_hidden_files = true   # .minecraft starts with a dot: hidden by default in Godot dialogs
+	var appdata := OS.get_environment("APPDATA")
+	if appdata != "":
+		fd.current_dir = appdata
 	fd.dir_selected.connect(func(d):
 		Settings.set_v("custom_mc_dir", d)
 		Settings.save()

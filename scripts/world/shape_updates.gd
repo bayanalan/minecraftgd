@@ -61,6 +61,12 @@ static func _k(bid: int) -> int:
 	return k
 
 
+## Fills the per-block kind table up front (main thread): worldgen workers read it in Features._post_process.
+static func prime() -> void:
+	for bid in Res.blocks.names.size():
+		_k(bid)
+
+
 static func kind_of(st: int) -> int:
 	return K_NONE if st <= 0 else _k(Res.blocks.st_block[st])
 

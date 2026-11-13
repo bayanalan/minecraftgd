@@ -91,7 +91,8 @@ func _submit(t: String) -> void:
 			if Net.is_client() and not (t.get_slice(" ", 0) in ["/help", "/seed", "/list", "/locate", "/me"]):
 				world.hud.chat_message("Only the host can run that command in a LAN game")
 			else:
-				world.hud.chat_message(world.commands.execute(t))
+				var out: String = world.commands.execute(t)
+				world.hud.chat_message(out, world.commands.feedback_click)
 		elif Net.active():
 			Net.chat(t)
 		else:
@@ -114,6 +115,11 @@ func _input(event: InputEvent) -> void:
 			return
 	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT and world != null:
 		var cmd: String = world.hud.chat_click_at(event.position)
+		if cmd.begins_with("copy:"):
+			# Java ClickEvent COPY_TO_CLIPBOARD (the chat stays open)
+			DisplayServer.clipboard_set(cmd.substr(5))
+			get_viewport().set_input_as_handled()
+			return
 		if cmd != "":
 			# Java ClickEvent SUGGEST_COMMAND
 			edit.text = cmd

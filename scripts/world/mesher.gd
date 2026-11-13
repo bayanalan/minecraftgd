@@ -209,7 +209,9 @@ static func build_gd(job: Dictionary) -> Dictionary:
 							res = _face_light(pad, plight, flags, i, d)
 						if res[0]:
 							res = [false, [res[1], res[1], res[1], res[1]], [res[2], res[2], res[2], res[2]], [res[3], res[3], res[3], res[3]], res[4]]
-						var md := 0 if (opts & 2) else _face_mode(res)
+						# translucent cubes (ice, glass, slime, honey) are never merged: merged faces leave T-junction hairline
+						# cracks, visible through translucent layers (seams across ice seen from under water); Java never merges
+						var md := 0 if (opts & 2) or surf_cls == 2 else _face_mode(res)
 						if md != 0:
 							# greedy candidate (see native/src/mesher.cpp FaceDescs: merge modes 1 both, 2 width, 3 height)
 							var dkey := "%d:%d:%d:%d:%s:%s:%s" % [fdata & 0x0FFFFFFF, tint & 0xFFFFFF, int(res[4]), md, str(res[1]), str(res[2]), str(res[3])]

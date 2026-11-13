@@ -58,7 +58,7 @@ static func on_placed(world, p: Vector3i, st: int) -> void:
 		Signs.data(world, p)
 		Signs.mark_dirty()
 		return
-	if n in ["chest", "trapped_chest", "barrel", "hopper", "dispenser", "dropper", "furnace", "blast_furnace", "smoker", "brewing_stand"] or n.ends_with("shulker_box") or n.ends_with("copper_chest"):
+	if n in ["chest", "trapped_chest", "barrel", "hopper", "dispenser", "dropper", "crafter", "furnace", "blast_furnace", "smoker", "brewing_stand"] or n.ends_with("shulker_box") or n.ends_with("copper_chest"):
 		var items: Array = []
 		items.resize(container_size(n))
 		items.fill({})
@@ -418,6 +418,8 @@ static func hopper_step(world, p: Vector3i, d: Dictionary) -> bool:
 
 
 static func _insert(d: Dictionary, s: ItemStack, id: String, dir: Vector3i) -> bool:
+	if id == "crafter":
+		return Crafter.insert_one(d, s)
 	var items: Array = d.get("items", [])
 	var slots: Array = range(items.size())
 	if id in ["furnace", "blast_furnace", "smoker"]:
