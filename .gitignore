@@ -8,3 +8,4 @@
 # Godot's shadow copies of locked GDExtension DLLs
 native/bin/~*
 *.TMP
+/builds/

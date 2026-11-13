@@ -1,6 +1,7 @@
 # Builds native/bin/recraft_native.<arch>.dll with the installed Visual Studio 2022 MSVC.
-# Usage: powershell -File tools/build_native.ps1 [-Arch x86_64|arm64|all] [-Debug]
-param([string]$Arch = "all", [switch]$Debug)
+# Usage: powershell -File tools/build_native.ps1 [-Arch x86_64|arm64|all] [-Debug] [-OutDir <folder>]
+# -OutDir writes the DLL elsewhere (e.g. when native\bin\ is locked by a running Godot that loaded it).
+param([string]$Arch = "all", [switch]$Debug, [string]$OutDir = "")
 $vs = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
 if (-not (Test-Path $vs)) { "vcvarsall.bat not found"; exit 1 }
 $root = Split-Path -Parent $PSScriptRoot
@@ -14,7 +15,9 @@ foreach ($t in $targets) {
 	$name = $t[0]; $va = $t[1]
 	$obj = Join-Path $root "native\obj\$name"
 	New-Item -ItemType Directory -Force $obj | Out-Null
-	$out = Join-Path $root "native\bin\recraft_native.$name.dll"
+	$outDir = if ($OutDir -ne "") { $OutDir } else { Join-Path $root "native\bin" }
+	New-Item -ItemType Directory -Force $outDir | Out-Null
+	$out = Join-Path $outDir "recraft_native.$name.dll"
 	$cmd = "call `"$vs`" $va >nul && cd /d `"$root`" && cl /nologo /std:c++17 /EHsc /MD /W3 /wd4244 /wd4267 /wd4305 $opt /Inative\include native\src\*.cpp /LD /Fo`"$obj\\`" /Fe`"$out`" /link $link"
 	$log = Join-Path $obj "build.log"
 	cmd /c $cmd > $log 2>&1

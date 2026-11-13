@@ -69,7 +69,7 @@ Gameplay / UI:
 - [~] Mob animation smooth + modern AI (interpolation, look / body rotation controls, A* pathfinding, arm poses):
       verify in game; probe timing split (15 ms worst step)
 Build:
-- [ ] x86_64 native DLL rebuild (locked while the user's x64 game runs): needed for the 2 x 667 animateTick sampling
+- [ ] native/bin/recraft_native.x86_64.dll is stale (locked by the running x64 Godot): rebuild with tools/build_native.ps1 -Arch x86_64 once it is closed. The 2026-11-12 x86_64 build in builds/ already has the fresh DLL (built with -OutDir)
 Earlier, still open: vanilla template structures (shipwreck, ocean ruins, ruined portal, igloo, fossils, end city),
 hand-coded structures (desert pyramid, jungle temple, swamp hut, stronghold, fortress, monument, mansion), map zoom /
 cartography, banners, offhand, recipe book search; parched arm / leg wraps; nautilus exact model.
