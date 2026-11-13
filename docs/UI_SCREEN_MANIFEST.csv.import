@@ -1,0 +1,19 @@
+[remap]
+
+importer="csv_translation"
+type="Translation"
+uid="uid://ij07ca0qwic7"
+
+[deps]
+
+files=["res://docs/UI_SCREEN_MANIFEST.family.translation", "res://docs/UI_SCREEN_MANIFEST.tag.translation", "res://docs/UI_SCREEN_MANIFEST.controller.translation", "res://docs/UI_SCREEN_MANIFEST.layout.translation", "res://docs/UI_SCREEN_MANIFEST.responsive.translation", "res://docs/UI_SCREEN_MANIFEST.implemented.translation", "res://docs/UI_SCREEN_MANIFEST.interactive.translation", "res://docs/UI_SCREEN_MANIFEST.visual.translation", "res://docs/UI_SCREEN_MANIFEST.verification.translation", "res://docs/UI_SCREEN_MANIFEST.notes.translation"]
+
+source_file="res://docs/UI_SCREEN_MANIFEST.csv"
+dest_files=["res://docs/UI_SCREEN_MANIFEST.family.translation", "res://docs/UI_SCREEN_MANIFEST.tag.translation", "res://docs/UI_SCREEN_MANIFEST.controller.translation", "res://docs/UI_SCREEN_MANIFEST.layout.translation", "res://docs/UI_SCREEN_MANIFEST.responsive.translation", "res://docs/UI_SCREEN_MANIFEST.implemented.translation", "res://docs/UI_SCREEN_MANIFEST.interactive.translation", "res://docs/UI_SCREEN_MANIFEST.visual.translation", "res://docs/UI_SCREEN_MANIFEST.verification.translation", "res://docs/UI_SCREEN_MANIFEST.notes.translation"]
+
+[params]
+
+compress=1
+delimiter=0
+unescape_keys=false
+unescape_translations=true

@@ -1,0 +1,104 @@
+route,family,tag,controller,layout_ref,responsive_mode,implemented,interactive_test,visual_golden,verification,notes
+boot.splash,boot,clone_extension,scripts/ui/loading_screen.gd,clone,centered,yes,no,no,manual,Asset loading progress screen
+boot.resource_scan,boot,clone_extension,scripts/ui/import_screen.gd,clone,centered,yes,no,no,manual,Finds local .minecraft installs (minecraft_locator.gd)
+boot.source_selection,boot,clone_extension,scripts/ui/import_screen.gd,clone,centered,yes,no,no,manual,
+boot.import_progress,boot,clone_extension,scripts/ui/import_screen.gd,clone,centered,yes,no,no,manual,
+boot.import_error,boot,clone_extension,scripts/ui/import_screen.gd,clone,centered,partial,no,no,manual,Errors shown as text
+boot.missing_assets,boot,clone_extension,scripts/ui/import_screen.gd,clone,centered,yes,no,no,manual,Placeholder mode fallback offered
+boot.cache_repair,boot,clone_extension,scripts/ui/options_menu.gd,clone,list,yes,no,no,manual,Video Settings > Recraft > Re-import Assets
+boot.completed,boot,clone_extension,scripts/app/bootstrap.gd,clone,-,yes,no,no,manual,Goes straight to title
+title.main,title,vanilla_26_3,scripts/ui/title_menu.gd,TitleScreen (h/4+48 rows; logo 256x44 at y30; splash C+123 69 -20deg),abs,yes,--ui=title,screenshot,screenshot 2026-11-12,Panorama from asset index; Realms disabled (service)
+title.language,title,vanilla_26_3,scripts/ui/language_screen.gd,LanguageSelectScreen,list,yes,--ui=options_language,screenshot,screenshot 2026-11-12,Opens Options>Language (title icon button routes to Options)
+title.accessibility,title,vanilla_26_3,scripts/ui/options_menu.gd,AccessibilityOptionsScreen,list,partial,--ui=options_access,screenshot,screenshot 2026-11-12,Title icon opens Options (direct route TODO)
+title.friends,title,service_blocked,-,-,-,no,no,no,-,Friends list needs Microsoft services
+world.select,world,vanilla_26_3,scripts/ui/world_list.gd,SelectWorldScreen 1.20 geometry (list 48..h-64 rows 36 width 270),list,yes,--ui=world_list,screenshot,screenshot 2026-11-12,26.x HeaderAndFooter offsets REF
+world.edit,world,vanilla_26_3,scripts/ui/edit_world.gd,EditWorldScreen LinearLayout spacing 5 centred,centered,yes,--ui=edit_world,screenshot,screenshot 2026-11-12,Optimize World disabled (single chunk format)
+world.delete_confirm,world,vanilla_26_3,scripts/ui/confirm_screen.gd,ConfirmScreen (title y70 msg y90 buttons 150),centered,yes,--ui=delete_world,screenshot,screenshot 2026-11-12,Focus starts on Cancel
+world.recreate,world,vanilla_26_3,scripts/ui/create_world.gd,CreateWorldScreen prefilled,tabs,yes,no,no,code,New folder; never overwrites
+world.backup_confirm,world_maint,conditional,scripts/ui/edit_world.gd,-,-,partial,no,no,code,Make Backup runs immediately with status line
+world.backup_progress,world_maint,conditional,-,-,-,no,no,no,-,Backup is synchronous (small saves)
+world.upgrade_confirm,world_maint,not_in_version,-,-,-,no,no,no,-,No older Recraft save formats
+world.upgrade_progress,world_maint,not_in_version,-,-,-,no,no,no,-,
+world.optimize,world_maint,not_in_version,-,-,-,no,no,no,-,Disabled button with reason
+world.optimize_progress,world_maint,not_in_version,-,-,-,no,no,no,-,
+world.corrupt,world_maint,conditional,scripts/ui/world_list.gd,-,list,yes,no,no,code,Row shows error sprite + red info; level.json.bak recovery
+world.restore_backup,world_maint,conditional,-,-,-,no,no,no,-,Open Backups Folder only
+world.copy_error,world_maint,conditional,-,-,-,no,no,no,-,
+world.delete_error,world_maint,conditional,-,-,-,no,no,no,-,
+world.unsupported_version,world_maint,conditional,-,-,-,no,no,no,-,
+world.experimental_warning,world_maint,not_in_version,-,-,-,no,no,no,-,No experiments
+world.datapack_load_failed,world_maint,not_in_version,-,-,-,no,no,no,-,No data packs
+world.safe_mode,world_maint,not_in_version,-,-,-,no,no,no,-,
+world.create.game,creation,vanilla_26_3,scripts/ui/create_world.gd,CreateWorldScreen GameTab,tabs,yes,--ui=create_world,screenshot,screenshot 2026-11-12,
+world.create.world,creation,vanilla_26_3,scripts/ui/create_world.gd,CreateWorldScreen WorldTab + SwitchGrid,tabs,yes,--ui=create_world_world,screenshot,screenshot 2026-11-12,+ Recraft Generator profile row (UI_LAYOUT_DECISIONS)
+world.create.more,creation,vanilla_26_3,scripts/ui/create_world.gd,CreateWorldScreen MoreTab,tabs,yes,--ui=create_world_more,screenshot,screenshot 2026-11-12,Experiments / Data Packs disabled with reason
+world.superflat_customize,creation,vanilla_26_3,scripts/ui/flat_customize.gd,CreateFlatWorldScreen,list,yes,--ui=flat,screenshot,screenshot 2026-11-12,
+world.superflat_presets,creation,vanilla_26_3,scripts/ui/flat_customize.gd,PresetFlatWorldScreen,list,yes,--ui=presets,screenshot,screenshot 2026-11-12,Presets from installed flat_level_generator_preset data
+world.single_biome,creation,vanilla_26_3,scripts/ui/single_biome.gd,CreateBuffetWorldScreen + 26.x search,list,yes,--ui=single_biome,screenshot,screenshot 2026-11-12,Overworld biomes only
+world.gamerules_create,creation,vanilla_26_3,scripts/ui/game_rules_screen.gd,EditGameRulesScreen,list,yes,--ui=game_rules,screenshot,screenshot 2026-11-12,Recraft rule subset (game_rules.gd SPEC)
+world.experiments,creation,not_in_version,-,-,-,no,no,no,-,Disabled button with reason
+world.datapacks,creation,not_in_version,-,-,-,no,no,no,-,Disabled button with reason
+world.create_progress,creation,vanilla_26_3,scripts/ui/loading_screen.gd,LevelLoadingScreen,centered,partial,no,no,manual,Chunk progress grid not drawn
+game.pause,game,vanilla_26_3,scripts/ui/pause_menu.gd,PauseScreen grid 204/98 at 25%,abs,yes,--screen=pause,screenshot,screenshot 2026-11-12,Feedback/Report Bugs disabled (Mojang services)
+game.world_options.general,game,vanilla_26_3,scripts/ui/world_options.gd,26.3 World Options (REF: no reference screenshot),tabs,yes,--screen=world_options,screenshot,screenshot 2026-11-12,Layout REF; all controls live
+game.world_options.multiplayer,game,vanilla_26_3,scripts/ui/world_options.gd,26.3 World Options (REF),tabs,yes,--screen=world_options_mp,screenshot,screenshot 2026-11-12,LAN real; command access / force mode fixed (reason shown)
+game.restrictions,game,reference_unknown,-,-,-,no,no,no,-,No 26.3 lang keys found for a Restrictions screen
+game.lock_world,game,reference_unknown,-,-,-,no,no,no,-,difficulty.lock.* keys exist; UI not built
+game.sleep,game,vanilla_26_3,scripts/ui/hud.gd,InBedChatScreen,-,partial,no,no,manual,
+game.death,game,vanilla_26_3,scripts/ui/death_screen.gd,DeathScreen (gradient; 2x title y30; cause y85; score y100; buttons h/4+72/+96 active after 20 ticks),abs,yes,--screen=death,screenshot,screenshot 2026-11-12,death.* messages incl. killer; chat death message (showDeathMessages)
+game.hardcore_death,game,vanilla_26_3,scripts/ui/death_screen.gd,DeathScreen hardcore,abs,yes,no,no,code,Game Over! + Spectate World
+options.main,options,vanilla_26_3,scripts/ui/options_menu.gd,OptionsScreen HeaderAndFooter 61/33,abs,yes,--ui=options,screenshot,screenshot 2026-11-12,
+options.video,options,vanilla_26_3,scripts/ui/options_menu.gd,VideoSettingsScreen (Display / Quality & Performance / Preferences),list,yes,--ui=options_video,screenshot,screenshot 2026-11-12,Row order REF; unimplemented options disabled with reason; + Recraft section
+options.audio,options,vanilla_26_3,scripts/ui/options_menu.gd,SoundOptionsScreen,list,yes,--ui=options_sounds,screenshot,no,code,
+options.controls,options,vanilla_26_3,scripts/ui/options_menu.gd,ControlsScreen,list,yes,--ui=options_controls,screenshot,no,code,
+options.keybinds,options,vanilla_26_3,scripts/ui/options_menu.gd,KeyBindsScreen,list,yes,--ui=options_keybinds,screenshot,screenshot 2026-11-12,Per-row Reset + Reset Keys
+options.mouse,options,vanilla_26_3,scripts/ui/options_menu.gd,MouseSettingsScreen,list,partial,no,no,code,Scroll/discrete/invert X disabled with reason
+options.chat,options,vanilla_26_3,scripts/ui/options_menu.gd,ChatOptionsScreen,list,yes,no,no,code,Visibility / opacity / background / size / spacing / width / heights live; colours / links / delay / suggestions disabled with reason
+options.accessibility,options,vanilla_26_3,scripts/ui/options_menu.gd,AccessibilityOptionsScreen,list,partial,--ui=options_access,screenshot,no,code,
+options.skin,options,vanilla_26_3,scripts/ui/options_menu.gd,SkinCustomizationScreen,list,yes,no,no,code,Hat / jacket / sleeves / pants toggles live on the player rigs; cape off (no account capes); + Player Name (LAN)
+options.language,options,vanilla_26_3,scripts/ui/language_screen.gd,LanguageSelectScreen,list,yes,--ui=options_language,screenshot,screenshot 2026-11-12,Live switch via Res.set_language
+options.resourcepacks,options,vanilla_26_3,scripts/ui/pack_screen.gd,PackSelectionScreen 1.20 geometry,dual_list,yes,--ui=options_packs,screenshot,screenshot 2026-11-12,Applies on next start (stated on screen)
+options.online,options,service_blocked,scripts/ui/options_menu.gd,OnlineOptionsScreen,list,yes,--ui=options_online,no,code,All rows disabled (Microsoft services)
+options.telemetry,options,clone_extension,scripts/ui/options_menu.gd,-,list,yes,no,no,code,States Recraft collects nothing
+network.multiplayer_warning,network,vanilla_26_3,-,-,-,no,no,no,-,
+network.multiplayer,network,vanilla_26_3,scripts/ui/multiplayer_screen.gd,JoinMultiplayerScreen (list 32..h-64 rows 36; 100/74-px button rows),list,yes,--ui=multiplayer,screenshot,screenshot 2026-11-12,Saved servers (user://servers.json) + LAN section; no status ping (shown as unknown)
+network.add_server,network,vanilla_26_3,scripts/ui/multiplayer_screen.gd,EditServerScreen,abs,yes,no,no,code,Resource pack prompt row omitted (no server packs)
+network.edit_server,network,vanilla_26_3,scripts/ui/multiplayer_screen.gd,EditServerScreen,abs,yes,no,no,code,
+network.direct_connect,network,vanilla_26_3,scripts/ui/multiplayer_screen.gd,DirectJoinServerScreen,abs,yes,no,no,code,
+network.delete_server_confirm,network,vanilla_26_3,scripts/ui/confirm_screen.gd,ConfirmScreen,centered,yes,no,no,code,
+network.(connection states),network,conditional,scripts/net/net.gd,-,-,partial,no,no,manual,Status text only
+network.social_interactions,network,service_blocked,-,-,-,no,no,no,-,
+network.report_player,network,service_blocked,-,-,-,no,no,no,-,
+network.server_links,network,service_blocked,-,-,-,no,no,no,-,
+hud.player_list,network,vanilla_26_3,scripts/ui/hud.gd,PlayerTabOverlay,-,partial,no,no,manual,
+realms.*,realms,service_blocked,-,-,-,no,no,no,-,Realms button disabled with reason on title
+container.player,inventory,vanilla_26_3,scripts/ui/inventory_screen.gd,InventoryScreen 176x166,abs,yes,--screen=inventory,screenshot,screenshot 2026-11-12,
+container.crafting,inventory,vanilla_26_3,scripts/ui/crafting_screen.gd,CraftingScreen,abs,yes,--screen=crafting,screenshot,no,manual,
+container.creative,inventory,vanilla_26_3,scripts/ui/creative_screen.gd,CreativeModeInventoryScreen,abs,yes,--screen=inventory --gm=creative,screenshot,screenshot 2026-11-11,Tab contents heuristic (UI_REFERENCE_GAPS)
+container.chest_1..6/double/ender/shulker/barrel,inventory,vanilla_26_3,scripts/ui/container_screen.gd,ContainerScreen generic_54,abs,yes,no,no,manual,
+container.hopper/dropper/dispenser/crafter,inventory,vanilla_26_3,scripts/ui/container_screen.gd,-,abs,partial,no,no,manual,
+container.furnace/blast_furnace/smoker/brewing_stand/enchanting/anvil/grindstone/smithing_table/stonecutter/loom/cartography_table,workstation,vanilla_26_3,scripts/ui/workstation_screen.gd + container_screen.gd,container textures + Java title positions,abs,partial,--screen=ws_<kind>|ct_<kind>,screenshot,screenshot 2026-11-12,Furnace / brewing / anvil / smithing / grindstone / enchanting / loom checked; enchanting 3D book and smithing armor-stand preview missing; smithing template icons do not cycle
+container.beacon,workstation,vanilla_26_3,scripts/ui/beacon_screen.gd,-,abs,partial,no,no,manual,
+container.lectern,workstation,vanilla_26_3,scripts/ui/book_screen.gd,-,abs,partial,no,no,manual,
+container.merchant,mobile,vanilla_26_3,scripts/ui/trade_screen.gd,-,abs,partial,no,no,manual,
+container.horse/donkey/mule/llama,mobile,vanilla_26_3,scripts/ui/horse_screen.gd,-,abs,partial,no,no,manual,
+container.chest_boat/chest_minecart/hopper_minecart,mobile,vanilla_26_3,scripts/ui/container_screen.gd,-,abs,partial,no,no,manual,
+overlay.recipe_book,overlay,vanilla_26_3,scripts/ui/container_ui.gd,RecipeBookComponent (tabs / filter / search / slots / pages),abs,yes,--screen=crafting,screenshot,screenshot 2026-11-12,No ghost recipe for uncraftable entries; recipe collections not grouped
+overlay.item_tooltip,overlay,vanilla_26_3,scripts/ui/ui_kit.gd,TooltipRenderUtil + DefaultTooltipPositioner,-,yes,--hover,screenshot,screenshot 2026-11-12,Name only (+ durability / id with F3+H); no attribute / rarity lines yet
+overlay.bundle_preview,overlay,vanilla_26_3,-,-,-,no,no,no,-,
+edit.sign / edit.hanging_sign,text,vanilla_26_3,scripts/ui/sign_screen.gd,SignEditScreen / HangingSignEditScreen (gui/signs + gui/hanging_signs textures),abs,yes,--screen=sign|hanging_sign,screenshot,screenshot 2026-11-12,In-place line editing on the board; dye colour
+edit.book_and_quill / edit.book_sign / view.written_book,text,vanilla_26_3,scripts/ui/book_screen.gd,BookEditScreen / BookViewScreen (gui/book.png; page sprites at 43/116,159; footer at C-100,196),abs,yes,--screen=book,screenshot,screenshot 2026-11-12,9-px lines; gradient dim
+edit.command_block,text,vanilla_26_3,scripts/ui/command_block_screen.gd,-,abs,partial,no,no,manual,
+edit.structure_block / edit.jigsaw_block,text,vanilla_26_3,-,-,-,no,no,no,-,
+game.advancements,progression,vanilla_26_3,scripts/ui/advancements_screen.gd,AdvancementsScreen (window 252x140; tabs above; TreeNodePosition layout; visibility evaluator),abs,yes,--screen=advancements,screenshot,screenshot 2026-11-12,Hover uses the tooltip instead of the title_box widget; >8 tabs paging not needed (5 tabs)
+game.statistics,progression,vanilla_26_3,scripts/ui/stats_screen.gd,StatsScreen 1.20 (General / Items / Mobs lists),list,yes,--screen=stats,screenshot,screenshot 2026-11-12,Only the stats Recraft records (play time / distance / mined / crafted / used / killed / fish)
+game.end_poem / game.credits,progression,vanilla_26_3,-,-,-,no,no,no,-,
+hud.chat / hud.chat_input,hud,vanilla_26_3,scripts/ui/hud.gd + chat_screen.gd,ChatComponent / ChatScreen (320 wide; fade curve; wrap; input bar),anchors,yes,--screen=chat,screenshot,screenshot 2026-11-12,No chat scrollbar / suggestions popup yet
+hud.*,hud,vanilla_26_3,scripts/ui/hud.gd,Gui,anchors,partial,--screen=hud,screenshot,screenshot 2026-11-12,Hotbar/offhand/hearts/armour/hunger/xp/durability/counts checked; chat/titles/bossbar/toasts/effects not yet audited
+hud.debug*,hud_debug,vanilla_26_3,scripts/ui/hud.gd,DebugScreenOverlay,-,partial,no,no,manual,
+dialog.confirm,modal,vanilla_26_3,scripts/ui/confirm_screen.gd,ConfirmScreen,centered,yes,--ui=delete_world,screenshot,screenshot 2026-11-12,
+dialog.*(others),modal,conditional,-,-,-,partial,no,no,-,Old AcceptDialog popups remain in some screens (being replaced)
+world.icon,world,vanilla_26_3,scripts/world/world_manager.gd,GameRenderer.takeAutoScreenshot (64x64 centre crop without GUI),-,yes,--icon=1,file,2026-11-12,Shown in Select World rows
+hud.title / hud.subtitle / hud.actionbar,hud,vanilla_26_3,scripts/ui/hud.gd,Gui.renderTitle / overlay message,anchors,yes,--screen=titles,screenshot,screenshot 2026-11-12,4x / 2x shadowed; action bar fade
+hud.bossbar,hud,vanilla_26_3,scripts/ui/hud.gd,BossHealthOverlay (boss_bar sprites),anchors,yes,--screen=titles,screenshot,screenshot 2026-11-12,Notched overlays not drawn
+hud.advancement_toast,hud,vanilla_26_3,scripts/ui/hud.gd,AdvancementToast (toast/advancement),anchors,yes,--screen=titles,screenshot,screenshot 2026-11-12,Slide timing approximate

@@ -1,0 +1,8 @@
+[configuration]
+entry_symbol = "recraft_native_init"
+compatibility_minimum = "4.7"
+reloadable = false
+
+[libraries]
+windows.x86_64 = "res://native/bin/recraft_native.x86_64.dll"
+windows.arm64 = "res://native/bin/recraft_native.arm64.dll"
