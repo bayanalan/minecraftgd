@@ -23,6 +23,15 @@ var _meshes: Array = []
 var _vm_pending := 3        # frames left to convert newly built hand meshes to VIEWMODEL materials
 var _fov_scale := -1.0
 var _vm_mats: Dictionary = {}           # source material instance id -> VIEWMODEL material
+# Java ItemInHandRenderer.tick: the shown stacks and their heights (the shown item lowers 0.4 / tick when the held one
+# changes and is swapped below 0.1, the new one rises; the main hand also follows the attack strength cubed)
+var _main_h := 0.0
+var _main_h_old := 0.0
+var _off_h := 0.0
+var _off_h_old := 0.0
+var _shown_main: ItemStack = null
+var _shown_slot := -1
+var _shown_off: ItemStack = null
 static var _vm_shaders: Dictionary = {} # source shader instance id -> VIEWMODEL variant shader
 
 
@@ -129,6 +138,41 @@ static func _tr(t: Transform3D, v: Vector3) -> Transform3D:
 	return t * Transform3D(Basis.IDENTITY, v)
 
 
+## Same stack for the hand animation: Java keeps the shown stack when the held one is the same object (counts change in
+## place) or ItemStack.matches it (same item, count and components - e.g. two identical stacks).
+static func _same_stack(a: ItemStack, b: ItemStack, same_slot: bool) -> bool:
+	if a == null:
+		return false
+	if a.item != b.item:
+		return false
+	return same_slot or (a.count == b.count and a.components == b.components)
+
+
+func game_tick() -> void:
+	if world == null or world.player == null:
+		return
+	var p: Player = world.player
+	_main_h_old = _main_h
+	_off_h_old = _off_h
+	var cur := p.inventory.held()
+	var cur_off := p.inventory.get_slot(Inventory.OFFHAND)
+	var same_main := _same_stack(_shown_main, cur, p.inventory.selected == _shown_slot)
+	if same_main:
+		_shown_main = cur
+		_shown_slot = p.inventory.selected
+	var same_off := _same_stack(_shown_off, cur_off, true)
+	if same_off:
+		_shown_off = cur_off
+	var f: float = p.attack_strength(1.0)
+	_main_h += clampf((f * f * f if same_main else 0.0) - _main_h, -0.4, 0.4)
+	_off_h += clampf((1.0 if same_off else 0.0) - _off_h, -0.4, 0.4)
+	if _main_h < 0.1:
+		_shown_main = cur
+		_shown_slot = p.inventory.selected
+	if _off_h < 0.1:
+		_shown_off = cur_off
+
+
 func _process(_d: float) -> void:
 	if world == null or world.player == null or world.cm == null:
 		return
@@ -147,10 +191,13 @@ func _process(_d: float) -> void:
 	off_root.visible = false
 	if not show:
 		return
-	var held := p.inventory.held()
+	var held: ItemStack = _shown_main if _shown_main != null else p.inventory.held()
 	var swing := 0.0
+	var ptk := clampf(world.tick_accum / 0.05, 0.0, 1.0)
 	if world.hand_swing > 0:
-		swing = clampf((6.0 - float(world.hand_swing) + world.tick_accum / 0.05) / 6.0, 0.0, 1.0)
+		swing = clampf((float(world.hand_swing_dur - world.hand_swing) + ptk) / float(world.hand_swing_dur), 0.0, 1.0)
+	# equipped progress (Java 1 - lerp(oMainHandHeight, mainHandHeight)): -0.6 x it down (maps -1.2)
+	var equip := 1.0 - lerpf(_main_h_old, _main_h, ptk)
 	# view bobbing (Java bobView: translate(sin(b*pi)*bob*0.5, -|cos(b*pi)*bob|, 0), z/x rotations)
 	var bob_t := Transform3D.IDENTITY
 	if Settings.get_v("view_bobbing"):
@@ -162,7 +209,7 @@ func _process(_d: float) -> void:
 	if held.is_empty():
 		var g := sqrt(swing)
 		var t := bob_t
-		t = _tr(t, Vector3(-0.3 * sin(g * PI) + 0.64, 0.4 * sin(g * TAU) - 0.6, -0.4 * sin(swing * PI) - 0.72))
+		t = _tr(t, Vector3(-0.3 * sin(g * PI) + 0.64, 0.4 * sin(g * TAU) - 0.6 + equip * -0.6, -0.4 * sin(swing * PI) - 0.72))
 		t = _rot(t, Vector3.UP, 45.0)
 		t = _rot(t, Vector3.UP, sin(g * PI) * 70.0)
 		t = _rot(t, Vector3.BACK, sin(swing * swing * PI) * -20.0)
@@ -184,7 +231,7 @@ func _process(_d: float) -> void:
 		var f := clampf(1.0 - p.pitch / 45.0 + 0.1, 0.0, 1.0)
 		var tilt := -cos(f * PI) * 0.5 + 0.5
 		var tm := bob_t
-		tm = _tr(tm, Vector3(0, 0.04 - tilt * 0.5, -0.72 - 0.4 * sin(sqrt(swing) * PI)))
+		tm = _tr(tm, Vector3(0, 0.04 + equip * -1.2 - tilt * 0.5, -0.72 - 0.4 * sin(sqrt(swing) * PI)))
 		tm = _rot(tm, Vector3.RIGHT, tilt * -85.0 + sin(sqrt(swing) * PI) * 20.0)
 		tm = tm * Transform3D(Basis.from_scale(Vector3.ONE * 0.76), Vector3.ZERO)
 		item_root.transform = tm
@@ -209,7 +256,7 @@ func _process(_d: float) -> void:
 			ti = _rot(ti, Vector3.UP, hq * 90.0)
 			ti = _rot(ti, Vector3.RIGHT, hq * 10.0)
 			ti = _rot(ti, Vector3.BACK, hq * 30.0)
-		ti = _tr(ti, Vector3(0.56, -0.52, -0.72))
+		ti = _tr(ti, Vector3(0.56, -0.52 + equip * -0.6, -0.72))
 		if ua == "brush":
 			# Java applyBrushTransform (right arm): a 10-tick sweep, X rotation -15 + 75 cos(h 2 pi)
 			var rem_i: int = UseItem.duration(held) - p.use_ticks
@@ -247,7 +294,7 @@ func _process(_d: float) -> void:
 			ti = _rot(ti, Vector3.UP, -45.0)
 	else:
 		ti = _tr(ti, Vector3(-0.4 * sin(g2 * PI), 0.2 * sin(g2 * TAU), -0.2 * sin(swing * PI)))
-		ti = _tr(ti, Vector3(0.56, -0.52, -0.72))
+		ti = _tr(ti, Vector3(0.56, -0.52 + equip * -0.6, -0.72))
 		var s2 := sin(swing * swing * PI)
 		ti = _rot(ti, Vector3.UP, 45.0 + s2 * -20.0)
 		var h2 := sin(g2 * PI)
@@ -378,7 +425,7 @@ func _update_map_decos(mid: int) -> void:
 
 
 func _update_offhand(p: Player, bob_t: Transform3D, lv: Vector2) -> void:
-	var off := p.inventory.get_slot(Inventory.OFFHAND)
+	var off: ItemStack = _shown_off if _shown_off != null else p.inventory.get_slot(Inventory.OFFHAND)
 	if off.is_empty():
 		return
 	var using := p.using_slot == Inventory.OFFHAND
@@ -414,10 +461,16 @@ func _update_offhand(p: Player, bob_t: Transform3D, lv: Vector2) -> void:
 				emi.material_override = m
 				off_root.add_child(emi)
 				off_root.set_meta("mode", "item")
+				if Glint.has_glint(off):
+					var og := MeshInstance3D.new()
+					og.mesh = emi.mesh
+					og.material_override = Glint.material_3d(tex, off)
+					off_root.add_child(og)
 	var mode := str(off_root.get_meta("mode", ""))
 	if mode == "":
 		return
-	var t := _tr(bob_t, Vector3(-0.56, -0.52, -0.72))
+	var off_equip := 1.0 - lerpf(_off_h_old, _off_h, clampf(world.tick_accum / 0.05, 0.0, 1.0))
+	var t := _tr(bob_t, Vector3(-0.56, -0.52 + off_equip * -0.6, -0.72))
 	if mode == "block":
 		t = _rot(t, Vector3.UP, -225.0)   # block/block firstperson_lefthand Y 225, mirrored for the left hand
 		t = t * Transform3D(Basis.from_scale(Vector3.ONE * 0.4), Vector3.ZERO)
@@ -535,6 +588,11 @@ func _ensure_item(s: ItemStack) -> void:
 	m.set_shader_parameter("has_tex", true)
 	mi2.material_override = m
 	item_root.add_child(mi2)
+	if Glint.has_glint(s):
+		var g2 := MeshInstance3D.new()   # enchantment glint over the item's own geometry
+		g2.mesh = mi2.mesh
+		g2.material_override = Glint.material_3d(tex, s)
+		item_root.add_child(g2)
 
 
 ## Java ItemModelGenerator: front/back quads + one side quad per exposed pixel edge, 1/16 thick, centred.

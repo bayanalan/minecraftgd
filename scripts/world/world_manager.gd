@@ -29,7 +29,7 @@ var crack_textures: Array = []
 var screen = null           # open GUI screen (inventory, pause...)
 var paused := false
 var game_time := 0          # total ticks
-var day_time := 1000        # 0..24000 cycle
+var day_time := 1000        # Java dayTime: keeps counting (% 24000 = time of day, / 24000 = day)
 var tick_accum := 0.0
 var tick_ms := 0.0
 var autosave_timer := 0.0
@@ -38,7 +38,8 @@ var hardcore := false
 var gamerules: Dictionary = {}
 var rain := 0.0
 var thunder := 0.0
-var weather_timer := 12000
+var weather_timer := 12000   # rain flag timer (ticks)
+var thunder_timer := 12000   # thunder flag timer (ticks, independent of the rain timer)
 var raining := false
 var thundering := false
 var spawn_ready := false
@@ -62,6 +63,8 @@ var commands: CommandParser
 var dimension := "overworld"     # overworld | the_nether | the_end (only the player's dimension is loaded)
 var dim_type: Dictionary = {}
 var portal_time := 0
+var portal_spin := 0.0       # Java LocalPlayer.spinningEffectIntensity (nether portal overlay)
+var portal_spin_old := 0.0
 var portal_cooldown := 0
 var changing_dim := false
 var _arrival: Dictionary = {}       # pending arrival after a dimension change: {kind, pos, axis}
@@ -70,8 +73,11 @@ var advancements: Advancements
 var _inv_dirty := false
 var _auto_input := false
 var hand_swing := 0          # Java swingTime countdown (6 ticks), drives the first-person swing
+var hand_swing_dur := 6      # Java LivingEntity.getCurrentSwingDuration: 6, Haste 6 - level, Mining Fatigue 6 + 2 x level
+var view_model: ViewModel
 var player_model: Node3D
 var _pm_limb := 0.0
+var _pm_swim := 0.0   # third-person model: Java swimAmount (crawl / swim pose blend)
 
 
 ## In-game screens are compiled on a background thread when the world starts: the first load() of a screen script
@@ -134,6 +140,9 @@ func _ready() -> void:
 	rng.randomize()
 	Controls.setup()
 	BlockUpdates.reset()
+	Sensors.reset()
+	Growth.reset()
+	Ambience.reset()
 	Beacons.clear()
 	Signs.clear()
 	BERender.setup()
@@ -157,12 +166,16 @@ func _ready() -> void:
 	difficulty = int(level.get("difficulty", 2))
 	hardcore = bool(level.get("hardcore", false))
 	gamerules = GameRules.defaults()
-	gamerules.merge(level.get("gamerules", {}), true)
+	gamerules.merge(GameRules.migrate(level.get("gamerules", {})), true)   # (older worlds: camelCase names)
 	game_time = int(level.get("game_time", 0))
 	day_time = int(level.get("day_time", 1000))
 	raining = bool(level.get("raining", false))
 	thundering = bool(level.get("thundering", false))
 	weather_timer = int(level.get("weather_timer", 12000))
+	thunder_timer = int(level.get("thunder_timer", 12000))
+	_thunder_flag = bool(level.get("thunder_flag", thundering))
+	_thunder_seen = thundering
+	_rain_seen = raining
 	_setup_environment()
 	camera = Camera3D.new()
 	camera.fov = float(Settings.get_v("fov"))
@@ -204,6 +217,7 @@ func _ready() -> void:
 	hud.world = self
 	add_child(hud)
 	var vm := ViewModel.new()
+	view_model = vm
 	vm.world = self
 	if autoplay.has("nohand"):   # experiment: no first-person hand
 		vm.world = null
@@ -365,8 +379,17 @@ func _apply_dimension_env() -> void:
 	sky_state.setup(dim_type)
 	_apply_fog_distance()
 
+## A game rule by its 26.x id or its pre-26.1 name (inverted ones such as disableRaids answer the old meaning).
 func gamerule(name: String, default = null):
-	return gamerules.get(name, default)
+	if name == "doFireTick":
+		return int(gamerules.get("fire_spread_radius_around_player", 128)) != 0   # (removed rule: 0 = no fire spread)
+	var id := GameRules.canonical(name)
+	if id == "":
+		return default
+	var v = gamerules.get(id, default)
+	if GameRules.is_inverted_legacy(name) and v is bool:
+		return not v
+	return v
 
 
 var sky_state := SkyState.new()
@@ -497,6 +520,49 @@ func weather_at(p: Vector3) -> String:
 	return "snow" if t < 0.15 else "rain"
 
 
+## (probes) Block name at a position in the vanilla save ("New World", overworld), sections cached per chunk in `cache`.
+func _vanilla_block(cache: Dictionary, x: int, y: int, z: int) -> String:
+	var ck := Vector2i(x >> 4, z >> 4)
+	if not cache.has(ck):
+		var secs := {}
+		var rdir := OS.get_environment("APPDATA").path_join(".minecraft/saves/New World/dimensions/minecraft/overworld/region")
+		var fa := FileAccess.open(rdir.path_join("r.%d.%d.mca" % [ck.x >> 5, ck.y >> 5]), FileAccess.READ)
+		if fa != null:
+			var rb := fa.get_buffer(fa.get_length())
+			var ci := (ck.x & 31) + (ck.y & 31) * 32
+			var off := ((rb[ci * 4] << 16) | (rb[ci * 4 + 1] << 8) | rb[ci * 4 + 2]) * 4096
+			if off > 0:
+				var ln := (rb[off] << 24) | (rb[off + 1] << 16) | (rb[off + 2] << 8) | rb[off + 3]
+				var nb := NBT.parse(rb.slice(off + 5, off + 4 + ln).decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_DEFLATE))
+				for sec in nb.get("sections", []):
+					var bsd = sec.get("block_states", {})
+					if not (bsd is Dictionary):
+						continue
+					var names := PackedStringArray()
+					for pe in bsd.get("palette", []):
+						if pe is Dictionary:
+							names.append(str(pe.get("Name", pe.get("id", pe.get("", "?")))).trim_prefix("minecraft:"))
+						else:
+							names.append(str(pe).trim_prefix("minecraft:"))
+					var bits := 4
+					while (1 << bits) < names.size():
+						bits += 1
+					secs[int(sec.get("Y", 0))] = [names, bsd.get("data", PackedInt64Array()), bits]
+		cache[ck] = secs
+	var s = (cache[ck] as Dictionary).get(y >> 4)
+	if s == null:
+		return "?"
+	var names2: PackedStringArray = s[0]
+	if names2.size() <= 1:
+		return names2[0] if names2.size() == 1 else "?"
+	var per := 64 / int(s[2])
+	var bi := (y & 15) * 256 + (z & 15) * 16 + (x & 15)
+	var lw: int = (s[1] as PackedInt64Array)[bi / per]
+	var pi := (lw >> ((bi % per) * int(s[2]))) & ((1 << int(s[2])) - 1)
+	return names2[pi] if pi < names2.size() else "?"
+
+
+
 func state_at(x: int, y: int, z: int) -> int:
 	return cm.get_block(x, y, z)
 
@@ -518,6 +584,8 @@ func set_block(x: int, y: int, z: int, st: int, notify := true) -> int:
 	if old >= 0 and old != st and st > 0 and Res.blocks.st_block[st] == BlockUpdates._fire_id() and (old == 0 or Res.blocks.st_block[old] != Res.blocks.st_block[st]):
 		BlockUpdates.fire_placed(self, Vector3i(x, y, z))   # FireBlock.onPlace: first tick in 30..39
 	if old >= 0 and old != st:
+		if weather_fx != null:
+			weather_fx.block_changed(x, z)
 		BERender.on_block_changed(Vector3i(x, y, z), old, st)
 		Interaction.chest_unlink(self, Vector3i(x, y, z), old, st)
 		Creaking.on_block_changed(self, Vector3i(x, y, z), old)
@@ -528,9 +596,17 @@ func set_block(x: int, y: int, z: int, st: int, notify := true) -> int:
 	if old >= 0 and old != st and not Net.is_client():
 		Portals.on_block_changed(self, Vector3i(x, y, z), old, st)
 		if notify:
-			Redstone.notify_observers(self, Vector3i(x, y, z))
-			Redstone.request(self, Vector3i(x, y, z))
+			# listeners whose blocks exist within 2 blocks (exact filter: they would find nothing to do otherwise)
+			var im := Interest.near(self, Vector3i(x, y, z), 2) | Interest.of(st) | Interest.of(old)
+			if im & Interest.OBSERVER:
+				Redstone.notify_observers(self, Vector3i(x, y, z))
+			if im & (Interest.WIRE | Interest.CONSUMER) and not Interest.rs_inert_change(old, st):
+				# (a flowing-water step next to a wire network re-solved the whole network: 20 ms in an ancient city)
+				Redstone.request(self, Vector3i(x, y, z))
 			ShapeUpdates.on_changed(self, Vector3i(x, y, z), old, st)   # fences / walls / panes / stairs / gates / paths
+			BlockUpdates.fluids_changed(self, Vector3i(x, y, z))   # fluid neighbour updates (flow ticks, lava + water)
+			if im & Interest.CORAL:
+				Growth.on_changed(self, Vector3i(x, y, z))   # coral without water dies 60-99 ticks later
 	return old
 
 
@@ -540,6 +616,7 @@ func _update_origin(force := false) -> void:
 	if force or absf(p.x - o.x) > REBASE or absf(p.z - o.z) > REBASE:
 		var no := Vector3i(int(floor(p.x / 16.0)) * 16, 0, int(floor(p.z / 16.0)) * 16)
 		cm.set_origin(no)
+		Audio.origin = Vector3(no)
 
 
 func vis(p: Vector3) -> Vector3:
@@ -619,6 +696,9 @@ func _process(delta: float) -> void:
 	var p0 := Time.get_ticks_usec()
 	var alpha := clampf(tick_accum / TICK, 0.0, 1.0)
 	_update_camera(alpha)
+	# particles / rain splashes / weather interpolate between ticks on the GPU (Java render-time partial tick)
+	ShaderGlobals.put(&"mc_ticks", float(int(game_time) & 131071))
+	ShaderGlobals.put(&"mc_partial", alpha)
 	if weather_fx != null:
 		weather_fx.set_partial(alpha)
 	Beacons.render(self)
@@ -1165,6 +1245,15 @@ func _auto_run() -> void:
 				if gi < 9 and Res.items.id(gn) > 0:
 					player.inventory.set_slot(gi, ItemStack.named(gn, 1))
 					gi += 1
+		if autoplay.has("enchanted"):   # --enchanted=1: glint probe - the hotbar items enchanted, an enchanted chestplate worn
+			for gi2 in 9:
+				var es := player.inventory.get_slot(gi2)
+				if not es.is_empty():
+					es.components["minecraft:enchantments"] = {"minecraft:unbreaking": 1}
+					player.inventory.set_slot(gi2, es)
+			var ecp := ItemStack.named("diamond_chestplate")
+			ecp.components["minecraft:enchantments"] = {"minecraft:protection": 1}
+			player.inventory.set_slot(Inventory.ARMOR0 + 2, ecp)
 		if sname.begins_with("ws_") or sname.begins_with("ct_"):
 			# probe: place the block and open its workstation / container screen
 			var kd := sname.substr(3)
@@ -2100,6 +2189,10 @@ func _auto_run() -> void:
 				await get_tree().process_frame
 			for i in (60 if autoplay.has("camwait") else 0):
 				await get_tree().process_frame
+		if autoplay.has("shotwait"):   # --shotwait=ms: let the world run (flows, growth) before the views
+			var sw0 := Time.get_ticks_msec()
+			while Time.get_ticks_msec() - sw0 < int(autoplay["shotwait"]):
+				await get_tree().process_frame
 		if autoplay.has("spawnov"):   # --spawnov=x,z: structure spawn override on the top nether brick of a column
 			var so: PackedStringArray = str(autoplay["spawnov"]).split(",")
 			var sx := int(so[0])
@@ -2290,7 +2383,7 @@ func _auto_run() -> void:
 			player.pitch = float(autoplay.get("pitch", "40"))
 			raining = true
 			rain = 1.0
-			gamerules["doWeatherCycle"] = false
+			gamerules["advance_weather"] = false
 			for i in 80:
 				await get_tree().process_frame
 			weather_fx.frozen = true
@@ -2343,9 +2436,797 @@ func _auto_run() -> void:
 			weather_fx.set_full_quad(false)
 			print("[raincheck] gpu ms per frame: visible-texel runs %.3f, whole column quads %.3f, no weather %.3f" % [gsum["runs"], gsum["full quads"], gsum["none"]])
 			weather_fx.frozen = false
+		if autoplay.has("vrefs"):
+			# --vrefs=X.Z: chunks of vanilla region r.X.Z whose structure references are not empty (what / where)
+			var rdir2 := OS.get_environment("APPDATA").path_join(".minecraft/saves/New World/dimensions/minecraft/overworld/region")
+			var fa2 := FileAccess.open(rdir2.path_join("r.%s.mca" % str(autoplay["vrefs"])), FileAccess.READ)
+			var rb2 := fa2.get_buffer(fa2.get_length())
+			var nshow := 0
+			var seen := {}
+			for ci2 in 1024:
+				var off2 := ((rb2[ci2 * 4] << 16) | (rb2[ci2 * 4 + 1] << 8) | rb2[ci2 * 4 + 2]) * 4096
+				if off2 == 0:
+					continue
+				var ln2 := (rb2[off2] << 24) | (rb2[off2 + 1] << 16) | (rb2[off2 + 2] << 8) | rb2[off2 + 3]
+				var raw2 := rb2.slice(off2 + 5, off2 + 4 + ln2).decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_DEFLATE)
+				var hx := raw2.hex_encode()
+				if hx.find("5265666572656e636573") < 0:   # "References"
+					continue
+				var nb2 := NBT.parse(raw2)
+				var sd = nb2.get("structures", {})
+				var refs = sd.get("References", {}) if sd is Dictionary else {}
+				if refs is Dictionary and not (refs as Dictionary).is_empty():
+					for rk in refs:
+						var arr: PackedInt64Array = refs[rk]
+						for pk in arr:
+							var sx := int(pk << 32 >> 32)
+							var sz := int(pk >> 32)
+							var key2 := "%s %d %d" % [rk, sx, sz]
+							if not seen.has(key2):
+								seen[key2] = true
+								print("[vrefs] %s -> start chunk (%d, %d); this chunk status %s, structures keys %s" % [rk, sx, sz, str(nb2.get("Status", "?")), str((sd as Dictionary).keys())])
+								nshow += 1
+				if nshow > 25:
+					break
+		if autoplay.has("topmap"):
+			# --topmap=x0.z0.x1.z1: top-down map of the highest non-air block per column (L leaves, T log, # structure-ish
+			# solid, = path, . grass / dirt, ~ water, s sand / snow, o other)
+			var tmv := str(autoplay["topmap"]).split(".")
+			player.pos = Vector3((int(tmv[0]) + int(tmv[2])) / 2, 150, (int(tmv[1]) + int(tmv[3])) / 2)
+			player.prev_pos = player.pos
+			_update_origin(true)
+			for i in 60:
+				await get_tree().process_frame
+			var tm0 := Time.get_ticks_msec()
+			while cm.pending_jobs() > 0 and Time.get_ticks_msec() - tm0 < 60000:
+				await get_tree().process_frame
+			for z in range(int(tmv[1]), int(tmv[3]) + 1):
+				var row := ""
+				for x in range(int(tmv[0]), int(tmv[2]) + 1):
+					var ch2 := "?"
+					for y in range(200, -10, -1):
+						var s := state_at(x, y, z)
+						if s <= 0 or (Res.blocks.st_flags[s] & BlockRegistry.F_AIR) != 0:
+							continue
+						var n := Res.blocks.name_of(s)
+						if n.ends_with("_leaves"):
+							ch2 = "L"
+						elif n.ends_with("_log") or n.ends_with("_wood"):
+							ch2 = "T"
+						elif n == "dirt_path":
+							ch2 = "="
+						elif n in ["grass_block", "dirt", "podzol", "coarse_dirt", "short_grass", "tall_grass", "fern", "large_fern"] or n.ends_with("flower") or n in ["dandelion", "poppy", "leaf_litter", "bush"]:
+							ch2 = "."
+						elif n == "water":
+							ch2 = "~"
+						elif n in ["sand", "snow", "snow_block", "gravel", "stone"]:
+							ch2 = "s"
+						elif n.find("plank") >= 0 or n.find("cobble") >= 0 or n.find("glass") >= 0 or n.find("stairs") >= 0 or n.find("slab") >= 0 or n.find("fence") >= 0 or n.find("door") >= 0 or n == "bell" or n.find("wool") >= 0 or n.find("hay") >= 0 or n.find("terracotta") >= 0 or n.find("stripped") >= 0:
+							ch2 = "#"
+						else:
+							ch2 = "o"
+						break
+					row += ch2
+				print("[topmap] %5d %s" % [z, row])
+		if autoplay.has("treecmp"):
+			# --treecmp=bx0.bz0.bx1.bz1: villages (and other template structures) starting in the block range of the vanilla
+			# save: logs / leaves inside each piece box and in a 4-block ring around it, ours vs the vanilla save
+			var tr := str(autoplay["treecmp"]).split(".")
+			var vc := {}
+			var tot := [0, 0, 0, 0]
+			for st in gen.structures.sets:
+				for sc in gen.structures._candidates(st, (int(tr[0]) + int(tr[2])) >> 5, (int(tr[1]) + int(tr[3])) >> 5, 64):
+					var scv: Vector2i = sc
+					if scv.x * 16 < int(tr[0]) or scv.x * 16 > int(tr[2]) or scv.y * 16 < int(tr[1]) or scv.y * 16 > int(tr[3]):
+						continue
+					var res: Dictionary = gen.structures._start(st, scv)
+					if res.is_empty() or not res.has("pieces"):
+						continue
+					var nm := str(res["structure"])
+					if autoplay.has("treecmpf") and nm.find(str(autoplay["treecmpf"])) < 0:
+						continue
+					player.pos = Vector3((scv.x << 4) + 8, 150, (scv.y << 4) + 8)
+					player.prev_pos = player.pos
+					_update_origin(true)
+					for i in 60:
+						await get_tree().process_frame
+					var tw0 := Time.get_ticks_msec()
+					while cm.pending_jobs() > 0 and Time.get_ticks_msec() - tw0 < 60000:
+						await get_tree().process_frame
+					var cnt := [0, 0, 0, 0]   # ours in, ours ring, java in, java ring
+					var seen_t := {}
+					var dlist: Array = []
+					for pc in res["pieces"]:
+						var el: Dictionary = pc["el"]
+						if str(el.get("t", "")) == "feature":
+							if autoplay.has("treecmpd"):
+								print("[treecmp]   feature piece %s at %s" % [str(el.get("feature", el.get("loc", "?"))), str(pc["pos"])])
+							continue
+						var pb: Array = pc["box"]
+						for y in range(pb[0].y, pb[1].y + 6):
+							for z in range(pb[0].z - 4, pb[1].z + 5):
+								for x in range(pb[0].x - 4, pb[1].x + 5):
+									var q := Vector3i(x, y, z)
+									if seen_t.has(q):
+										continue
+									seen_t[q] = true
+									var inside: bool = x >= pb[0].x and x <= pb[1].x and z >= pb[0].z and z <= pb[1].z and y <= pb[1].y
+									var on := Res.blocks.name_of(maxi(0, state_at(x, y, z)))
+									var jn := _vanilla_block(vc, x, y, z)
+									if on.ends_with("_leaves") or on.ends_with("_log"):
+										cnt[0 if inside else 1] += 1
+									if jn.ends_with("_leaves") or jn.ends_with("_log"):
+										cnt[2 if inside else 3] += 1
+									var ot := on.ends_with("_leaves") or on.ends_with("_log")
+									var jt := jn.ends_with("_leaves") or jn.ends_with("_log")
+									if ot != jt and jn != "?" and dlist.size() < 60:
+										dlist.append("(%d,%d,%d) ours %s java %s" % [x, y, z, on, jn])
+					for k in 4:
+						tot[k] += cnt[k]
+					if autoplay.has("treecmpd"):
+						print("[treecmp]   diffs: ", "; ".join(dlist))
+					print("[treecmp] %s start chunk %s, %d pieces: logs+leaves inside pieces ours %d / java %d, 4-block ring ours %d / java %d" % [nm, str(scv), (res["pieces"] as Array).size(), cnt[0], cnt[2], cnt[1], cnt[3]])
+			print("[treecmp] TOTAL inside ours %d / java %d, ring ours %d / java %d" % [tot[0], tot[2], tot[1], tot[3]])
+		if autoplay.has("structcheck"):
+			# --structcheck=1: every forced structure write (last one per position) vs the finished, decorated world
+			Features._srm.lock()
+			var sw := Features.struct_writes.duplicate()
+			Features._srm.unlock()
+			var last := {}
+			for k in range(0, sw.size(), 5):
+				if sw[k + 4] == Features.W_FORCE:
+					last[Vector3i(sw[k], sw[k + 1], sw[k + 2])] = sw[k + 3]
+			var nchk := 0
+			var nbad := 0
+			var by_now := {}
+			var samples: Array = []
+			for p in last:
+				var pv: Vector3i = p
+				var ch := cm.get_chunk(pv.x >> 4, pv.z >> 4)
+				if ch == null or ch.state < Chunk.DECORATED:
+					continue
+				nchk += 1
+				var want: int = last[p]
+				var now := state_at(pv.x, pv.y, pv.z)
+				if now != want:
+					nbad += 1
+					var key := "%s <- %s" % [Res.blocks.name_of(now), Res.blocks.name_of(want)]
+					by_now[key] = int(by_now.get(key, 0)) + 1
+					if samples.size() < 30:
+						samples.append("(%d,%d,%d) %s" % [pv.x, pv.y, pv.z, key])
+			var keys := by_now.keys()
+			keys.sort_custom(func(a, b): return by_now[a] > by_now[b])
+			print("[structcheck] structure writes checked %d, lost %d" % [nchk, nbad])
+			for kk in keys.slice(0, 25):
+				print("[structcheck]   %6d  now %s" % [by_now[kk], kk])
+			print("[structcheck] e.g. ", "; ".join(samples))
+		if autoplay.has("vfind"):
+			# --vfind=x0.z0.x1.z1.y0.y1.name: positions of a block (by name) in our world and in the vanilla save area
+			var fp := str(autoplay["vfind"]).split(".")
+			var fid := Res.blocks.block_id(fp[6])
+			var found: Array = []
+			for fy in range(int(fp[4]), int(fp[5]) + 1):
+				for fz in range(int(fp[1]), int(fp[3]) + 1):
+					for fx in range(int(fp[0]), int(fp[2]) + 1):
+						var fs := state_at(fx, fy, fz)
+						if fs > 0 and Res.blocks.st_block[fs] == fid:
+							found.append("(%d,%d,%d)" % [fx, fy, fz])
+			print("[vfind] OURS %s: %d %s" % [fp[6], found.size(), " ".join(found.slice(0, 60))])
+			var vcache := {}
+			var jfound: Array = []
+			for fy in range(int(fp[4]), int(fp[5]) + 1):
+				for fz in range(int(fp[1]), int(fp[3]) + 1):
+					for fx in range(int(fp[0]), int(fp[2]) + 1):
+						if _vanilla_block(vcache, fx, fy, fz) == fp[6]:
+							jfound.append("(%d,%d,%d)" % [fx, fy, fz])
+			print("[vfind] JAVA %s: %d %s" % [fp[6], jfound.size(), " ".join(jfound.slice(0, 60))])
+		if autoplay.has("vbiome"):
+			# --vbiome=x0.z0.x1.z1.y: biome per 4x4 quart at height y, vanilla save vs ours (differences listed)
+			var bp := str(autoplay["vbiome"]).split(".")
+			var by := int(bp[4])
+			var rdirb := OS.get_environment("APPDATA").path_join(".minecraft/saves/New World/dimensions/minecraft/overworld/region")
+			var bcache := {}
+			var nsame := 0
+			var ndiff := 0
+			var dl: Array = []
+			for qz in range(int(bp[1]) >> 2, (int(bp[3]) >> 2) + 1):
+				for qx in range(int(bp[0]) >> 2, (int(bp[2]) >> 2) + 1):
+					var x := qx << 2
+					var z := qz << 2
+					var ck := Vector2i(x >> 4, z >> 4)
+					if not bcache.has(ck):
+						var bsecs := {}
+						var fa := FileAccess.open(rdirb.path_join("r.%d.%d.mca" % [ck.x >> 5, ck.y >> 5]), FileAccess.READ)
+						if fa != null:
+							var rb := fa.get_buffer(fa.get_length())
+							var ci := (ck.x & 31) + (ck.y & 31) * 32
+							var off := ((rb[ci * 4] << 16) | (rb[ci * 4 + 1] << 8) | rb[ci * 4 + 2]) * 4096
+							if off > 0:
+								var ln := (rb[off] << 24) | (rb[off + 1] << 16) | (rb[off + 2] << 8) | rb[off + 3]
+								var nb := NBT.parse(rb.slice(off + 5, off + 4 + ln).decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_DEFLATE))
+								for sec in nb.get("sections", []):
+									var bio = sec.get("biomes", {})
+									if bio is Dictionary:
+										bsecs[int(sec.get("Y", 0))] = [bio.get("palette", []), bio.get("data", PackedInt64Array())]
+						bcache[ck] = bsecs
+					var s = (bcache[ck] as Dictionary).get(by >> 4)
+					if s == null:
+						continue
+					var pal: Array = s[0]
+					var jb := "?"
+					if pal.size() == 1:
+						jb = str(pal[0]).trim_prefix("minecraft:")
+					elif pal.size() > 1:
+						var bits := 1
+						while (1 << bits) < pal.size():
+							bits += 1
+						var per := 64 / bits
+						var bi := (((by & 15) >> 2) << 4) | (((z & 15) >> 2) << 2) | ((x & 15) >> 2)
+						var lw: int = (s[1] as PackedInt64Array)[bi / per]
+						jb = str(pal[(lw >> ((bi % per) * bits)) & ((1 << bits) - 1)]).trim_prefix("minecraft:")
+					var och := cm.get_chunk(x >> 4, z >> 4)
+					if och == null:
+						continue
+					var ob: String = biomes.names[och.biome_at(x & 15, by, z & 15)]
+					if ob.trim_prefix("minecraft:") == jb:
+						nsame += 1
+					else:
+						ndiff += 1
+						if dl.size() < 30:
+							dl.append("(%d,%d,%d) ours %s java %s" % [x, by, z, ob, jb])
+			print("[vbiome] y %d: %d quarts equal, %d differ: %s" % [by, nsame, ndiff, "; ".join(dl)])
+		if autoplay.has("vcol"):
+			print("[vcol] precipitation calls %d columns %d snow %d ice %d, raining %s" % [BlockUpdates.pr_stats[0], BlockUpdates.pr_stats[1], BlockUpdates.pr_stats[2], BlockUpdates.pr_stats[3], str(raining)])
+			# --vcol=x.z.y0.y1_x.z.y0.y1: block names of a column in the vanilla save vs ours (top down)
+			var rdir5 := OS.get_environment("APPDATA").path_join(".minecraft/saves/New World/dimensions/minecraft/overworld/region")
+			for spec in str(autoplay["vcol"]).split("_"):
+				var sp := spec.split(".")
+				var vx := int(sp[0])
+				var vz := int(sp[1])
+				var vy0 := int(sp[2])
+				var vy1 := int(sp[3])
+				var vsecs := {}
+				var fa5 := FileAccess.open(rdir5.path_join("r.%d.%d.mca" % [vx >> 9, vz >> 9]), FileAccess.READ)
+				if fa5 != null:
+					var rb5 := fa5.get_buffer(fa5.get_length())
+					var ci5 := ((vx >> 4) & 31) + ((vz >> 4) & 31) * 32
+					var off5 := ((rb5[ci5 * 4] << 16) | (rb5[ci5 * 4 + 1] << 8) | rb5[ci5 * 4 + 2]) * 4096
+					if off5 > 0:
+						var ln5 := (rb5[off5] << 24) | (rb5[off5 + 1] << 16) | (rb5[off5 + 2] << 8) | rb5[off5 + 3]
+						var nb5 := NBT.parse(rb5.slice(off5 + 5, off5 + 4 + ln5).decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_DEFLATE))
+						for sec in nb5.get("sections", []):
+							vsecs[int(sec.get("Y", 0))] = sec.get("block_states", {})
+				for vy in range(vy1, vy0 - 1, -1):
+					var jname := "?"
+					var bsd = vsecs.get(vy >> 4)
+					if bsd is Dictionary:
+						var pal: Array = bsd.get("palette", [])
+						var pi5 := 0
+						if pal.size() > 1 and bsd.has("data"):
+							var bits := 4
+							while (1 << bits) < pal.size():
+								bits += 1
+							var per := 64 / bits
+							var bi := (vy & 15) * 256 + (vz & 15) * 16 + (vx & 15)
+							var lw: int = bsd["data"][bi / per]
+							pi5 = (lw >> ((bi % per) * bits)) & ((1 << bits) - 1)
+						if pi5 < pal.size():
+							var pe5 = pal[pi5]
+							if pe5 is Dictionary:
+								jname = str(pe5.get("Name", pe5.get("id", pe5.get("", "?")))).trim_prefix("minecraft:")
+								if jname == "?":
+									jname = "?" + str(pe5)
+								if pe5.has("Properties"):
+									jname += str(pe5["Properties"]).replace(" ", "")
+								elif pe5.has("properties"):
+									jname += str(pe5["properties"]).replace(" ", "")
+							else:
+								jname = str(pe5).trim_prefix("minecraft:")
+					if jname == "?" and bsd is Dictionary:
+						jname = "? pal %d data %s first %s" % [(bsd.get("palette", []) as Array).size(), str(bsd.get("data", PackedInt64Array()).size()) if bsd.has("data") else "-", str(bsd.get("palette", [null])[0])]
+					var oname := Res.blocks.state_string(state_at(vx, vy, vz))
+					print("[vcol] (%d, %d, %d) JAVA %s | OURS %s" % [vx, vy, vz, jname, oname])
+		if autoplay.has("vgrid"):
+			# --vgrid=x0.z0.x1.z1: vanilla OCEAN_FLOOR heightmap (full chunks only) vs our world's top colliding non-fluid
+			# block over a block area (structures included on both sides): difference histogram + worst columns
+			var gp := str(autoplay["vgrid"]).split(".")
+			var gx0 := int(gp[0])
+			var gz0 := int(gp[1])
+			var gx1 := int(gp[2])
+			var gz1 := int(gp[3])
+			var rdir4 := OS.get_environment("APPDATA").path_join(".minecraft/saves/New World/dimensions/minecraft/overworld/region")
+			var hcache := {}
+			var hist := {}
+			var bad: Array = []
+			var fl4: PackedInt32Array = Res.blocks.st_flags
+			for gz in range(gz0, gz1 + 1):
+				for gx in range(gx0, gx1 + 1):
+					var ck := Vector2i(gx >> 4, gz >> 4)
+					if not hcache.has(ck):
+						hcache[ck] = null
+						var fa4 := FileAccess.open(rdir4.path_join("r.%d.%d.mca" % [gx >> 9, gz >> 9]), FileAccess.READ)
+						if fa4 != null:
+							var rb4 := fa4.get_buffer(fa4.get_length())
+							var ci4 := (ck.x & 31) + (ck.y & 31) * 32
+							var off4 := ((rb4[ci4 * 4] << 16) | (rb4[ci4 * 4 + 1] << 8) | rb4[ci4 * 4 + 2]) * 4096
+							if off4 > 0:
+								var ln4 := (rb4[off4] << 24) | (rb4[off4 + 1] << 16) | (rb4[off4 + 2] << 8) | rb4[off4 + 3]
+								var nb4 := NBT.parse(rb4.slice(off4 + 5, off4 + 4 + ln4).decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_DEFLATE))
+								if str(nb4.get("Status", "")).ends_with("full"):
+									hcache[ck] = nb4.get("Heightmaps", {}).get("OCEAN_FLOOR")
+					var la4 = hcache[ck]
+					var och := cm.get_chunk(ck.x, ck.y)
+					if la4 == null or och == null or och.state < Chunk.DECORATED:
+						continue
+					var idx4 := (gx & 15) + (gz & 15) * 16
+					var jv := ((int(la4[idx4 / 7]) >> ((idx4 % 7) * 9)) & 511) - 64
+					var oy := Coords.MAX_Y - 1
+					while oy > Coords.MIN_Y:
+						var s4 := state_at(gx, oy, gz)
+						if s4 > 0 and (fl4[s4] & BlockRegistry.F_LIQUID) == 0 and (fl4[s4] & BlockRegistry.F_COLLIDE) != 0:
+							break
+						oy -= 1
+					var dd4 := (oy + 1) - jv
+					hist[dd4] = int(hist.get(dd4, 0)) + 1
+					if dd4 != 0 and bad.size() < 40:
+						bad.append("(%d,%d) ours %d java %d top %s" % [gx, gz, oy + 1, jv, Res.blocks.name_of(state_at(gx, oy, gz))])
+			var hk := hist.keys()
+			hk.sort()
+			print("[vgrid] ours - java histogram: %s" % ", ".join(hk.map(func(k): return "%d:%d" % [k, hist[k]])))
+			for bl in bad:
+				print("[vgrid]   %s" % bl)
+		if autoplay.has("vheight"):
+			# --vheight=x.z_x.z: vanilla save heightmaps at block columns (status, WORLD_SURFACE(_WG), OCEAN_FLOOR) vs ours
+			var rdir3 := OS.get_environment("APPDATA").path_join(".minecraft/saves/New World/dimensions/minecraft/overworld/region")
+			for colspec in str(autoplay["vheight"]).split("_"):
+				var cxz := colspec.split(".")
+				var bx := int(cxz[0])
+				var bz := int(cxz[1])
+				var fa3 := FileAccess.open(rdir3.path_join("r.%d.%d.mca" % [bx >> 9, bz >> 9]), FileAccess.READ)
+				if fa3 == null:
+					print("[vheight] (%d, %d): no region" % [bx, bz])
+					continue
+				var rb3 := fa3.get_buffer(fa3.get_length())
+				var ci3 := ((bx >> 4) & 31) + ((bz >> 4) & 31) * 32
+				var off3 := ((rb3[ci3 * 4] << 16) | (rb3[ci3 * 4 + 1] << 8) | rb3[ci3 * 4 + 2]) * 4096
+				var hs := ""
+				if off3 > 0:
+					var ln3 := (rb3[off3] << 24) | (rb3[off3 + 1] << 16) | (rb3[off3 + 2] << 8) | rb3[off3 + 3]
+					var nb3 := NBT.parse(rb3.slice(off3 + 5, off3 + 4 + ln3).decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_DEFLATE))
+					hs = "status %s" % str(nb3.get("Status", "?"))
+					var hm = nb3.get("Heightmaps", {})
+					for hk in hm:
+						var la = hm[hk]
+						var idx := (bx & 15) + (bz & 15) * 16
+						var lv: int = la[idx / 7]
+						var v := (lv >> ((idx % 7) * 9)) & 511
+						hs += ", %s %d" % [hk, v - 64]
+				print("[vheight] (%d, %d): JAVA %s | OURS first_free_height %d, ocean floor %d" % [bx, bz, hs, gen.structures.first_free_height(bx, bz), gen.structures.first_free_height(bx, bz, true)])
+		if autoplay.has("vcompare"):
+			# --vcompare=region,region,...: structure starts in the vanilla save ("New World", region files r.X.Z) vs ours for
+			# the same chunks (run with that world's seed): piece ids / boxes, to find vertical offsets
+			var rdir := OS.get_environment("APPDATA").path_join(".minecraft/saves/New World/dimensions/minecraft/overworld/region")
+			var shown := 0
+			var vset_name := str(autoplay["vcompare"])   # structure set, e.g. villages
+			var cands: Array = []
+			for vs in gen.structures.sets:
+				var vsn := str(vs["name"]).trim_prefix("minecraft:")
+				if (vsn == vset_name or (vset_name == "all" and not vsn in ["strongholds", "mineshafts", "nether_complexes", "end_cities", "nether_fossils", "buried_treasures"])) and not str(vs["placement"].get("type", "")).ends_with("concentric_rings"):
+					cands.append_array(gen.structures._candidates(vs, 0, 0, int(autoplay.get("vrad", "40"))))
+			print("[vcompare] %d candidate chunks for %s" % [cands.size(), vset_name])
+			print("[vcompare] world seed %d; first candidates %s" % [gen.seed, str(cands.slice(0, 20))])
+			for vs2 in gen.structures.sets:
+				if str(vs2["name"]).trim_prefix("minecraft:") in ["villages", "igloos", "trial_chambers"]:
+					print("[vcompare] set %s placement %s; near (21, 6): %s" % [vs2["name"], str(vs2["placement"]), str(gen.structures._candidates(vs2, 21, 6, 20))])
+			var rcache := {}
+			for cc in cands:
+				var rkey := "%d.%d" % [cc.x >> 5, cc.y >> 5]
+				if not rcache.has(rkey):
+					var fa := FileAccess.open(rdir.path_join("r.%s.mca" % rkey), FileAccess.READ)
+					rcache[rkey] = fa.get_buffer(fa.get_length()) if fa != null else PackedByteArray()
+				var rb: PackedByteArray = rcache[rkey]
+				if rb.size() < 8192:
+					continue
+				for ci in [(cc.x & 31) + (cc.y & 31) * 32]:
+					var off := ((rb[ci * 4] << 16) | (rb[ci * 4 + 1] << 8) | rb[ci * 4 + 2]) * 4096
+					if off == 0 or off + 5 > rb.size():
+						continue
+					var ln := (rb[off] << 24) | (rb[off + 1] << 16) | (rb[off + 2] << 8) | rb[off + 3]
+					var ct := rb[off + 4]
+					if ct != 2 or ln <= 1:
+						continue
+					var raw := rb.slice(off + 5, off + 4 + ln).decompress_dynamic(32 * 1024 * 1024, FileAccess.COMPRESSION_DEFLATE)
+					if raw.is_empty():
+						continue
+					var nb := NBT.parse(raw)
+					var sts = nb.get("structures", {}).get("starts", {})
+					if sts is Dictionary and not (sts as Dictionary).is_empty():
+						print("[vcompare] chunk %s: status %s, starts %s" % [str(cc), str(nb.get("Status", "?")), str((sts as Dictionary).keys())])
+					for sid in sts:
+						var stt: Dictionary = sts[sid]
+						if not stt.has("Children") or (stt["Children"] as Array).is_empty():
+							continue
+						var scx := int(stt.get("ChunkX", 0))
+						var scz := int(stt.get("ChunkZ", 0))
+						var lines: Array = []
+						for ch in stt["Children"]:
+							var bb: PackedInt32Array = ch.get("BB", PackedInt32Array())
+							var loc := ""
+							var pe = ch.get("pool_element", {})
+							if pe is Dictionary:
+								loc = str(pe.get("location", ""))
+							lines.append("%s %s %s" % [str(ch.get("id", "")).trim_prefix("minecraft:"), str(bb), loc.get_file()])
+						print("[vcompare] JAVA %s at chunk (%d, %d): %d pieces" % [sid, scx, scz, lines.size()])
+						for li in mini(int(autoplay.get("vlines", "6")), lines.size()):
+							print("[vcompare]   %s" % lines[li])
+						# ours: the set holding this structure
+						var nm := str(sid).trim_prefix("minecraft:")
+						for sset in gen.structures.sets:
+							var has := false
+							for en in sset["entries"]:
+								if str(en["name"]) == nm:
+									has = true
+							if not has:
+								continue
+							var ours: Dictionary = gen.structures._start(sset, Vector2i(scx, scz))
+							var ps: Array = ours.get("pieces", [])
+							print("[vcompare] OURS %s: %s, %d pieces" % [nm, str(ours.get("structure", "-")), ps.size()])
+							for pi in mini(int(autoplay.get("vlines", "6")), ps.size()):
+								var pb: Array = ps[pi]["box"]
+								print("[vcompare]   [%d, %d, %d, %d, %d, %d] %s" % [pb[0].x, pb[0].y, pb[0].z, pb[1].x, pb[1].y, pb[1].z, str(ps[pi].get("el", "")).get_file()])
+						shown += 1
+						if shown >= int(autoplay.get("vmax", "4")):
+							break
+					if shown >= int(autoplay.get("vmax", "4")):
+						break
+				if shown >= int(autoplay.get("vmax", "4")):
+					break
+		if autoplay.has("daytest"):   # --daytest=1: day time ticks per real second (Java: 20; a day 24000 = 20 min)
+			var dt0 := day_time
+			var gt0d := game_time
+			var ms0 := Time.get_ticks_msec()
+			while Time.get_ticks_msec() - ms0 < 10000:
+				await get_tree().process_frame
+			var el := (Time.get_ticks_msec() - ms0) / 1000.0
+			print("[daytest] %.1f s: day_time +%d (%.2f / s), game_time +%d (%.2f / s), doDaylightCycle %s" % [el, posmod(day_time - dt0, 24000), posmod(day_time - dt0, 24000) / el, game_time - gt0d, (game_time - gt0d) / el, str(gamerule("doDaylightCycle", true))])
+		if autoplay.has("airpockets"):
+			# --airpockets=R: air cells below sea level with water beside / above them within R blocks of the camera
+			var ar := int(autoplay["airpockets"])
+			var ac := Vector3i(int(floor(player.pos.x)), 0, int(floor(player.pos.z)))
+			var found := 0
+			var samples: Array = []
+			var below_names := {}
+			for az in range(-ar, ar + 1):
+				for ax in range(-ar, ar + 1):
+					for ay in range(-60, 63):
+						var s0 := state_at(ac.x + ax, ay, ac.z + az)
+						if s0 != 0:
+							continue
+						var wn := 0
+						for dv in [Vector3i(0, 1, 0), Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
+							var sn := state_at(ac.x + ax + dv.x, ay + dv.y, ac.z + az + dv.z)
+							if sn > 0 and Res.blocks.st_flags[sn] & (BlockRegistry.F_LIQUID | BlockRegistry.F_WATERLOGGED):
+								wn += 1
+						if wn >= 2:
+							found += 1
+							var bn := Res.blocks.name_of(maxi(0, state_at(ac.x + ax, ay - 1, ac.z + az)))
+							below_names[bn] = int(below_names.get(bn, 0)) + 1
+							if samples.size() < 12:
+								samples.append(Vector3i(ac.x + ax, ay, ac.z + az))
+			print("[airpockets] %d air cells with >= 2 water neighbours; blocks below: %s; e.g. %s" % [found, str(below_names), str(samples)])
+		if autoplay.has("fluidtest"):
+			# --fluidtest: stone platform 31 x 31 at the camera (walled), a water source poured by the bucket path in the
+			# middle; flow counted every 10 game ticks (Java: radius-7 diamond, 113 cells, after ~8 x 5 ticks). Then lava
+			# placed next to the water: ticks until obsidian / cobblestone.
+			var fb := Vector3i(int(floor(player.pos.x)), int(floor(player.pos.y)) + 20, int(floor(player.pos.z)))
+			var stone := Res.blocks.default_state("stone")
+			for fz in range(-16, 17):
+				for fx in range(-16, 17):
+					for fy in range(-1, 3):
+						var wall := absi(fx) == 16 or absi(fz) == 16
+						set_block(fb.x + fx, fb.y + fy, fb.z + fz, stone if fy == -1 or wall else 0)
+			BlockUpdates.reset()
+			await get_tree().process_frame
+			set_block(fb.x, fb.y, fb.z, Res.blocks.WATER)
+			BlockUpdates.schedule(self, fb, 5)
+			var gt0 := game_time
+			var counts := []
+			var busy_since := -1
+			var max_busy := 0
+			var chg: Array = []   # [block epoch, msec] of each change seen in the centre chunk's platform layer
+			var max_stale := 0
+			var last_hash := 0
+			var gid := Coords.chunk_key(fb.x >> 4, fb.z >> 4) * 8 + (fb.y - Coords.MIN_Y) / Mesher.GH
+			# per cell of the whole 31 x 31 layer: the game tick and frame of every change and when its mesh group showed
+			# it (flow cadence: Java shows every 5-tick step on the next frame)
+			var fprev := PackedInt32Array()
+			fprev.resize(31 * 31)
+			var fpend: Array = []   # [x, z, block epoch, usec changed, game tick]
+			var fdone: Dictionary = {}   # game tick -> [cells, first change usec, last change usec, last shown usec]
+			var fsu0 := BlockUpdates.sched_total_us
+			var fsn0 := BlockUpdates.sched_total_n
+			BlockUpdates.sched_peak_us = 0
+			while game_time - gt0 < 80:
+				await get_tree().process_frame
+				var fnow := Time.get_ticks_usec()
+				for fz4 in range(-15, 16):
+					for fx4 in range(-15, 16):
+						var fi := (fz4 + 15) * 31 + fx4 + 15
+						var fs4 := state_at(fb.x + fx4, fb.y, fb.z + fz4)
+						if fs4 != fprev[fi]:
+							fprev[fi] = fs4
+							fpend.append([fb.x + fx4, fb.z + fz4, cm.block_epoch, fnow, game_time])
+				var fkeep: Array = []
+				for fe in fpend:
+					if cm.mesh_caught_up(int(fe[0]), fb.y, int(fe[1]), int(fe[2])):
+						var fd: Array = fdone.get(int(fe[4]), [0, 1 << 62, 0, 0])
+						fdone[int(fe[4])] = [int(fd[0]) + 1, mini(int(fd[1]), int(fe[3])), maxi(int(fd[2]), int(fe[3])), maxi(int(fd[3]), fnow)]
+					else:
+						fkeep.append(fe)
+				fpend = fkeep
+				var hsh := 0
+				for hz in 16:
+					for hx in 16:
+						hsh = hsh * 31 + state_at((fb.x & ~15) + hx, fb.y, (fb.z & ~15) + hz)
+				if hsh != last_hash:
+					last_hash = hsh
+					chg.append([cm.block_epoch, Time.get_ticks_msec()])
+				var shown_ep := int(cm.dbg_bepoch.get(gid, -1))
+				while not chg.is_empty() and int(chg[0][0]) <= shown_ep:
+					max_stale = maxi(max_stale, Time.get_ticks_msec() - int(chg[0][1]))
+					chg.pop_front()
+				var bz := false
+				for qz in range(-1, 2):
+					for qx in range(-1, 2):
+						var qk := Coords.chunk_key((fb.x >> 4) + qx, (fb.z >> 4) + qz)
+						var qc: Chunk = cm.chunks.get(qk)
+						if qc != null and (qc.update_groups != 0 or cm._light_update.has(qk)):
+							bz = true
+				if bz and busy_since < 0:
+					busy_since = Time.get_ticks_msec()
+				elif not bz and busy_since >= 0:
+					max_busy = maxi(max_busy, Time.get_ticks_msec() - busy_since)
+					busy_since = -1
+				if (game_time - gt0) % 10 == 0 and counts.size() < (game_time - gt0) / 10:
+					var nw := 0
+					for fz2 in range(-15, 16):
+						for fx2 in range(-15, 16):
+							var s2 := state_at(fb.x + fx2, fb.y, fb.z + fz2)
+							if s2 > 0 and Res.blocks.st_flags[s2] & BlockRegistry.F_LIQUID:
+								nw += 1
+					counts.append(nw)
+			print("[fluidtest] water cells every 10 ticks: %s (Java: ends at 113)" % str(counts))
+			# per game tick with changes: cells, ms over which the tick's changes were applied, change -> on screen (ms,
+			# worst cell), and the gap between consecutive steps on screen (Java: a step every 250 ms, shown at once)
+			var fticks: Array = fdone.keys()
+			fticks.sort()
+			var fline := ""
+			var fprev_shown := 0
+			var fworst := 0
+			for ft in fticks:
+				var fd2: Array = fdone[ft]
+				var fdelay := (int(fd2[3]) - int(fd2[1])) / 1000
+				fworst = maxi(fworst, fdelay)
+				fline += "t%d:%dc spread %dms shown +%dms%s; " % [int(ft) - gt0, int(fd2[0]), (int(fd2[2]) - int(fd2[1])) / 1000, fdelay, "" if fprev_shown == 0 else " gap %dms" % ((int(fd2[3]) - fprev_shown) / 1000)]
+				fprev_shown = int(fd2[3])
+			print("[fluidtest] steps: %s" % fline)
+			print("[fluidtest] worst step change->screen %d ms, cells never shown %d; scheduled updates %d, avg %d us, worst call %d us (%d updates)" % [fworst, fpend.size(), BlockUpdates.sched_total_n - fsn0, (BlockUpdates.sched_total_us - fsu0) / maxi(1, BlockUpdates.sched_total_n - fsn0), BlockUpdates.sched_peak_us, BlockUpdates.sched_peak_n])
+			var tq := Time.get_ticks_msec()
+			var busy := true
+			while busy and Time.get_ticks_msec() - tq < 10000:
+				busy = false
+				for qz in range(-1, 2):
+					for qx in range(-1, 2):
+						var qk := Coords.chunk_key((fb.x >> 4) + qx, (fb.z >> 4) + qz)
+						var qc: Chunk = cm.chunks.get(qk)
+						if qc != null and (qc.update_groups != 0 or qc.dirty_groups != 0 or cm._light_update.has(qk) or cm._mesh_pending(qk) or cm._jobs_light.has(qk)):
+							busy = true
+				if busy:
+					await get_tree().process_frame
+			print("[fluidtest] meshes up to date %d ms after the flow settled; longest wait for a queued update during the flow %d ms; longest change-to-screen delay %d ms" % [Time.get_ticks_msec() - tq, max_busy, max_stale])
+			var row := ""
+			for fx3 in range(-9, 10):
+				var s3 := state_at(fb.x + fx3, fb.y, fb.z)
+				row += ("." if s3 == 0 else (str(Res.blocks.st_level[s3]) if s3 > 0 and Res.blocks.st_flags[s3] & BlockRegistry.F_LIQUID else "#"))
+			print("[fluidtest] row through the source (levels): %s" % row)
+			print("[fluidtest] pending ticks in the world (worldgen fluid ticks included): %d" % BlockUpdates.pending.size())
+			# lava source poured next to the last flowing water cell (+7, level 7); then water poured onto a lava source
+			for case in [[Vector3i(8, 0, 0), Vector3i.ZERO], [Vector3i(12, 0, 12), Vector3i(12, 1, 12)]]:
+				var lp: Vector3i = fb + case[0]
+				set_block(lp.x, lp.y, lp.z, Res.blocks.LAVA)
+				if case[1] != Vector3i.ZERO:
+					for i in 3:
+						await get_tree().process_frame
+					var wq: Vector3i = fb + case[1]
+					set_block(wq.x, wq.y, wq.z, Res.blocks.WATER)
+				var gt1 := game_time
+				var res_name := "lava"
+				while game_time - gt1 < 100:
+					var ls := state_at(lp.x, lp.y, lp.z)
+					if Res.blocks.name_of(ls) != "lava":
+						res_name = Res.blocks.name_of(ls)
+						break
+					await get_tree().process_frame
+				print("[fluidtest] lava source %s: became %s after %d ticks (Java: obsidian at once)" % ["beside flowing water" if case[1] == Vector3i.ZERO else "under poured water", res_name, game_time - gt1])
+		if autoplay.has("hittest"):
+			# --hittest=allay,cow,...: spawn the mob 2 blocks ahead, punch it once (full attack strength), report its health
+			# at spawn, after the hit and 3 s later (regeneration)
+			var hb := Vector3i(player.pos.floor()) + Vector3i(0, -3, 4)
+			for hz in range(-3, 4):
+				for hx in range(-3, 4):
+					for hy in range(0, 5):
+						set_block(hb.x + hx, hb.y + hy, hb.z + hz, Res.blocks.default_state("stone") if hy == 0 or hy == 4 or absi(hx) == 3 or absi(hz) == 3 else 0)
+			for hid in str(autoplay["hittest"]).split(","):
+				var hm = entities.spawn_mob(hid, Vector3(hb) + Vector3(0.5, 1.0, 0.5))
+				var hw0 := Time.get_ticks_msec()
+				while Time.get_ticks_msec() - hw0 < 5000 and hm != null and not hm.dead:
+					await get_tree().process_frame
+				print("[hittest] %s after 5 s in a 5 x 3 x 5 room: hp %.1f fall %.1f (fall immune %s)" % [hid, hm.hp, hm.fall, str(entities._fall_immune(hm))])
+				if hm == null:
+					print("[hittest] %s: spawn failed" % hid)
+					continue
+				var hp_spawn: float = hm.hp
+				player.attack_ticks = 1000
+				entities.player_attack(hm)
+				var hp_hit: float = hm.hp
+				var ht0 := Time.get_ticks_msec()
+				while Time.get_ticks_msec() - ht0 < 3000:
+					await get_tree().process_frame
+				print("[hittest] %s: def hp %s, at spawn %.1f, after one punch %.1f (dead %s), 3 s later %.1f" % [hid, str(hm.def.get("hp")), hp_spawn, hp_hit, str(hm.dead), hm.hp])
+		if autoplay.has("allaytest"):
+			# --allaytest=1 (with --survival): stone platform, an allay holding cobblestone that likes the player, 10
+			# cobblestone + 3 dirt item entities 8 / 6 blocks away; per second: allay position, carried / held, what the
+			# player received
+			var ab := Vector3i(player.pos.floor())
+			for az in range(-12, 13):
+				for ax in range(-12, 13):
+					for ay in range(-1, 9):
+						set_block(ab.x + ax, ab.y + ay, ab.z + az, Res.blocks.default_state("stone") if ay == -1 else 0)
+			player.pos = Vector3(ab) + Vector3(0.5, 0.0, 0.5)
+			player.prev_pos = player.pos
+			player.inventory.clear_all()
+			var al = entities.spawn_mob("allay", player.pos + Vector3(0, 2, 2))
+			Allay._set_held(al, ItemStack.named("cobblestone", 1))
+			al.data["liked"] = true
+			entities.spawn_item(player.pos + Vector3(8, 0.2, 0), ItemStack.named("cobblestone", 10))
+			entities.spawn_item(player.pos + Vector3(-6, 0.2, 0), ItemStack.named("dirt", 3))
+			for sec in 16:
+				var at0 := Time.get_ticks_msec()
+				while Time.get_ticks_msec() - at0 < 1000:
+					player.pos = Vector3(ab) + Vector3(0.5, 0.0, 0.5)
+					await get_tree().process_frame
+				var got := player.inventory.count_item(Res.items.id("cobblestone"))
+				print("[allaytest] t=%2d s allay at %s (%.1f from player) carried %s, held %s, player has %d cobblestone, vel %.3f" % [sec + 1, str(al.pos.snapped(Vector3(0.1, 0.1, 0.1))), al.pos.distance_to(player.pos), str(Allay.inv(al).count), Allay.held(al).name(), got, al.vel.length()])
+		if autoplay.has("shelftest"):
+			# --shelftest=1: three oak shelves facing north in a row; a click on the left third of the middle one puts the held
+			# item there; powering all three joins them (side_chain) and a click swaps all 9 with the hotbar
+			var sb := Vector3i(player.pos.floor()) + Vector3i(0, 0, -3)
+			var sh_st := Res.blocks.with_prop(Res.blocks.default_state("oak_shelf"), "facing", "north")
+			var row := [sb + Vector3i(1, 0, 0), sb, sb + Vector3i(-1, 0, 0)]   # left, middle, right as seen from the north
+			for q in row:
+				set_block(q.x, q.y, q.z, sh_st)
+				BlockEntities.on_placed(self, q, sh_st)
+			player.inventory.set_slot(player.inventory.selected, ItemStack.named("dirt", 7))
+			var hp := Vector3(sb) + Vector3(0.8, 0.5, 0.0)   # left third of the front face (+x is the viewer's left)
+			Interaction.use_block(self, {"pos": sb, "state": state_at(sb.x, sb.y, sb.z), "point": hp, "normal": Vector3i(0, 0, -1)})
+			var its: Array = BlockEntities.get_data(self, sb).get("items", [])
+			print("[shelftest] single swap: slot0 %s slot1 %s slot2 %s, hand now %s" % [ItemStack.from_dict(its[0]).name(), ItemStack.from_dict(its[1]).name(), ItemStack.from_dict(its[2]).name(), player.inventory.held().name()])
+			for q in row:
+				Shelf.on_power(self, q, state_at(q.x, q.y, q.z), true)
+			print("[shelftest] side_chain: %s" % ", ".join(row.map(func(q): return Res.blocks.get_prop(state_at(q.x, q.y, q.z), "side_chain"))))
+			for i in 9:
+				player.inventory.set_slot(i, ItemStack.named("stone", i + 1))
+			Interaction.use_block(self, {"pos": sb, "state": state_at(sb.x, sb.y, sb.z), "point": hp, "normal": Vector3i(0, 0, -1)})
+			var hb: Array = []
+			for i in 9:
+				hb.append("%s%d" % [player.inventory.get_slot(i).name().substr(0, 2), player.inventory.get_slot(i).count])
+			var sc: Array = []
+			for q in row:
+				for it in BlockEntities.get_data(self, q).get("items", []):
+					sc.append(ItemStack.from_dict(it).count)
+			print("[shelftest] after hotbar swap: hotbar %s, shelf counts %s, comparator(middle) %d" % [" ".join(hb), str(sc), Shelf.comparator(self, sb)])
+		if autoplay.has("golemtest"):
+			# --golemtest=1: stone platform, a copper chest with 40 cobblestone + 5 dirt, two chests 6 / 9 blocks away (one
+			# holding dirt), a copper golem built from a copper block + carved pumpkin; per 2 s: golem state and contents
+			var gb := Vector3i(player.pos.floor())
+			for gz in range(-12, 13):
+				for gx in range(-12, 13):
+					for gy in range(-1, 6):
+						set_block(gb.x + gx, gb.y + gy, gb.z + gz, Res.blocks.default_state("stone") if gy == -1 else 0)
+			var src := gb + Vector3i(3, 0, 0)
+			set_block(src.x, src.y, src.z, Res.blocks.default_state("copper_block"))
+			var pumpkin := Res.blocks.default_state("carved_pumpkin")
+			set_block(src.x, src.y + 1, src.z, pumpkin)
+			Summons.try(self, src + Vector3i(0, 1, 0), pumpkin)
+			var sd := BlockEntities.get_data(self, src)
+			var sitems: Array = sd.get("items", [])
+			if sitems.size() >= 2:
+				sitems[0] = ItemStack.named("cobblestone", 40).to_dict()
+				sitems[1] = ItemStack.named("dirt", 5).to_dict()
+				sd["items"] = sitems
+				BlockEntities.set_data(self, src, sd)
+			var dsts := [gb + Vector3i(-3, 0, 4), gb + Vector3i(-6, 0, -5)]
+			for dp in dsts:
+				var cst := Res.blocks.default_state("chest")
+				set_block(dp.x, dp.y, dp.z, cst)
+				BlockEntities.on_placed(self, dp, cst)
+			var dd := BlockEntities.get_data(self, dsts[0])
+			(dd["items"] as Array)[0] = ItemStack.named("dirt", 1).to_dict()
+			BlockEntities.set_data(self, dsts[0], dd)
+			var golem = null
+			for e2 in entities.ents:
+				if e2.kind == "mob" and e2.id == "copper_golem":
+					golem = e2
+			print("[golemtest] built: chest at %s is %s, golem %s" % [str(src), Res.blocks.name_of(state_at(src.x, src.y, src.z)), "spawned" if golem != null else "MISSING"])
+			var count_in := func(p3: Vector3i, item: String) -> int:
+				var n := 0
+				for it in (BlockEntities.get_data(self, p3).get("items", []) as Array):
+					var s3 := ItemStack.from_dict(it)
+					if not s3.is_empty() and s3.name() == item:
+						n += s3.count
+				return n
+			for sec in 20:
+				var gt0 := Time.get_ticks_msec()
+				while Time.get_ticks_msec() - gt0 < 2000:
+					await get_tree().process_frame
+				if golem == null or golem.dead:
+					break
+				print("[golemtest] t=%2d s golem at %s holds %s x%d; copper chest cobble %d dirt %d; chest A dirt %d cobble %d; chest B cobble %d dirt %d" % [(sec + 1) * 2,
+					str(golem.pos.snapped(Vector3(0.1, 0.1, 0.1))), CopperGolem.held(golem).name(), CopperGolem.held(golem).count,
+					count_in.call(src, "cobblestone"), count_in.call(src, "dirt"), count_in.call(dsts[0], "dirt"), count_in.call(dsts[0], "cobblestone"),
+					count_in.call(dsts[1], "cobblestone"), count_in.call(dsts[1], "dirt")])
+		if autoplay.has("gpuprobe") and DisplayServer.get_name() != "headless":
+			# --gpuprobe=1: GPU and frame time at this view (yaw / pitch from --yaw / --pitch), 300 frames uncapped
+			player.yaw = float(autoplay.get("yaw", "0"))
+			player.pitch = float(autoplay.get("pitch", "10"))
+			Engine.max_fps = 0
+			var gvp2 := get_viewport().get_viewport_rid()
+			RenderingServer.viewport_set_measure_render_time(gvp2, true)
+			for i in 60:
+				await get_tree().process_frame
+			var gs2 := 0.0
+			var t02 := Time.get_ticks_usec()
+			var nfr := 300 if not autoplay.has("gpuspin") else 1200
+			var fts: Array = []
+			var tl := Time.get_ticks_usec()
+			var gmax := 0.0
+			var slowf: Array = []
+			for i in nfr:
+				if autoplay.has("gpuspin"):   # --gpuspin=1: turn 360 degrees over 1200 frames (frame time spread / spikes)
+					player.yaw = float(autoplay.get("yaw", "0")) + 360.0 * float(i) / float(nfr)
+				await get_tree().process_frame
+				var gms := RenderingServer.viewport_get_measured_render_time_gpu(gvp2)
+				gs2 += gms
+				gmax = maxf(gmax, gms)
+				var tn := Time.get_ticks_usec()
+				fts.append((tn - tl) / 1000.0)
+				if cm.tracing and (tn - tl) > 4000:
+					slowf.append("%.1f ms gpu %.2f %s" % [(tn - tl) / 1000.0, gms, JSON.stringify(frame_tparts).left(300)])
+				tl = tn
+			fts.sort()
+			print("[gpuprobe] gpu %.3f ms per frame (max %.2f), %.0f fps; frame ms p50 %.2f p99 %.2f max %.2f" % [gs2 / nfr, gmax, nfr / ((Time.get_ticks_usec() - t02) / 1e6), fts[nfr / 2], fts[int(nfr * 0.99)], fts[nfr - 1]])
+			for sl in slowf.slice(0, 12):
+				print("[gpuprobe]   slow: ", sl)
+		if autoplay.has("biomecheck") and gen.has_method("find_biome"):
+			# --biomecheck=a,b,...: /locate biome search, native vs the GDScript reference (radius 1024: the reference is slow)
+			for bname in str(autoplay["biomecheck"]).split(","):
+				var bidc: int = biomes.id(bname)
+				var px := int(floor(player.pos.x))
+				var pz := int(floor(player.pos.z))
+				var tn := Time.get_ticks_usec()
+				gen.native_find = true
+				var rn: Vector3i = gen.find_biome(bidc, px, 64, pz, 1024)
+				var tn1 := Time.get_ticks_usec()
+				gen.native_find = false
+				var rg: Vector3i = gen.find_biome(bidc, px, 64, pz, 1024)
+				var tg1 := Time.get_ticks_usec()
+				gen.native_find = true
+				var rf: Vector3i = gen.find_biome(bidc, px, 64, pz)
+				var tf1 := Time.get_ticks_usec()
+				print("[biomecheck] %s: native %s in %.1f ms, gdscript %s in %.1f ms -> %s; radius 6400: %s in %.1f ms" % [bname, str(rn), (tn1 - tn) / 1000.0, str(rg), (tg1 - tn1) / 1000.0, "same" if rn == rg else "DIFFERENT", str(rf), (tf1 - tg1) / 1000.0])
 		if autoplay.has("locatest") and gen.get("structures") != null:   # --locatest=name: synchronous structure locate
 			for lname0 in str(autoplay["locatest"]).split(","):
-				var lname := lname0.get_slice(":", 0)   # name[:radius in chunks]
+				var lname := lname0.get_slice(":", 0)   # name[:radius in units of the set spacing]
 				var lrad := int(lname0.get_slice(":", 1)) if lname0.contains(":") else 100
 				var tl0 := Time.get_ticks_usec()
 				var lr: Dictionary = gen.structures.locate(lname, int(floor(player.pos.x)) >> 4, int(floor(player.pos.z)) >> 4, lrad)
@@ -2712,6 +3593,58 @@ func _auto_run() -> void:
 			i += 1
 		autoplay["yaw"] = autoplay.get("yaw", "0")
 		autoplay["pitch"] = autoplay.get("pitch", "5")
+	if autoplay.has("growtest"):   # --growtest: saplings grow their 26.3 tree features, bone meal targets (real world)
+		var gw0 := Time.get_ticks_msec()
+		while cm.pending_jobs() > 0 and Time.get_ticks_msec() - gw0 < 30000:
+			await get_tree().process_frame
+		var bx := int(floor(player.pos.x)) - 48
+		var bz := int(floor(player.pos.z))
+		var grass := Res.blocks.default_state("grass_block")
+		var res: Array = []
+		var kinds := ["oak_sapling", "birch_sapling", "spruce_sapling", "jungle_sapling", "acacia_sapling", "cherry_sapling", "poplar_sapling", "mangrove_propagule", "azalea", "dark_oak_sapling", "pale_oak_sapling", "spruce_sapling", "jungle_sapling"]
+		for ki in kinds.size():
+			var at := Vector3i(bx + ki * 8, 230, bz)
+			var two: bool = ki >= 9   # 2x2 squares for dark oak, pale oak, mega spruce, mega jungle
+			var sst := Res.blocks.default_state(kinds[ki])
+			for d in ([Vector3i(0, 0, 0), Vector3i(1, 0, 0), Vector3i(0, 0, 1), Vector3i(1, 0, 1)] if two else [Vector3i.ZERO]):
+				set_block(at.x + d.x, at.y - 1, at.z + d.z, grass)
+				set_block(at.x + d.x, at.y, at.z + d.z, sst)
+			var grew := TreeGrower.grow(self, at, sst)
+			var logs := 0
+			for y in range(at.y, at.y + 30):
+				for dz in range(-2, 4):
+					for dx in range(-2, 4):
+						var ls := state_at(at.x + dx, y, at.z + dz)
+						if ls > 0 and (Res.blocks.name_of(ls).ends_with("_log") or Res.blocks.name_of(ls).ends_with("_stem")):
+							logs += 1
+			res.append("%s%s:%s/%d" % [kinds[ki], "x4" if two else "", "grew" if grew else "no", logs])
+		print("[growtest] trees ", ", ".join(res))
+		var mp := Vector3i(bx, 230, bz + 12)
+		for dz in range(-3, 4):
+			for dx in range(-3, 4):
+				set_block(mp.x + dx, mp.y, mp.z + dz, Res.blocks.default_state("stone"))
+		set_block(mp.x, mp.y, mp.z, Res.blocks.default_state("moss_block"))
+		var moss_ok := Bonemeal.apply(self, mp, state_at(mp.x, mp.y, mp.z))
+		var mossn := 0
+		for dz in range(-3, 4):
+			for dx in range(-3, 4):
+				if Res.blocks.name_of(maxi(0, state_at(mp.x + dx, mp.y, mp.z + dz))) == "moss_block":
+					mossn += 1
+		var gp := Vector3i(bx + 16, 230, bz + 12)
+		for dz in range(-7, 8):
+			for dx in range(-7, 8):
+				set_block(gp.x + dx, gp.y, gp.z + dz, grass)
+		Bonemeal.apply(self, gp, grass)
+		var plants := 0
+		for dz in range(-7, 8):
+			for dx in range(-7, 8):
+				if state_at(gp.x + dx, gp.y + 1, gp.z + dz) > 0:
+					plants += 1
+		var cl = MiscEntities.spawn_cloud(entities, player.pos, "swiftness")
+		var gt0 := game_time
+		while game_time - gt0 < 25:
+			await get_tree().process_frame
+		print("[growtest] moss %s -> %d moss blocks; grass -> %d plants; lingering cloud r %.3f speed %s" % [moss_ok, mossn, plants, float(cl.data["r"]), str(player.effects.get("speed", {}))])
 	var gen_start: int = cm.stats["generated"]
 	while cm.pending_jobs() > 0 and Time.get_ticks_msec() - t0 < secs * 1000.0:
 		await get_tree().process_frame
@@ -2721,8 +3654,22 @@ func _auto_run() -> void:
 	var shots: Array = []
 	var frame_ms: Array = []
 	var views := [[0.0, 10.0], [90.0, 10.0], [180.0, 10.0], [270.0, 10.0], [45.0, 60.0], [30.0, 25.0, 40.0], [210.0, 20.0, 60.0]]
+	if autoplay.has("giveitems") and not autoplay.has("screen"):   # (held-item checks in plain views)
+		var vgi := 0
+		for vgn in str(autoplay["giveitems"]).split(","):
+			if vgi < 9 and Res.items.id(vgn) > 0:
+				var vs := ItemStack.named(vgn, 1)
+				if autoplay.has("enchanted"):
+					vs.components["minecraft:enchantments"] = {"minecraft:unbreaking": 1}
+				player.inventory.set_slot(vgi, vs)
+				vgi += 1
 	if autoplay.has("yaw"):
 		views = [[float(autoplay["yaw"]), float(autoplay.get("pitch", "10"))]]
+	if autoplay.has("views"):   # --views=yaw/pitch_yaw/pitch...: several views in one run
+		views = []
+		for vs in str(autoplay["views"]).split("_"):
+			var vp := vs.split("/")
+			views.append([float(vp[0]), float(vp[1])])
 	var ground := player.pos
 	for vi in views.size():
 		if autoplay.has("cam"):
@@ -2745,6 +3692,18 @@ func _auto_run() -> void:
 				entities.spawn_block_particles(Vector3i(at.floor()), Res.blocks.default_state(names[bi]))
 			for f in 3:
 				await get_tree().process_frame
+		if autoplay.has("itemfx"):   # --itemfx=item,item,...: eating fragments of those items in front of the camera
+			var ifwd := Vector3(-sin(deg_to_rad(player.yaw)), 0, cos(deg_to_rad(player.yaw)))
+			var iside := Vector3(ifwd.z, 0, -ifwd.x)
+			var inames: PackedStringArray = str(autoplay["itemfx"]).split(",")
+			for ii in inames.size():
+				var iid: int = Res.items.id(inames[ii])
+				for kk in 14:
+					var iat := player.eye_pos() + ifwd * 1.6 + iside * (float(ii) - (inames.size() - 1) / 2.0) * 0.5 + Vector3(randf_range(-0.12, 0.12), randf_range(-0.12, 0.12), randf_range(-0.12, 0.12))
+					Particles.item_fragment(iat, Vector3.ZERO, iid)
+				print("[itemfx] %s id %d cell %d fragments %d" % [inames[ii], iid, Particles.instance._icells.get(iid, -9), Particles.instance.tparts.size()])
+			for f in 2:
+				await get_tree().process_frame
 		if DisplayServer.get_name() != "headless":   # the dummy renderer never emits frame_post_draw (headless probes hung)
 			await RenderingServer.frame_post_draw
 			var img := get_viewport().get_texture().get_image()
@@ -2755,7 +3714,7 @@ func _auto_run() -> void:
 	var stats := {
 		"world": folder, "generator": gen.generator_id, "seed": gen.seed, "assets": Res.mode + " " + Res.version,
 		"time_to_spawn_ms": t_spawn, "time_to_settle_ms": t_settle, "chunks_loaded": cm.chunks.size(),
-		"chunks_generated": cm.stats["generated"], "gen_ms_avg": cm.stats["gen_ms"], "light_ms_avg": cm.stats["light_ms"],
+		"chunks_generated": cm.stats["generated"], "sched_peak_ms": BlockUpdates.sched_peak_us / 1000.0, "sched_peak_n": BlockUpdates.sched_peak_n, "sched_first_ms": BlockUpdates.sched_first_us / 1000.0, "sched_avg_us_per_tick": float(BlockUpdates.sched_total_us) / maxf(1.0, float(BlockUpdates.sched_total_n)), "sched_ticks": BlockUpdates.sched_total_n, "gen_ms_avg": cm.stats["gen_ms"], "light_ms_avg": cm.stats["light_ms"],
 		"mesh_ms_avg": cm.stats["mesh_ms"], "mesh_groups": cm.visible_groups(), "verts": cm.stats["verts"],
 		"frame_ms_median": frame_ms[frame_ms.size() / 2] if frame_ms.size() > 0 else 0.0,
 		"frame_ms_p95": frame_ms[int(frame_ms.size() * 0.95)] if frame_ms.size() > 0 else 0.0,
@@ -2908,6 +3867,15 @@ func _portal_tick() -> void:
 					in_ep = true
 				elif n == "end_gateway":
 					in_gw = Vector3i(x, y, z)
+	# Java LocalPlayer.handlePortalTransitionEffect: +0.0125 per tick inside a nether portal (block.portal.trigger at
+	# 0.25, pitch 0.8-1.2 when it starts), -0.05 per tick outside
+	portal_spin_old = portal_spin
+	if in_np:
+		if portal_spin == 0.0:
+			Audio.play("block.portal.trigger", player.pos, "Ambient", 0.25, randf() * 0.4 + 0.8)
+		portal_spin = minf(1.0, portal_spin + 0.0125)
+	else:
+		portal_spin = maxf(0.0, portal_spin - 0.05)
 	if in_gw.y != -99999 and dimension == "the_end" and dragon_fight != null:
 		if portal_cooldown > 0:
 			portal_cooldown = 10
@@ -2970,10 +3938,19 @@ func _update_player_model(p: Vector3) -> void:
 	player_model.visible = third_person > 0 and not player.is_spectator()
 	if not player_model.visible:
 		return
-	var crouch: bool = player.sneaking and player.on_ground and not player.flying
+	# Java Pose.SWIMMING (crawling in a 1-block gap, sprint-swimming): Player.updateSwimAmount eases 0.09 per tick
+	var swim_pose: bool = player.crawling or player.swimming
+	_pm_swim = move_toward(_pm_swim, 1.0 if swim_pose else 0.0, 0.09 * 20.0 * get_process_delta_time())
+	var crouch: bool = player.sneaking and player.on_ground and not player.flying and not swim_pose
 	# Java PlayerRenderer.getRenderOffset: a crouching player is drawn 2 px lower
 	player_model.position = vis(p) + (Vector3(0, -2.0 / 16.0, 0) if crouch else Vector3.ZERO)
 	player_model.rotation.y = deg_to_rad(180.0 - player.yaw + float(autoplay.get("pmyaw", 0.0)))
+	# Java PlayerRenderer.setupRotations: rotX(lerp(swimAmount, 0, in water ? -90 - pitch : -90)), then translate(0, -1,
+	# 0.3) in the turned frame while in the swimming pose (lying face down, centred on the hitbox)
+	var tilt := deg_to_rad(lerpf(0.0, (-90.0 - player.pitch) if player.in_water else -90.0, _pm_swim)) if _pm_swim > 0.0 else 0.0
+	player_model.rotation.x = tilt
+	if swim_pose:
+		player_model.position += Basis(Vector3.UP, player_model.rotation.y) * (Basis(Vector3.RIGHT, tilt) * Vector3(0, -1.0, 0.3))
 	var spd := Vector2(player.pos.x - player.prev_pos.x, player.pos.z - player.prev_pos.z).length()
 	_pm_limb += spd * 4.0
 	var amt := clampf(spd * 4.0, 0.0, 1.0)
@@ -2981,6 +3958,7 @@ func _update_player_model(p: Vector3) -> void:
 	var main_s := player.inventory.held()
 	var off_s := player.inventory.get_slot(Inventory.OFFHAND)
 	HeldItems.update(player_model, main_s, off_s)
+	MobBehaviors.render_shoulders(player_model, player, crouch)   # (parrots perched on the shoulders)
 	var model: Node = player_model.get_node_or_null("model")
 	if model == null:
 		return
@@ -2989,7 +3967,7 @@ func _update_player_model(p: Vector3) -> void:
 	var age_t := float(game_time) + pt
 	var attack := 0.0
 	if hand_swing > 0:
-		attack = clampf((6.0 - float(hand_swing) + pt) / 6.0, 0.0, 1.0)
+		attack = clampf((float(hand_swing_dur - hand_swing) + pt) / float(hand_swing_dur), 0.0, 1.0)
 	var body_y := sin(sqrt(attack) * TAU) * 0.2 if attack > 0.0 else 0.0
 	var head_x := deg_to_rad(player.pitch)
 	var l := cm.get_light(int(floor(p.x)), int(floor(p.y + 1.0)), int(floor(p.z)))
@@ -3001,6 +3979,8 @@ func _update_player_model(p: Vector3) -> void:
 		var p0: Vector3 = c.get_meta("p0")
 		if nm == "head" or nm == "hat":
 			c.rotation = Vector3(-head_x, 0, 0)
+			if swim_pose and _pm_swim > 0.0:
+				c.rotation.x = -lerp_angle(head_x, -PI / 4.0, _pm_swim)   # (HumanoidModel: swimming head xRot -> -45 degrees)
 			c.position = p0 + (Vector3(0, -4.2, 0) / 16.0 if crouch else Vector3.ZERO)
 		elif nm == "body":
 			c.rotation = Vector3(-0.5 if crouch else 0.0, -body_y, 0)
@@ -3008,6 +3988,8 @@ func _update_player_model(p: Vector3) -> void:
 		elif nm.begins_with("leg"):
 			var right_leg := nm == "leg0"
 			var lx := -1.4137167 if player.vehicle != null else cos(_pm_limb * 0.6662 + (0.0 if right_leg else PI)) * 1.4 * amt
+			if _pm_swim > 0.0:
+				lx = lerpf(lx, 0.3 * cos(_pm_limb * 0.33333334 + (0.0 if right_leg else PI)), _pm_swim)   # (swimming kick)
 			c.rotation = Vector3(-lx, 0, 0)
 			c.position = p0 + (Vector3(0, -0.2, 3.9) / 16.0 if crouch else Vector3.ZERO)
 		elif nm.begins_with("arm"):
@@ -3042,6 +4024,29 @@ func _update_player_model(p: Vector3) -> void:
 					az += sin(attack * PI) * -0.4
 			if crouch:
 				arm_pos.y = -5.2 / 16.0
+			if _pm_swim > 0.0 and not (right and attack > 0.0):
+				# HumanoidModel.setupAnim swim stroke over limbSwing % 26 (quadraticArmUpdate(f) = f^2 - 65 f); the left
+				# arm eases with rotlerpRad, the right with lerp (Java)
+				var f5 := fposmod(_pm_limb, 26.0)
+				var tx := 0.0
+				var tz := PI
+				if f5 < 14.0:
+					var qa := (f5 * f5 - 65.0 * f5) / (14.0 * 14.0 - 65.0 * 14.0)
+					tz = PI - 1.8707964 * qa if right else PI + 1.8707964 * qa
+				elif f5 < 22.0:
+					var f6 := (f5 - 14.0) / 8.0
+					tx = PI / 2.0 * f6
+					tz = 1.2707963 + 1.8707964 * f6 if right else 5.012389 - 1.8707964 * f6
+				else:
+					tx = PI / 2.0 - PI / 2.0 * (f5 - 22.0) / 4.0
+				if right:
+					ax = lerpf(ax, tx, _pm_swim)
+					ay = lerpf(ay, PI, _pm_swim)
+					az = lerpf(az, tz, _pm_swim)
+				else:
+					ax = lerp_angle(ax, tx, _pm_swim)
+					ay = lerp_angle(ay, PI, _pm_swim)
+					az = lerp_angle(az, tz, _pm_swim)
 			c.position = arm_pos
 			c.rotation = Vector3(-ax, -ay, az)
 		for mi in entities._meshes(c):
@@ -3054,6 +4059,34 @@ func _player_biome() -> int:
 	if c == null:
 		return -1
 	return c.biome_at(int(floor(player.pos.x)) & 15, clampi(int(player.pos.y), Coords.MIN_Y, Coords.MAX_Y - 1), int(floor(player.pos.z)) & 15)
+
+
+var _anchor_pending := Vector3i(0, -99999, 0)
+
+
+## After a respawn at a respawn anchor: once its chunk is ready, a charged anchor loses a charge (deplete sound) and the
+## player stands up beside it; a missing / empty anchor sends them to the world spawn with the "no home" message.
+func _anchor_respawn() -> void:
+	if _anchor_pending.y == -99999 or dimension != "the_nether" or not _arrival.is_empty():
+		return
+	var hp := _anchor_pending
+	if not column_ready(hp.x, hp.z):
+		return
+	_anchor_pending = Vector3i(0, -99999, 0)
+	var bs := state_at(hp.x, hp.y, hp.z)
+	var ok := bs > 0 and Res.blocks.name_of(bs) == "respawn_anchor" and int(Res.blocks.get_prop(bs, "charges")) > 0
+	var stand = _stand_up_spot(hp) if ok else null
+	if stand == null:
+		hud.chat_message(Res.tr_key("block.minecraft.spawn.not_valid", "You have no home bed or charged respawn anchor, or it was obstructed"))
+		player.has_spawn = false
+		player.spawn_dim = "overworld"
+		var sp: Array = level.get("spawn", [0, 80, 0])
+		change_dimension("overworld", {"kind": "spawn", "pos": Vector3(sp[0] + 0.5, sp[1], sp[2] + 0.5)})
+		return
+	set_block(hp.x, hp.y, hp.z, Res.blocks.with_prop(bs, "charges", str(int(Res.blocks.get_prop(bs, "charges")) - 1)))
+	Audio.play("block.respawn_anchor.deplete", Vector3(hp) + Vector3(0.5, 0.5, 0.5), "Blocks")
+	player.pos = stand
+	player.prev_pos = stand
 
 
 func _go_respawn_dimension() -> void:
@@ -3097,6 +4130,9 @@ var _ent_slicing := false       # the entity phase is in progress (EntityManager
 var _ent_slice := 1 << 30       # (unused: slices are time-budgeted now)
 var _ent_budgeted := false      # this pass spreads over frames with ENT_BUDGET_US per frame
 const ENT_BUDGET_US := 1000
+var _ent_budget_us := ENT_BUDGET_US   # this pass's per-frame entity budget (sized from the last pass's cost)
+var _ent_last_us := 0                 # measured cost of the last whole entity pass
+var _ent_accum := 0
 var _last_delta := 0.016
 var _tick_meas: Dictionary = {} # tracing: usec per part of the tick in progress
 var _tick_us := 0               # tracing: total usec of the tick in progress
@@ -3117,7 +4153,7 @@ func _tick() -> void:
 	block_flicker += (randf() - randf()) * randf() * randf() * 0.1
 	block_flicker *= 0.9
 	if gamerule("doDaylightCycle", true):
-		day_time = (day_time + 1) % 24000
+		day_time += 1   # Java dayTime keeps counting (days for the moon phase; the timelines wrap by their period)
 	_weather_tick()
 	if not spawn_ready:
 		return
@@ -3131,6 +4167,7 @@ func _tick() -> void:
 	var g1 := Time.get_ticks_usec()
 	if not Net.is_client():
 		_portal_tick()
+		_anchor_respawn()
 		if dragon_fight != null:
 			dragon_fight.tick()
 	if advancements != null:
@@ -3149,6 +4186,8 @@ func _tick() -> void:
 		Maps.update(self, mid)
 	if hand_swing > 0:
 		hand_swing -= 1
+	if view_model != null:
+		view_model.game_tick()
 	var g4 := Time.get_ticks_usec()
 	if use_cooldown > 0:
 		use_cooldown -= 1
@@ -3157,12 +4196,15 @@ func _tick() -> void:
 	UseItem.tick(self, player, (Input.is_action_pressed("use") and mouse_captured and screen == null) or auto_use > 0)
 	# particles tick with the tick start: their render interpolation (prev -> cur by tick_accum) restarts on this frame,
 	# so a tick on a later frame showed them one step back for a frame (falling particles jittered back and forth)
+	var q_ui := Time.get_ticks_usec()
 	if Particles.instance != null:
 		Particles.instance.tick()
+	var q_pa := Time.get_ticks_usec()
+	Ambience.tick(self)   # mood / biome loop / underwater ambience + background music choice (client side)
 	var q0 := Time.get_ticks_usec()
 	_tick_phase = 1
 	if cm.tracing:
-		_tick_meas = {"time+weather": g0 - t0, "player": g1 - g0, "portal+adv": g2 - g1, "mining+maps": g4 - g2, "useitem": q0 - g4}
+		_tick_meas = {"time+weather": g0 - t0, "player": g1 - g0, "portal+adv": g2 - g1, "mining+maps": g4 - g2, "useitem": q_ui - g4, "particles": q_pa - q_ui, "ambience": q0 - q_pa}
 		for k in _tick_meas:
 			if int(_tick_meas[k]) > 300:
 				frame_tparts["tick0:" + k] = _tick_meas[k]
@@ -3200,18 +4242,27 @@ func _tick_step() -> void:
 			part = "entities"
 			# at high frame rates the entity step spans the frames until the next tick with a per-frame time budget
 			# (was ~3 equal slices: a village's villagers put 10 ms into one frame); a new tick finishes the rest
-			var deadline := Time.get_ticks_usec() + ENT_BUDGET_US if _ent_budgeted else 0
+			# the pass is spread whenever a few frames remain before the next tick (it was only at >= 12 frames per tick:
+			# the x86 build sat right at that line and ran whole passes - 10-12 ms - in single frames whenever it dipped);
+			# each frame takes the last pass's cost divided by the frames left for it (the later phases need one each)
+			var es0 := Time.get_ticks_usec()
+			var deadline := es0 + _ent_budget_us if _ent_budgeted else 0
 			if _ent_slicing:
 				stay = not entities.tick_slice(1 << 30, deadline)
 			else:
 				entities.tick_begin()
 				var fpt := (TICK - tick_accum) / maxf(_last_delta, 0.0005)
-				_ent_budgeted = fpt >= 12.0
-				deadline = Time.get_ticks_usec() + ENT_BUDGET_US if _ent_budgeted else 0
+				var avail := fpt - float(TICK_LAST_PHASE - 2) - 1.0
+				_ent_budgeted = avail >= 2.0
+				_ent_budget_us = int(clampf(float(_ent_last_us) / maxf(1.0, avail - 1.0), float(ENT_BUDGET_US), 8000.0))
+				_ent_accum = 0
+				deadline = es0 + _ent_budget_us if _ent_budgeted else 0
 				_ent_slicing = true
 				stay = not entities.tick_slice(1 << 30, deadline)
+			_ent_accum += Time.get_ticks_usec() - es0
 			if not stay:
 				_ent_slicing = false
+				_ent_last_us = _ent_accum if _ent_accum > _ent_last_us else int(lerpf(float(_ent_last_us), float(_ent_accum), 0.1))
 		3:
 			part = "block_updates"
 			if net_client:
@@ -3227,13 +4278,26 @@ func _tick_step() -> void:
 			if not net_client:
 				var r0 := Time.get_ticks_usec()
 				Redstone.flush(self)
+				var r0a := Time.get_ticks_usec()
+				Sensors.tick(self)
+				var r0b := Time.get_ticks_usec()
+				Growth.tick(self)
 				var r1 := Time.get_ticks_usec()
 				BlockEntities.tick_furnaces(self)
 				var r2 := Time.get_ticks_usec()
 				Beacons.tick(self)
+				var r2a := Time.get_ticks_usec()
 				CommandBlocks.tick(self)
+				var r2b := Time.get_ticks_usec()
 				Raids.tick(self)
 				if cm.tracing:
+					frame_tparts["p5:redstone"] = r0a - r0
+					frame_tparts["p5:sensors"] = r0b - r0a
+					frame_tparts["p5:growth"] = r1 - r0b
+					frame_tparts["p5:block_entities"] = r2 - r1
+					frame_tparts["p5:beacons"] = r2a - r2
+					frame_tparts["p5:cmd"] = r2b - r2a
+					frame_tparts["p5:raids"] = Time.get_ticks_usec() - r2b
 					_tick_meas["redstone"] = r1 - r0
 					_tick_meas["furnaces"] = r2 - r1
 					_tick_meas["beacon+cmd+raids"] = Time.get_ticks_usec() - r2
@@ -3274,16 +4338,89 @@ func _tick_step() -> void:
 			last_tick_parts = _tick_meas
 			_pf("  tick:total", _tick_us)
 
+## wiki: Weather - the rain and thunder flags have independent timers: rain on 12000-24000 ticks, off 12000-180000;
+## thunder on 3600-15600, off 12000-180000. Thunder only affects the world while it rains (a thunderstorm needs rain),
+## so `thundering` stays "a thunderstorm is on" (thunder flag and rain) for the rest of the game; the flag itself is
+## _thunder_flag. A change of `raining` / `thundering` made elsewhere (/weather, sleeping, a loaded save) sets the flag
+## to the new `thundering`.
+var _thunder_flag := false
+var _thunder_seen := false
+var _rain_seen := false
+
+
 func _weather_tick() -> void:
-	if gamerule("doWeatherCycle", true) and not Net.is_client():
-		weather_timer -= 1
-		if weather_timer <= 0:
-			raining = not raining
-			thundering = raining and rng.randf() < 0.3
-			weather_timer = rng.randi_range(12000, 180000) if not raining else rng.randi_range(12000, 24000)
+	if not Net.is_client():
+		if thundering != _thunder_seen or raining != _rain_seen:
+			_thunder_flag = thundering
+		if gamerule("doWeatherCycle", true):
+			# Java ServerLevel.advanceWeatherCycle: a running timer flips the state when it reaches 0; a timer at 0 (reset by
+			# sleeping, /weather) just draws a new duration for the current state
+			if weather_timer > 0:
+				weather_timer -= 1
+				if weather_timer == 0:
+					raining = not raining
+			else:
+				weather_timer = rng.randi_range(12000, 24000) if raining else rng.randi_range(12000, 180000)
+			if thunder_timer > 0:
+				thunder_timer -= 1
+				if thunder_timer == 0:
+					_thunder_flag = not _thunder_flag
+			else:
+				thunder_timer = rng.randi_range(3600, 15600) if _thunder_flag else rng.randi_range(12000, 180000)
+		thundering = _thunder_flag and raining
+		_thunder_seen = thundering
+		_rain_seen = raining
 	var wet := dimension == "overworld"
 	rain = move_toward(rain, 1.0 if raining and wet else 0.0, 0.01)
 	thunder = move_toward(thunder, 1.0 if thundering and wet else 0.0, 0.01)
+	if sky_flash > 0:
+		sky_flash -= 1
+	if thundering and wet and not Net.is_client():
+		_natural_lightning()
+
+
+var sky_flash := 0   # Java ClientLevel.skyFlashTime (2 ticks per lightning bolt; Hide Sky Flashes turns it off)
+
+
+## Java ServerLevel.tickChunk thunder: each ticking chunk (simulation distance) has a 1 / 100000 chance per tick of a
+## bolt at a random column top (wiki Lightning); a living entity under the open sky within 3 blocks of the column is
+## struck instead; only where it rains (not in snowy or dry biomes). A lightning rod within 128 blocks that is the
+## highest block of its column takes the strike first (wiki Lightning Rod: the closest one; Sensors.find_rod).
+## (Skeleton trap horses are not modelled.)
+func _natural_lightning() -> void:
+	var sim := int(Settings.get_v("simulation_distance"))
+	var side := sim * 2 + 1
+	if rng.randi_range(0, 99999) >= side * side:
+		return
+	var pcx := int(floor(player.pos.x)) >> 4
+	var pcz := int(floor(player.pos.z)) >> 4
+	var cx := pcx + rng.randi_range(-sim, sim)
+	var cz := pcz + rng.randi_range(-sim, sim)
+	var ch: Chunk = cm.get_chunk(cx, cz)
+	if ch == null or ch.heightmap.is_empty():
+		return
+	var lx := rng.randi_range(0, 15)
+	var lz := rng.randi_range(0, 15)
+	var top := int(ch.heightmap[lx + lz * 16])
+	var at := Vector3(cx * 16 + lx + 0.5, top, cz * 16 + lz + 0.5)
+	var rod := Sensors.find_rod(self, at)
+	if rod != Sensors.NONE:
+		at = Vector3(rod) + Vector3(0.5, 1.0, 0.5)   # (the bolt hits the rod's top: Sensors.lightning powers it)
+		if weather_fx == null or weather_fx._precip_at(rod.x, rod.y + 1, rod.z) == 1:
+			entities.lightning(at)
+		return
+	var cands: Array = []
+	if player.pos.distance_to(Vector3(at.x, player.pos.y, at.z)) <= 3.5 and player.pos.y >= at.y - 3.0 and not player.dead and (cm.get_light(int(floor(player.pos.x)), int(floor(player.pos.y)) + 1, int(floor(player.pos.z))) >> 4) >= 15:
+		cands.append(player.pos)
+	for e in entities.ents:
+		if e.kind == "mob" and not e.dead and absf(e.pos.x - at.x) <= 3.5 and absf(e.pos.z - at.z) <= 3.5 and e.pos.y >= at.y - 3.0:
+			if (cm.get_light(int(floor(e.pos.x)), int(floor(e.pos.y)) + 1, int(floor(e.pos.z))) >> 4) >= 15:
+				cands.append(e.pos)
+	if not cands.is_empty():
+		at = cands[rng.randi_range(0, cands.size() - 1)]
+	if weather_fx != null and weather_fx._precip_at(int(floor(at.x)), int(floor(at.y)), int(floor(at.z))) != 1:
+		return
+	entities.lightning(at)
 
 
 func celestial_angle() -> float:
@@ -3300,9 +4437,57 @@ func sky_darken() -> float:
 	return g * 0.8 + 0.2
 
 
+## Java Level.skyDarken: levels subtracted from the sky light for the internal light level (spawning, growth, daylight
+## burning): (int)((1 - f * rain * thunder) * 11), f = 0.5 + 2 * clamp(cos(angle 2 pi), -0.25, 0.25), rain = 1 - 5/16
+## x rain level, thunder = 1 - 5/16 x thunder level. Matches wiki: Daylight cycle / Weather (internal sky light 15 at
+## noon, 12 in rain, 10 in a thunderstorm, 4 minimum at night). sky_darken() above is the render brightness factor.
+func sky_darken_level() -> int:
+	var f := 0.5 + 2.0 * clampf(cos(celestial_angle() * TAU), -0.25, 0.25)
+	return int((1.0 - f * (1.0 - rain * 5.0 / 16.0) * (1.0 - thunder * 5.0 / 16.0)) * 11.0)
+
+
 ## Per frame: Java 26.3 sky / fog / light state (SkyState) -> sky shader, stars, vanilla fog globals, lightmap inputs.
 const CLOUD_MODES := {"off": 0, "fast": 1, "fancy": 2}
 const DIM_SKY_MODES := {"the_nether": 1, "the_end": 2}
+var _powder_snow_id := -2
+var _water_vision := 0                 # ticks the player's eyes have been under water (water fog transition)
+var _water_fog_mults: Dictionary = {}  # biome index -> water_fog_end_distance multiplier from its 26.3 attributes
+
+
+## The biome's minecraft:visual/water_fog_end_distance modifier (swamp / mangrove swamp: multiply 0.85), 1 otherwise.
+func _water_fog_mult(bio: int) -> float:
+	if bio < 0:
+		return 1.0
+	var m = _water_fog_mults.get(bio)
+	if m == null:
+		m = 1.0
+		var d = biomes.data[bio] if bio < biomes.data.size() else null
+		var at = d.get("attributes") if d is Dictionary else null
+		var v = at.get("minecraft:visual/water_fog_end_distance") if at is Dictionary else null
+		if v is Dictionary and str(v.get("modifier", "")) == "multiply":
+			m = float(v.get("argument", 1.0))
+		_water_fog_mults[bio] = m
+	return float(m)
+
+
+var _water_fog_colors: Dictionary = {}   # biome index -> Color
+
+
+## The biome's minecraft:visual/water_fog_color attribute (26.3 environment attribute default #050533).
+func _water_fog_color(bio: int) -> Color:
+	var c = _water_fog_colors.get(bio)
+	if c != null:
+		return c
+	var col := Color8(0x05, 0x05, 0x33)
+	var d = biomes.data[bio] if bio >= 0 and bio < biomes.data.size() else null
+	var at = d.get("attributes") if d is Dictionary else null
+	var v = at.get("minecraft:visual/water_fog_color") if at is Dictionary else null
+	if v is String and str(v).begins_with("#"):
+		col = Color.html(str(v))
+	elif v is Dictionary and (v as Dictionary).get("argument") is String:
+		col = Color.html(str(v["argument"]))
+	_water_fog_colors[bio] = col
+	return col
 
 
 func _update_sky(alpha: float) -> void:
@@ -3320,17 +4505,55 @@ func _update_sky(alpha: float) -> void:
 	var env_f := _fog_env
 	var rd_f := _fog_rd
 	var fluid := false
-	if player.eyes_in_water:
-		# Java water fog: environmental -8 .. 96 (spherical), biome water fog colour
-		var bio := _player_biome()
-		var day := clampf((ss.sky_light_factor - 0.24) / 0.76, 0.0, 1.0)
-		fogc = (biomes.water[bio] if bio >= 0 else Color8(0x3f, 0x76, 0xe4)) * (0.3 + 0.5 * day)
-		env_f = Vector2(-8.0, 96.0)
-		fluid = true
-	elif player.in_lava:
+	if _powder_snow_id == -2:
+		_powder_snow_id = Res.blocks.block_id("powder_snow")
+	var cam_st := state_at(floori(cam_w.x), floori(cam_w.y), floori(cam_w.z))
+	var in_snow := cam_st > 0 and _powder_snow_id >= 0 and Res.blocks.st_block[cam_st] == _powder_snow_id
+	# lava fog when the camera is inside the lava (below its surface), not when only the body touches it
+	var cam_lava := false
+	if cam_st > 0 and (Res.blocks.st_flags[cam_st] & BlockRegistry.F_LAVA) != 0:
+		var lv: int = Res.blocks.st_level[cam_st]
+		cam_lava = cam_w.y < floorf(cam_w.y) + (0.889 if lv == 0 else (8.0 - lv) / 9.0)
+	if cam_lava:
+		# wiki: Fog - lava fog #991A00: sight 1 block, 3 with Fire Resistance, half the render distance in Spectator
 		fogc = Color(0.6, 0.1, 0.0)
-		env_f = Vector2(0.0, 5.0) if player.effects.has("fire_resistance") else Vector2(0.25, 1.0)
+		if player.is_spectator():
+			env_f = Vector2(0.0, rd_f.y * 0.5)
+		else:
+			env_f = Vector2(0.0, 3.0) if player.effects.has("fire_resistance") else Vector2(0.25, 1.0)
 		fluid = true
+	elif in_snow:
+		# wiki: Fog - powder snow fog #9FBBC8: sight 2 blocks, half the render distance in Spectator
+		fogc = Color8(0x9F, 0xBB, 0xC8)
+		env_f = Vector2(0.0, rd_f.y * 0.5 if player.is_spectator() else 2.0)
+		fluid = true
+	elif player.eyes_in_water:
+		# water fog: environment attributes water_fog_start_distance -8, water_fog_end_distance 96 (wiki: Environment
+		# attribute; swamps x 0.85 in their 26.3 biome data), the end distance blended from 25 % on entering the water to
+		# 60 % at 5 s and 100 % at 30 s (wiki: Fog)
+		# colour: the biome's minecraft:visual/water_fog_color (26.3 environment attribute, default #050533; swamp #232317,
+		# warm ocean #041f33 ...), no day factor (the timeline has no water fog modifier); darkened toward the bottom
+		# of the world like every fog but lava / powder snow (wiki: Fog - Height)
+		var bio := _player_biome()
+		fogc = _water_fog_color(bio)
+		var wflat: bool = gen != null and str(gen.generator_id) == "flat"
+		var wu := (cam_w.y - float(dim_type.get("min_y", -64.0))) * (1.0 if wflat else 0.03125)
+		if wu < 1.0:
+			wu = maxf(wu, 0.0)
+			fogc = Color(fogc.r * wu * wu, fogc.g * wu * wu, fogc.b * wu * wu)
+		var wt := float(_water_vision)
+		var wv := maxf(0.25, clampf(wt / 100.0, 0.0, 1.0) * 0.6 + clampf((wt - 100.0) / 500.0, 0.0, 1.0) * 0.4)
+		env_f = Vector2(-8.0, 96.0 * _water_fog_mult(bio) * wv)
+		fluid = true
+	if not cam_lava and not in_snow:
+		# wiki: Fog - Blindness (priority) and Darkness: black fog (other fog types keep their colour), sight 5 / 15
+		# blocks, the sky hidden; neither applies in lava or powder snow
+		var sight := 5.0 if player.effects.has("blindness") else (15.0 if player.effects.has("darkness") else -1.0)
+		if sight > 0.0:
+			if not fluid:
+				fogc = Color(0, 0, 0)
+			env_f = Vector2(0.0, minf(sight, env_f.y))
+			fluid = true
 	var strength := 0.0 if Settings.get_v("fog") == "off" and not fluid else 1.0
 	ShaderGlobals.put_v("mc_fog_color", Vector4(fogc.r, fogc.g, fogc.b, strength))
 	ShaderGlobals.put_v("mc_fog_dist", Vector4(env_f.x, env_f.y, rd_f.x, rd_f.y))
@@ -3386,10 +4609,11 @@ func _update_sky(alpha: float) -> void:
 
 ## Java 26.3 lightmap (core/lightmap.fsh) as the 16x16 texture Java renders each frame: x = block level, y = sky level.
 ## Inputs: timeline sky light colour / factor, dimension ambient colour, block light flicker (1.5 + Java's per-tick
-## random walk), night vision, Brightness option. BLOCK_LIGHT_TINT and NIGHT_VISION_COLOR are code constants in Java
-## (not data): ESTIMATED here (tint from the pre-26 warm block-light curve at mid levels).
-const BLOCK_LIGHT_TINT := Color(1.0, 0.76, 0.47)
-const NIGHT_VISION_COLOR := Color(1.0, 1.0, 1.0)
+## random walk), night vision, Brightness option. BLOCK_LIGHT_TINT and NIGHT_VISION_COLOR: the defaults of the
+## minecraft:visual/block_light_tint (#FFD88C) and night_vision_color (#999999) environment attributes (wiki:
+## Environment attribute; no 26.3 dimension or biome overrides them).
+const BLOCK_LIGHT_TINT := Color(1.0, 216.0 / 255.0, 140.0 / 255.0)
+const NIGHT_VISION_COLOR := Color(0.6, 0.6, 0.6)
 var lightmap_img: Image
 var lightmap_tex: ImageTexture
 var _lm_params := PackedFloat32Array()
@@ -3404,7 +4628,9 @@ func _update_lightmap(nv: float) -> void:
 		lightmap_tex = ImageTexture.create_from_image(lightmap_img)
 		RenderingServer.global_shader_parameter_set("mc_lightmap", lightmap_tex)
 	var ss := sky_state
-	var p := PackedFloat32Array([ss.sky_light_factor, 1.5 + block_flicker, nv, 0.0, 0.0, float(Settings.get_v("brightness")),
+	# Java: a lightning flash lights the sky fully for its 2 ticks (option Hide Sky Flashes keeps it off)
+	var skyf: float = 1.0 if sky_flash > 0 and not Settings.get_v("hide_lightning") else ss.sky_light_factor
+	var p := PackedFloat32Array([skyf, 1.5 + block_flicker, nv, 0.0, 0.0, float(Settings.get_v("brightness")),
 		BLOCK_LIGHT_TINT.r, BLOCK_LIGHT_TINT.g, BLOCK_LIGHT_TINT.b, ss.sky_light_color.r, ss.sky_light_color.g, ss.sky_light_color.b,
 		ss.ambient_color.r, ss.ambient_color.g, ss.ambient_color.b, NIGHT_VISION_COLOR.r, NIGHT_VISION_COLOR.g, NIGHT_VISION_COLOR.b])
 	if p == _lm_params:
@@ -3463,6 +4689,8 @@ func _tick_camera() -> void:
 	_eye_h += (player.eye_height() - _eye_h) * 0.5
 	_fov_mod_old = _fov_mod
 	_fov_mod = clampf(_fov_mod + (_fov_target() - _fov_mod) * 0.5, 0.1, 1.5)
+	# wiki: Fog - entering water starts the thick initial water fog again
+	_water_vision = _water_vision + 1 if player.eyes_in_water else 0
 
 
 ## Java AbstractClientPlayer.getFieldOfViewModifier: flying x1.1, (speed / walking speed + 1) / 2 (sprint 1.15, speed /
@@ -3479,7 +4707,9 @@ func _fov_target() -> float:
 	if ua == "bow":
 		var bf := minf(1.0, player.use_ticks / 20.0)
 		f *= 1.0 - bf * bf * 0.15
-	return lerpf(1.0, f, float(Settings.get_v("distortion")))
+	# wiki: Options - FOV Effects scales the FOV changes from sprinting, flying and status effects (Distortion Effects
+	# is the nausea / portal warp)
+	return lerpf(1.0, f, float(Settings.get_v("fov_effects")))
 
 
 func _update_camera(alpha: float) -> void:
@@ -3530,8 +4760,10 @@ func _update_camera(alpha: float) -> void:
 	var zoom_on: bool = Settings.get_v("adv_zoom") and screen == null and mouse_captured and Input.is_physical_key_pressed(KEY_C) and not Input.is_physical_key_pressed(KEY_CTRL)
 	_zoom = lerpf(_zoom, 0.25 if zoom_on else 1.0, clampf(get_process_delta_time() * 12.0, 0.0, 1.0))
 	fov *= _zoom
-	if player.eyes_in_water:
-		fov *= lerpf(1.0, 0.85714287, float(Settings.get_v("distortion")))
+	# wiki: Spyglass - 1/10 of the FOV option "regardless of the situation, or status effects" (no underwater shrink)
+	var scoping := third_person == 0 and UseItem.is_using(player) and UseItem.anim(UseItem.using_stack(player)) == "spyglass"
+	if player.eyes_in_water and not scoping:
+		fov *= lerpf(1.0, 0.85714287, float(Settings.get_v("fov_effects")))   # wiki: Water (FOV shrink follows FOV Effects)
 	camera.fov = fov
 	Audio.listener_pos = cam_pos
 	_update_player_model(p)
@@ -3544,6 +4776,10 @@ func _capture_mouse(on: bool) -> void:
 	if DisplayServer.get_name() == "headless" or not autoplay.is_empty():
 		return   # automated runs never grab the OS cursor (the user keeps working while tests run)
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if on else Input.MOUSE_MODE_VISIBLE
+
+
+var _sneak_toggled := false
+var _sprint_toggled := false
 
 
 func _gather_input() -> void:
@@ -3559,11 +4795,17 @@ func _gather_input() -> void:
 	player.in_forward = Input.get_action_strength("move_forward") - Input.get_action_strength("move_back")
 	player.in_strafe = Input.get_action_strength("move_left") - Input.get_action_strength("move_right")
 	player.in_jump = Input.is_action_pressed("jump")
+	# Java ToggleKeyMapping: with Sneak / Sprint set to Toggle a key press flips the held state
+	if player.dead:
+		_sneak_toggled = false
+		_sprint_toggled = false
 	if Settings.get_v("toggle_sneak"):
-		pass
+		player.in_sneak = _sneak_toggled
 	else:
 		player.in_sneak = Input.is_action_pressed("sneak")
-	if not Settings.get_v("toggle_sprint"):
+	if Settings.get_v("toggle_sprint"):
+		player.in_sprint = _sprint_toggled or player.sprinting and player.in_forward > 0.0
+	else:
 		player.in_sprint = Input.is_action_pressed("sprint") or player.sprinting and player.in_forward > 0.0
 
 
@@ -3610,9 +4852,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			return
 		open_screen(inventory_screen())
 		return
-	if event.is_action_pressed("chat") or event.is_action_pressed("command"):
+	# the command key: its bound key, or (with the default binding) any key that types "/" - numpad divide, keyboard
+	# layouts whose "/" is not on the US key - so "/" always opens the chat with "/" typed in
+	var cmd_key: bool = event.is_action_pressed("command") or (event is InputEventKey and event.pressed and not event.echo
+			and Controls.code_of("command") == KEY_SLASH and (event.unicode == 47 or event.keycode == KEY_KP_DIVIDE))
+	if event.is_action_pressed("chat") or cmd_key:
 		var ch = load("res://scripts/ui/chat_screen.gd").new()
-		ch.prefill = "/" if event.is_action_pressed("command") else ""
+		ch.prefill = "/" if cmd_key else ""
 		open_screen(ch)
 		return
 	for i in 9:
@@ -3658,16 +4904,20 @@ func _unhandled_input(event: InputEvent) -> void:
 		third_person = (third_person + 1) % 3
 	if event.is_action_pressed("screenshot"):
 		_screenshot()
-	if event.is_action_pressed("fullscreen"):
-		Settings.set_v("display_mode", "windowed" if Settings.get_v("display_mode") != "windowed" else "borderless")
+	if event.is_action_pressed("sneak") and not event.is_echo() and Settings.get_v("toggle_sneak"):
+		_sneak_toggled = not _sneak_toggled
+	if event.is_action_pressed("sprint") and not event.is_echo() and Settings.get_v("toggle_sprint"):
+		_sprint_toggled = not _sprint_toggled
 	if event.is_action_pressed("jump") and player.can_fly() and not player.is_spectator():
 		var now := Time.get_ticks_msec()
 		if now - last_tap_forward < 300:
 			player.flying = not player.flying
 			player.vel.y = 0.0
 		last_tap_forward = now
-	if event.is_action_pressed("drop"):
-		_drop_held(Input.is_key_pressed(KEY_CTRL))
+	if event.is_action_pressed("drop") and not player.is_spectator():
+		# Java handleKeybinds: a successful drop swings the main hand
+		if _drop_held(Input.is_key_pressed(KEY_CTRL)):
+			swing_hand()
 	if event.is_action_pressed("swap_offhand"):
 		var inv := player.inventory
 		var a := inv.get_slot(inv.selected)
@@ -3727,6 +4977,7 @@ func _screenshot() -> void:
 
 
 func _exit_tree() -> void:
+	Ambience.reset()   # (ambient loops stop with the world)
 	ChunkManager._dc_mutex.lock()
 	ChunkManager.dim_cache.clear()
 	ChunkManager._dc_mutex.unlock()
@@ -3864,8 +5115,12 @@ func _crack_mesh(st: int) -> ArrayMesh:
 
 
 func swing_hand() -> void:
-	if hand_swing <= 3:
-		hand_swing = 6
+	# Java LivingEntity.swing: restarts once half the current swing has passed
+	if hand_swing <= hand_swing_dur / 2:
+		var hz := maxi(player._effect_amp("haste"), player._effect_amp("conduit_power"))
+		var mf := player._effect_amp("mining_fatigue")
+		hand_swing_dur = 6 - hz if hz > 0 else (6 + mf * 2 if mf > 0 else 6)
+		hand_swing = hand_swing_dur
 
 
 func _attack() -> void:
@@ -3882,18 +5137,27 @@ func _attack() -> void:
 		mining_progress = 0.0
 		return
 	_attack_on_entity = false
-	player.attack_ticks = 0   # Java resetAttackStrengthTicker on every swing
+	if target.is_empty():
+		player.attack_ticks = 0   # Java startAttack MISS: resetAttackStrengthTicker (a block hit keeps it)
 	if target.is_empty() or player.is_spectator():
 		return
 	if player.is_creative():
-		if mining_cooldown <= 0:
+		# Java startDestroyBlock (a click): creative breaks at once and sets destroyDelay 5
+		if _creative_can_break():
 			_break_block(target["pos"], false)
 			mining_cooldown = 5
 
 
+## Java tool component can_destroy_blocks_in_creative: swords, spears, tridents, maces and the debug stick break nothing.
+func _creative_can_break() -> bool:
+	var h := player.inventory.held()
+	if h.is_empty():
+		return true
+	var n := h.name()
+	return not (n.ends_with("_sword") or n.ends_with("_spear") or n in ["trident", "mace", "debug_stick"])
+
+
 func _mining_tick() -> void:
-	if mining_cooldown > 0:
-		mining_cooldown -= 1
 	if _attack_on_entity:
 		if Input.is_action_pressed("attack"):
 			mining_progress = 0.0
@@ -3901,9 +5165,14 @@ func _mining_tick() -> void:
 			return
 		_attack_on_entity = false
 	if player.is_creative() and Input.is_action_pressed("attack") and screen == null and mouse_captured and not target.is_empty() and not target.has("entity"):
-		# Java continueAttack -> continueDestroyBlock (true every tick, a break every 5): the arm swings continuously
+		# Java continueAttack -> continueDestroyBlock (true every tick): destroyDelay counts down 5 ticks, then a break
+		# (one every 6 ticks while held); the arm swings continuously
 		swing_hand()
-		if mining_cooldown <= 0:
+		if _creative_can_break():
+			Particles.crack(target["pos"], int(target["state"]), target.get("normal", Vector3i.UP))   # (Java continueAttack)
+		if mining_cooldown > 0:
+			mining_cooldown -= 1
+		elif _creative_can_break():
 			_break_block(target["pos"], false)
 			mining_cooldown = 5
 		return
@@ -3918,20 +5187,28 @@ func _mining_tick() -> void:
 	if p != mining_pos:
 		mining_pos = p
 		mining_progress = 0.0
+		Interaction.redstone_ore_interact(self, p, int(target["state"]))   # (RedStoneOreBlock.attack)
 	if player.mode == Player.Mode.ADVENTURE and not Interaction.adventure_can_break(player.inventory.held(), int(target["state"])):
 		return
 	var st: int = target["state"]
 	swing_hand()   # Java: swing every tick while destroying (also on unbreakable blocks)
+	Particles.crack(p, st, target.get("normal", Vector3i.UP))   # Java Minecraft.continueAttack -> ParticleEngine.crack
+	if mining_cooldown > 0:
+		# Java MultiPlayerGameMode.continueDestroyBlock: destroyDelay (5 after a block that took more than one tick)
+		mining_cooldown -= 1
+		return
 	var d := Interaction.destroy_progress(player, st, self)
 	if d <= 0.0:
 		return
 	mining_progress += d
 	if game_time % 4 == 0:
-		Audio.play("block." + Res.blocks.block_info[Res.blocks.st_block[st]]["sound"] + ".hit", Vector3(p) + Vector3(0.5, 0.5, 0.5), "Blocks", 0.25, 0.5)
+		BlockProperties.play_block_sound(st, "hit", Vector3(p) + Vector3(0.5, 0.5, 0.5))
 	if mining_progress >= 1.0:
 		_break_block(p, true)
 		mining_progress = 0.0
-		mining_cooldown = 5
+		# wiki: Breaking - "a 6 tick (3/10 second) delay occurs before the next block begins to break" (none after an
+		# instant break): 6 ticks without progress here (Java: 5 destroyDelay ticks + the startDestroyBlock tick)
+		mining_cooldown = 6 if d < 1.0 else 0
 
 
 func _break_block(p: Vector3i, survival: bool) -> void:
@@ -3955,7 +5232,8 @@ func _break_block(p: Vector3i, survival: bool) -> void:
 		sb.components["minecraft:container"] = BlockEntities.component_of(be_data, "minecraft:container")
 		entities.spawn_item(Vector3(p) + Vector3(0.5, 0.25, 0.5), sb)
 	Sculk.vibrate(self, Vector3(p) + Vector3(0.5, 0.5, 0.5), true)
-	Audio.play("block." + str(blocks.block_info[blocks.st_block[st]]["sound"]) + ".break", Vector3(p) + Vector3(0.5, 0.5, 0.5), "Blocks")
+	# wiki: Stone (Sounds): block broken volume 1.0, pitch 0.8
+	BlockProperties.play_block_sound(st, "break", Vector3(p) + Vector3(0.5, 0.5, 0.5))
 	entities.spawn_block_particles(p, st)
 	if survival:
 		player.exhaustion += 0.005
@@ -3978,29 +5256,83 @@ func _use() -> void:
 		swing_hand()
 		entities.player_interact(target["entity"], held)
 		return
+	# Java MultiPlayerGameMode.useItemOn / useItem: an item on cooldown (ItemCooldowns) does nothing
+	var cooling := not held.is_empty() and player.on_cooldown(held.name())
 	if not target.is_empty():
 		if not player.sneaking or held.is_empty():
 			if Interaction.use_block(self, target):
 				swing_hand()
 				return
-		if not held.is_empty():
+		if not held.is_empty() and not cooling:
 			if Interaction.use_item_on(self, held, target):
 				swing_hand()
 				return
-	if UseItem.start(self, player, player.inventory.selected):
-		return
-	if not held.is_empty() and Interaction.has_use(held):
-		swing_hand()
-		Interaction.use_item(self, held)
+	if not cooling:
+		if UseItem.start(self, player, player.inventory.selected):
+			return
+		if not held.is_empty() and Interaction.has_use(held):
+			swing_hand()
+			Interaction.use_item(self, held)
+			return
+	var off := player.inventory.get_slot(Inventory.OFFHAND)
+	if not off.is_empty() and player.on_cooldown(off.name()):
 		return
 	UseItem.start(self, player, Inventory.OFFHAND)
 
 
+## Java Block.getCloneItemStack: the item a block picks as - its own item, or the item that places it (wall torches /
+## signs / banners / heads / coral fans, crops -> seeds, wire -> redstone, vines' bodies -> their tips, potted plants ->
+## the plant, candle cakes -> cake ...). -1: nothing (fluids, fire, portals, air).
+static var _clone_cache: Dictionary = {}
+
+
+static func clone_item(st: int) -> int:
+	if st <= 0:
+		return -1
+	var bid := Res.blocks.st_block[st]
+	var c = _clone_cache.get(bid)
+	if c != null:
+		return c
+	var nm := Res.blocks.name_of(st)
+	var it := Res.items.id(nm)
+	if it <= 0:
+		var alt := nm
+		if nm.begins_with("wall_"):
+			alt = nm.trim_prefix("wall_")
+		elif nm.contains("_wall_"):
+			alt = nm.replace("_wall_", "_")
+		elif nm.begins_with("potted_"):
+			alt = nm.trim_prefix("potted_")
+		elif nm.ends_with("_candle_cake") or nm == "candle_cake":
+			alt = "cake"
+		elif nm.ends_with("_plant") and Res.items.id(nm.trim_suffix("_plant")) > 0:
+			alt = nm.trim_suffix("_plant")   # kelp / twisting / weeping vines bodies
+		else:
+			alt = {"big_dripleaf_stem": "big_dripleaf", "attached_melon_stem": "melon_seeds", "attached_pumpkin_stem": "pumpkin_seeds",
+				"cave_vines_plant": "glow_berries", "piston_head": "piston", "bamboo_sapling": "bamboo", "tall_seagrass": "seagrass",
+				"moving_piston": "", "frosted_ice": "", "bubble_column": "", "fire": "", "soul_fire": "", "nether_portal": "",
+				"end_portal": "", "end_gateway": "", "water": "", "lava": "", "cave_air": "", "void_air": "", "air": ""}.get(nm, nm)
+		it = Res.items.id(alt) if alt != "" else -1
+		if it <= 0 and alt != "":
+			# items that place this block (seeds, redstone, string, berries, cocoa, powder snow bucket ...)
+			for i in Res.items.names.size():
+				var pb: int = Res.items.place_block[i]
+				if pb > 0 and Res.blocks.st_block[pb] == bid:
+					it = i
+					break
+	if it <= 0:
+		it = -1
+	_clone_cache[bid] = it
+	return it
+
+
+## Java Minecraft.pickBlock / Inventory.addAndPickItem: select the hotbar slot holding the item; otherwise (creative) a
+## new stack goes into the selected slot when it is empty, else into the first empty hotbar slot, else replaces the
+## selected one; survival takes the stack from the main inventory into the hotbar.
 func _pick_block() -> void:
 	if target.is_empty() or target.has("entity"):
 		return
-	var nm := Res.blocks.name_of(int(target["state"]))
-	var it := Res.items.id(nm)
+	var it := clone_item(int(target["state"]))
 	if it <= 0:
 		return
 	var inv := player.inventory
@@ -4008,15 +5340,38 @@ func _pick_block() -> void:
 		if inv.get_slot(i).item == it:
 			inv.selected = i
 			return
+	var dest := inv.selected
+	if not inv.get_slot(dest).is_empty():
+		for i in 9:
+			var k := (inv.selected + i) % 9
+			if inv.get_slot(k).is_empty():
+				dest = k
+				break
 	if player.is_creative():
-		inv.set_slot(inv.selected, ItemStack.of(it, 1))
+		inv.selected = dest
+		var prev := inv.get_slot(dest)
+		if not prev.is_empty():
+			for i in range(9, 36):
+				if inv.get_slot(i).is_empty():
+					inv.set_slot(i, prev)   # (Java: the replaced stack moves to a free inventory slot)
+					break
+		inv.set_slot(dest, ItemStack.of(it, 1))
+		return
+	for i in range(9, 36):
+		var s2 := inv.get_slot(i)
+		if s2.item == it:
+			var old := inv.get_slot(dest)
+			inv.set_slot(dest, s2)
+			inv.set_slot(i, old)
+			inv.selected = dest
+			return
 
 
-func _drop_held(all: bool) -> void:
+func _drop_held(all: bool) -> bool:
 	var inv := player.inventory
 	var h := inv.held()
 	if h.is_empty():
-		return
+		return false
 	var s := h.split(h.count if all else 1)
 	inv.changed.emit()
 	Sculk.vibrate(self, player.pos, true)
@@ -4024,17 +5379,25 @@ func _drop_held(all: bool) -> void:
 		var ep := player.eye_pos() - Vector3(0, 0.3, 0)
 		var dv := player.look_dir() * 0.3 + Vector3(0, 0.1, 0)
 		Net.forward("item", [ep.x, ep.y, ep.z, s.to_dict(), dv.x, dv.y, dv.z, 40])
-		return
+		return true
 	var e = entities.spawn_item(player.eye_pos() - Vector3(0, 0.3, 0), s)
 	if e != null:
-		e.vel = player.look_dir() * 0.3 + Vector3(0, 0.1, 0)
+		# Java Player.drop: 0.3 along the look, +0.1 up, a 0.02 random sideways nudge and +-0.1 random vertical
+		var ra := randf() * TAU
+		var rf := 0.02 * randf()
+		e.vel = player.look_dir() * 0.3 + Vector3(cos(ra) * rf, 0.1 + (randf() - randf()) * 0.1, sin(ra) * rf)
 		e.pickup_delay = 40
+	return true
 
 
+## wiki: Stone (Sounds): "Something falls on a block" - falling on the block with fall damage, volume 0.5, pitch 0.75
+## (the fall damage of this landing was applied just before: hurt() set hurt_time 10, counted down at most once since).
 func on_land(_p: Player) -> void:
+	if player.hurt_time < 9 or player.last_damage_source != "fall":
+		return
 	var st := state_at(int(floor(player.pos.x)), int(floor(player.pos.y - 0.2)), int(floor(player.pos.z)))
 	if st > 0:
-		Audio.play("block." + str(Res.blocks.block_info[Res.blocks.st_block[st]]["sound"]) + ".fall", player.pos, "Players", 0.5)
+		BlockProperties.play_block_sound(st, "fall", player.pos, "Players")
 
 
 func _on_player_death() -> void:
@@ -4149,6 +5512,14 @@ func respawn() -> void:
 			else:
 				at = stand
 				_settle_spawn = 0
+	if player.has_spawn and player.spawn_dim == "the_nether":
+		# wiki Respawn Anchor: respawning uses a charge; checked once the anchor's chunk is loaded (_anchor_respawn)
+		player.respawn(Vector3(player.spawn_point) + Vector3(0.5, 1.0, 0.5))
+		hud.death_shown = false
+		_anchor_pending = player.spawn_point
+		if dimension != "the_nether":
+			change_dimension("the_nether", {"kind": "exact", "pos": Vector3(player.spawn_point) + Vector3(0.5, 1.0, 0.5)})
+		return
 	player.respawn(at)
 	hud.death_shown = false
 	if dimension != "overworld":
@@ -4191,10 +5562,15 @@ func _on_setting(key: String) -> void:
 
 func _on_chunk_unloading(c: Chunk) -> void:
 	entities.on_chunk_unloading(c)
+	if not Net.is_client():
+		BlockUpdates.store_ticks(self, c, true)   # pending ticks leave with the chunk (saved), resume when it loads
 
 
 func _on_chunk_loaded(c: Chunk) -> void:
 	entities.on_chunk_loaded(c)
+	if not Net.is_client():
+		BlockUpdates.restore_ticks(self, c)
+		BlockUpdates.gen_fluid_ticks(self, c)
 
 
 # ---------------------------------------------------------------- persistence
@@ -4224,6 +5600,7 @@ func _autosave_step() -> void:
 		entities.store_chunk_entities(ch)
 		if not ch.saved_entities.is_empty():
 			ch.modified = true
+		BlockUpdates.store_ticks(self, ch, false)
 		if ch.modified:
 			cm.queue_save(ch.frozen_copy())
 		ch.saved_entities = []
@@ -4252,6 +5629,7 @@ func save_all() -> void:
 		entities.store_chunk_entities(ch)
 		if not ch.saved_entities.is_empty():
 			ch.modified = true
+		BlockUpdates.store_ticks(self, ch, false)
 		if ch.modified:
 			save.save_chunk(ch)
 		ch.saved_entities = []
@@ -4271,6 +5649,8 @@ func _save_level_data(background := false) -> void:
 	level["raining"] = raining
 	level["thundering"] = thundering
 	level["weather_timer"] = weather_timer
+	level["thunder_timer"] = thunder_timer
+	level["thunder_flag"] = _thunder_flag
 	level["gamerules"] = gamerules
 	level["difficulty"] = difficulty
 	level["last_version"] = Res.version

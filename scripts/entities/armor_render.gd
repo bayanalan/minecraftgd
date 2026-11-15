@@ -42,6 +42,8 @@ static func apply(rig: Node3D, slots: Array) -> void:
 				c.queue_free()
 	for slot in 4:
 		var full := str(slots[slot]) if slot < slots.size() else ""
+		var glint := full.contains("!")   # enchantment glint (Java armorEntityGlint: enchanted_glint_armor at 0.16)
+		full = full.replace("!", "")
 		var raw := full.get_slice("#", 0)
 		var trim := full.get_slice("#", 1) if full.contains("#") else ""
 		var nm := raw.get_slice("@", 0)
@@ -70,6 +72,12 @@ static func apply(rig: Node3D, slots: Array) -> void:
 			mi.mesh = st.commit()
 			mi.material_override = EntityRenderer.material(tex)
 			pivot.add_child(mi)
+			if glint:
+				var gl := MeshInstance3D.new()
+				gl.name = "armor_%d_%s_glint" % [slot, pn]
+				gl.mesh = mi.mesh
+				gl.material_override = Glint.material_3d(EntityRenderer.texture(tex), ItemStack.new(), true)
+				pivot.add_child(gl)
 			if trim != "":
 				var tt := trim_texture(trim.get_slice(":", 0), trim.get_slice(":", 1), legs, mat)
 				if tt != null:
@@ -100,6 +108,9 @@ static func apply(rig: Node3D, slots: Array) -> void:
 ## Horse saddle + body armor layers (Java HorseArmorLayer / saddle layer): the horse model's parts again, inflated
 ## slightly, with the installed entity/equipment/horse_body/<material>.png and horse_saddle/saddle.png textures.
 const HORSE_ARMOR := {"leather": 3, "copper": 4, "iron": 5, "golden": 7, "diamond": 11, "netherite": 19}
+# wiki (Horse Armor): armor toughness (others 0) and knockback resistance (netherite "+1" tooltip = 0.1 attribute, 10%)
+const HORSE_ARMOR_TOUGHNESS := {"diamond": 2, "netherite": 3}
+const HORSE_ARMOR_KB_RESISTANCE := {"netherite": 0.1}
 
 
 static func apply_horse(rig: Node3D, parts: Array, armor_item: String, saddle: bool) -> void:
@@ -137,11 +148,13 @@ static func apply_horse(rig: Node3D, parts: Array, armor_item: String, saddle: b
 		li += 1
 
 
+## Body armour points of a horse / nautilus (wiki Nautilus Armor: copper 4, iron 5, golden 7, diamond 11 (toughness 2),
+## netherite 19 (toughness 3) - the horse armour values).
 static func horse_armor_points(e) -> int:
 	var d = e.data.get("horse_armor", {})
 	if not (d is Dictionary) or d.is_empty():
 		return 0
-	return int(HORSE_ARMOR.get(ItemStack.from_dict(d).name().trim_suffix("_horse_armor"), 0))
+	return int(HORSE_ARMOR.get(ItemStack.from_dict(d).name().trim_suffix("_horse_armor").trim_suffix("_nautilus_armor"), 0))
 
 
 static var _trim_tex: Dictionary = {}
@@ -202,7 +215,7 @@ static func _trim_mat(t: Texture2D) -> ShaderMaterial:
 
 
 static func _suffix(s: ItemStack) -> String:
-	var out := ""
+	var out := "!" if Glint.has_glint(s) else ""
 	if s.components.has("minecraft:dyed_color"):
 		out += "@%d" % int(s.components["minecraft:dyed_color"])
 	var tr = s.components.get("minecraft:trim")
@@ -256,7 +269,12 @@ static func equip_mob(e, rng: RandomNumberGenerator, difficulty: int) -> void:
 
 
 static func death_drops(em, e) -> void:
+	if e.data.has("no_equip_drop"):
+		return   # (trial spawner equipment: slot_drop_chances 0)
 	var armor: Array = e.data.get("armor", [])
 	for nm in armor:
-		if str(nm) != "" and em.rng.randf() < 0.085:
+		if nm is Dictionary:
+			if not (nm as Dictionary).is_empty() and em.rng.randf() < 0.085:
+				em.spawn_item(e.pos + Vector3(0, 0.5, 0), ItemStack.from_dict(nm))
+		elif str(nm) != "" and em.rng.randf() < 0.085:
 			em.spawn_item(e.pos + Vector3(0, 0.5, 0), ItemStack.named(str(nm), 1))

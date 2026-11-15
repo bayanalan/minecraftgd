@@ -283,6 +283,31 @@ func text(pos_gui_screen: Vector2, t: String, col: Color, shadow := true, max_w 
 	body.draw_string(f, p, t, HORIZONTAL_ALIGNMENT_LEFT, max_w, fs, col)
 
 
+## Java bold text: each glyph drawn twice 1 px apart with a one-pixel wider advance (shadows under the whole string).
+func text_bold(pos_gui_screen: Vector2, t: String, col: Color, shadow := true) -> void:
+	var s := gs()
+	var f := UiKit.font()
+	var fs := 8 * int(s)
+	var p := pos_gui_screen + Vector2(0, 7 * s)
+	for layer_i in [0, 1]:
+		if layer_i == 0 and not (shadow and Settings.get_v("text_shadow")):
+			continue
+		var x := 0.0
+		for ch in t:
+			var adv := f.get_string_size(ch, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
+			for dx in [0.0, 1.0]:
+				if layer_i == 0:
+					body.draw_string(f, p + Vector2((x + dx + 1) * s, s), ch, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color(col.r * 0.25, col.g * 0.25, col.b * 0.25, col.a))
+				else:
+					body.draw_string(f, p + Vector2((x + dx) * s, 0), ch, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, col)
+			x += adv + 1.0
+
+
+## Width of bold text in GUI px (one extra pixel per glyph).
+static func text_w_bold(t: String) -> float:
+	return text_w(t) + float(t.length())
+
+
 ## Width of a string in GUI px.
 static func text_w(t: String) -> float:
 	return UiKit.font().get_string_size(t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x

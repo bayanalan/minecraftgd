@@ -39,7 +39,16 @@ var frame_ubo: RID
 var sampler: RID
 var tex_rid: RID
 var lm_sampler: RID
-var shaders: Array = [RID(), RID(), RID()]
+var shaders: Array = [RID(), RID(), RID(), RID(), RID(), RID()]   # opaque, cutout, translucent, + sRGB copy / blend / back
+## Java blends translucent terrain (water, ice, stained glass) in sRGB on an 8-bit target; ours is linear, where no fixed
+## blend reproduces it (water over a dark sea floor came out far too bright and blue). With srgb_blend the translucent
+## terrain is drawn three times: copy the scene under it into an RGBA8 texture as sRGB (mat 3), blend far-to-near there
+## exactly like Java (mat 4), write the result back as linear (mat 5) - only the covered pixels are touched.
+var srgb_blend := true
+var _srgb_tex := RID()
+var _srgb_size := Vector2i.ZERO
+var scr_sampler := RID()
+var _scr_usets: Dictionary = {}      # mat * 4096 + page -> [uniform set, screen texture]
 var pipelines: Dictionary = {}       # fb_format * 4 + mat -> RID
 var _usets: Dictionary = {}          # mat * 4096 + page -> uniform set
 var _cull_frame := -1
@@ -85,7 +94,15 @@ func _init(p_world) -> void:
 	tex_rid = RenderingServer.texture_get_rd_texture(Res.atlas.texture.get_rid())
 	if p_world != null and p_world.autoplay.has("trplanar"):
 		planar = str(p_world.autoplay["trplanar"]) == "1"
-	for m in 3:
+	if p_world != null and p_world.autoplay.has("trsrgb"):
+		srgb_blend = str(p_world.autoplay["trsrgb"]) != "0"
+	var sst := RDSamplerState.new()
+	sst.mag_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+	sst.min_filter = RenderingDevice.SAMPLER_FILTER_NEAREST
+	sst.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+	sst.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+	scr_sampler = rd.sampler_create(sst)
+	for m in 6:
 		shaders[m] = _compile(m)
 	_preallocate()
 
@@ -124,6 +141,14 @@ func destroy() -> void:
 		if rd.uniform_set_is_valid(us):
 			rd.free_rid(us)
 	_usets.clear()
+	for su in _scr_usets.values():
+		if rd.uniform_set_is_valid(su[0]):
+			rd.free_rid(su[0])
+	_scr_usets.clear()
+	if _srgb_tex.is_valid():
+		rd.free_rid(_srgb_tex)
+	if scr_sampler.is_valid():
+		rd.free_rid(scr_sampler)
 	for p in pipelines.values():
 		rd.free_rid(p)
 	pipelines.clear()
@@ -414,20 +439,25 @@ func render(render_data: RenderData, mats: Array) -> void:
 			sky_rd.draw_sky(dl, fmt, _samples, rsb.get_internal_size())
 		if m == 2:
 			# translucent: global far-to-near order across pages, one indirect draw per run of same-page commands
-			if np > 0:
-				for ri in range(0, _runs.size(), 3):
-					var rpg: int = _runs[ri]
-					var rfirst: int = _runs[ri + 1]
-					var rcnt: int = _runs[ri + 2]
-					if rpg < 0 or rpg >= np or rcnt <= 0 or rfirst + rcnt > MAX_CMDS:
-						continue
+			if np > 0 and _runs.size() > 0:
+				if srgb_blend and not ms:
+					if dl >= 0:
+						rd.draw_list_end()
+						dl = -1
+					var color: RID = rsb.get_color_layer(0, false)
+					_ensure_srgb(rsb.get_internal_size())
+					var fbs := FramebufferCacheRD.get_cache_multipass([_srgb_tex, rsb.get_depth_layer(0, false)], [], 1)
+					var fmts := rd.framebuffer_get_format(fbs)
+					var dls := rd.draw_list_begin(fbs, RenderingDevice.DRAW_DEFAULT_ALL)
+					_draw_runs(dls, fmts, 3, np, color)
+					_draw_runs(dls, fmts, 4, np, RID())
+					rd.draw_list_end()
+					dl = rd.draw_list_begin(fb, RenderingDevice.DRAW_DEFAULT_ALL)
+					_draw_runs(dl, fmt, 5, np, _srgb_tex)
+				else:
 					if dl < 0:
 						dl = rd.draw_list_begin(fb, RenderingDevice.DRAW_DEFAULT_ALL)
-					rd.draw_list_bind_render_pipeline(dl, _pipeline(fmt, m))
-					rd.draw_list_bind_uniform_set(dl, _uset(m, rpg), 0)
-					rd.draw_list_bind_vertex_array(dl, varrays[rpg])
-					rd.draw_list_bind_index_array(dl, index_array)
-					rd.draw_list_draw_indirect(dl, true, indirect_buf, rfirst * 20, rcnt, 20)
+					_draw_runs(dl, fmt, m, np, RID())
 			continue
 		for pg in np:
 			var mi: int = (m * np + pg) * 2
@@ -460,6 +490,57 @@ func render(render_data: RenderData, mats: Array) -> void:
 		rd.draw_list_end()
 
 
+func _draw_runs(dl: int, fmt: int, m: int, np: int, screen: RID) -> void:
+	rd.draw_list_bind_render_pipeline(dl, _pipeline(fmt, m))
+	rd.draw_list_bind_index_array(dl, index_array)
+	for ri in range(0, _runs.size(), 3):
+		var rpg: int = _runs[ri]
+		var rfirst: int = _runs[ri + 1]
+		var rcnt: int = _runs[ri + 2]
+		if rpg < 0 or rpg >= np or rcnt <= 0 or rfirst + rcnt > MAX_CMDS:
+			continue
+		rd.draw_list_bind_uniform_set(dl, _uset(m, rpg) if not screen.is_valid() else _uset_screen(m, rpg, screen), 0)
+		rd.draw_list_bind_vertex_array(dl, varrays[rpg])
+		rd.draw_list_draw_indirect(dl, true, indirect_buf, rfirst * 20, rcnt, 20)
+
+
+## RGBA8 target of the sRGB translucent pass (internal 3D size).
+func _ensure_srgb(size: Vector2i) -> void:
+	if _srgb_tex.is_valid() and size == _srgb_size:
+		return
+	if _srgb_tex.is_valid():
+		for su in _scr_usets.values():
+			if rd.uniform_set_is_valid(su[0]):
+				rd.free_rid(su[0])
+		_scr_usets.clear()
+		rd.free_rid(_srgb_tex)
+	var tf := RDTextureFormat.new()
+	tf.format = RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM
+	tf.width = size.x
+	tf.height = size.y
+	tf.usage_bits = RenderingDevice.TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT
+	_srgb_tex = rd.texture_create(tf, RDTextureView.new())
+	_srgb_size = size
+
+
+## Uniform set of the copy / write-back passes: the usual bindings + the screen texture they read (binding 5).
+func _uset_screen(m: int, pg: int, screen: RID) -> RID:
+	var k := m * 4096 + pg
+	var e = _scr_usets.get(k)
+	if e != null and (e[1] as RID) == screen and rd.uniform_set_is_valid(e[0]):
+		return e[0]
+	if e != null and rd.uniform_set_is_valid(e[0]):
+		rd.free_rid(e[0])
+	var su := RDUniform.new()
+	su.uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE
+	su.binding = 5
+	su.add_id(scr_sampler)
+	su.add_id(screen)
+	var us := rd.uniform_set_create([_u_storage(1, origins[pg]), _u_ubo(2, frame_ubo), _u_tex(4), su], shaders[m], 0)
+	_scr_usets[k] = [us, screen]
+	return us
+
+
 func _uset(m: int, pg: int) -> RID:
 	var k := m * 4096 + pg
 	var us: RID = _usets.get(k, RID())
@@ -474,7 +555,8 @@ func _compile(mat: int) -> RID:
 	var src := RDShaderSource.new()
 	src.language = RenderingDevice.SHADER_LANGUAGE_GLSL
 	src.source_vertex = VERT.replace("//VDEFINES", ("#define PLANAR\n" if planar else "") + ("#define CHEAPVS\n" if debug_flags & 256 else "") + ("#define DEGEN\n" if debug_flags & 512 else ""))
-	var defs := "#define CUTOUT\n" if mat == 1 else ("#define TRANSLUCENT\n" if mat == 2 else "")
+	var defs := "#define CUTOUT\n" if mat == 1 else ("#define TRANSLUCENT\n" if mat >= 2 else "")
+	defs += ["", "", "", "#define TCOPY\n", "#define SRGB_OUT\n", "#define TBACK\n"][mat]
 	if debug_flags & 16:
 		defs += "#define FLAT\n"   # experiment: constant colour (fragment cost)
 	src.source_fragment = FRAG.replace("//DEFINES", defs)
@@ -496,11 +578,11 @@ func _pipeline(fb_format: int, mat: int) -> RID:
 	ms.sample_count = _samples
 	var ds := RDPipelineDepthStencilState.new()
 	ds.enable_depth_test = true
-	ds.enable_depth_write = mat != 2
+	ds.enable_depth_write = mat < 2
 	ds.depth_compare_operator = RenderingDevice.COMPARE_OP_GREATER_OR_EQUAL   # reverse Z
 	var bs := RDPipelineColorBlendState.new()
 	var att := RDPipelineColorBlendStateAttachment.new()
-	if mat == 2:
+	if mat == 2 or mat == 4:
 		att.set_as_mix()
 	bs.attachments = [att]
 	var p := rd.render_pipeline_create(shaders[mat], fb_format, _vformat(), RenderingDevice.RENDER_PRIMITIVE_TRIANGLES, rs, ms, ds, bs)
@@ -694,6 +776,9 @@ layout(location = 2) in vec3 v_lm;
 layout(location = 3) in vec4 v_color;
 layout(location = 4) in vec2 v_fogd;
 layout(location = 0) out vec4 frag;
+#if defined(TCOPY) || defined(TBACK)
+layout(set = 0, binding = 5) uniform sampler2D screen_tex;
+#endif
 float lin_fog(float d, float s, float e) {
 	if (d <= s) return 0.0;
 	if (d >= e) return 1.0;
@@ -702,7 +787,18 @@ float lin_fog(float d, float s, float e) {
 vec3 to_linear(vec3 c) {
 	return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThan(c, vec3(0.04045)));
 }
+vec3 to_srgb(vec3 c) {
+	return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, c * 12.92, lessThan(c, vec3(0.0031308)));
+}
 void main() {
+#ifdef TCOPY
+	frag = vec4(to_srgb(clamp(texelFetch(screen_tex, ivec2(gl_FragCoord.xy), 0).rgb, 0.0, 1.0)), 1.0);
+	return;
+#endif
+#ifdef TBACK
+	frag = vec4(to_linear(texelFetch(screen_tex, ivec2(gl_FragCoord.xy), 0).rgb), 1.0);
+	return;
+#endif
 #ifdef FLAT
 	frag = vec4(v_color.rgb * v_lm, 1.0);
 	return;
@@ -724,9 +820,11 @@ void main() {
 	float fv = max(lin_fog(v_fogd.x, fr.fog.x, fr.fog.y), lin_fog(v_fogd.y, fr.fog.z, fr.fog.w));
 	col = mix(col, fr.fog_color.rgb, fv * fr.fog_color.a);
 	vec3 lin = to_linear(col);
-#ifdef TRANSLUCENT
-	// Java blends translucent terrain in sRGB; our target is linear, where a light background shows through far more
-	// (sand under water turned lavender). 1 - (1 - a)^1.5 restores the vanilla balance for typical backgrounds.
+#ifdef SRGB_OUT
+	frag = vec4(col, base.a);   // blended in sRGB like Java (the RGBA8 pass target)
+#elif defined(TRANSLUCENT)
+	// fallback (MSAA / --trsrgb=0): blending in our linear target, where a light background shows through far more
+	// (sand under water turned lavender); 1 - (1 - a)^1.5 restores the vanilla balance for typical backgrounds
 	frag = vec4(lin, 1.0 - pow(1.0 - base.a, 1.5));
 #else
 	frag = vec4(lin, 1.0);

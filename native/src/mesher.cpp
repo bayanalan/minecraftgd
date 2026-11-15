@@ -519,7 +519,8 @@ void emit_fluid(Surf &surf, const Ctx &c, int i, int x, int y, int z, int st, in
 	C4 col = lava ? C4{1, 1, 1, 1} : C4{c.tints[(512 + ci) * 4], c.tints[(512 + ci) * 4 + 1], c.tints[(512 + ci) * 4 + 2], c.tints[(512 + ci) * 4 + 3]};
 	bool up_same = same_fluid(c.fl(c.pad[i + PL]), lava);
 	int dn = c.pad[i - PL];
-	bool draw_down = !same_fluid(c.fl(dn), lava) && !((c.cull[dn] >> 1) & 1);
+	// Java shouldRenderFace: not where the cell's own block (a waterlogged slab / stairs) covers that face
+	bool draw_down = !same_fluid(c.fl(dn), lava) && !((c.cull[dn] >> 1) & 1) && !(c.cull[st] & 1);
 	double h = cell_h(c, i, lava);
 	double cnw = 1.0, cne = 1.0, csw = 1.0, cse = 1.0;
 	if (h < 1.0) {
@@ -557,7 +558,17 @@ void emit_fluid(Surf &surf, const Ctx &c, int i, int x, int y, int z, int st, in
 		cc.a = (float)SHADE[1];
 		C4 cs[4] = {cc, cc, cc, cc};
 		surf.quad(pts, uvc, cs, layer, -1.0f, sks, bls, false);
-		if (!lava) {
+		// FluidState.shouldRenderBackwardUpFace: the underside only when one of the 9 cells above holds neither water
+		// nor a solid-render block (open water). Under a submerged block the surface (8/9 high) is not seen from below:
+		// drawn always, it showed a thin layer of "air" under every block in water.
+		bool back = false;
+		if (!lava)
+			for (int oz = -1; oz <= 1 && !back; oz++)
+				for (int ox = -1; ox <= 1 && !back; ox++) {
+					int f2 = c.fl(c.pad[i + PL + oz * PX + ox]);
+					if (!same_fluid(f2, false) && !(f2 & F_OPAQUE)) back = true;
+				}
+		if (back) {
 			V3 rp[4] = {pts[3], pts[2], pts[1], pts[0]};
 			V2 ru[4] = {uvc[3], uvc[2], uvc[1], uvc[0]};
 			surf.quad(rp, ru, cs, layer, -1.0f, sks, bls, false);
@@ -583,6 +594,7 @@ void emit_fluid(Surf &surf, const Ctx &c, int i, int x, int y, int z, int st, in
 		int nf = c.fl(nb);
 		if (same_fluid(nf, lava)) continue;
 		if ((c.cull[nb] >> OPP[d]) & 1) continue;
+		if ((c.cull[st] >> d) & 1) continue;
 		double h1, h2, p1x, p1z, p2x, p2z;
 		switch (k) {
 			case 0: h1 = cnw; h2 = cne; p1x = x0; p1z = z0 + 0.001; p2x = x0 + 1.0; p2z = z0 + 0.001; break;

@@ -297,6 +297,9 @@ static func native_check(w) -> void:
 			vg.features.legacy_region = true
 			Structures.old_scan = true
 			Native.features_ok = false
+			if w.autoplay.has("flatcmp"):   # --flatcmp=1: the GDScript flat path (live heightmaps, as native) instead of the legacy
+				# overlay path, whose pristine heightmaps make trees placed beside earlier trees differ (jungle / fancy oak / mangrove)
+				vg.features.legacy_region = false
 			var ta2 := Time.get_ticks_usec()
 			var w1: PackedInt32Array = vg.compute_features(origin, ChunkRegion.new(ox, oz, nine))
 			var b1: Array = vg.features.bounds.duplicate()
@@ -327,6 +330,19 @@ static func native_check(w) -> void:
 						fi -= fi % 5
 						print("[nativecheck]   first differing write #%d: legacy %s / new %s" % [fi / 5, str(w1.slice(fi, fi + 5)), str(w2.slice(fi, fi + 5))])
 						break
+				if w.autoplay.has("fall"):   # --fall=1: every feature's writes compared, offsets ignored (first differing writes shown)
+					for bj in mini(b1.size(), b2.size()):
+						var s1 := w1.slice(b1[bj][1], b1[bj + 1][1] if bj + 1 < b1.size() else w1.size())
+						var s2 := w2.slice(b2[bj][1], b2[bj + 1][1] if bj + 1 < b2.size() else w2.size())
+						print("[nativecheck]   feat %s / %s: %s (%d / %d writes)" % [b1[bj][0], b2[bj][0], "same" if s1 == s2 else "DIFF", s1.size() / 5, s2.size() / 5])
+						if s1 != s2:
+							var fj := 0
+							while fj < mini(s1.size(), s2.size()) and s1[fj] == s2[fj]:
+								fj += 1
+							fj -= fj % 5
+							for q in 6:
+								var o := fj + q * 5
+								print("[nativecheck]     #%d legacy %s %s / new %s %s" % [o / 5, str(s1.slice(o, o + 5)), Res.blocks.state_string(maxi(0, s1[o + 3])) if o + 3 < s1.size() else "", str(s2.slice(o, o + 5)), Res.blocks.state_string(maxi(0, s2[o + 3])) if o + 3 < s2.size() else ""])
 				print("[nativecheck] feature writes differ at %d,%d: %d vs %d" % [ox, oz, w1.size(), w2.size()])
 		# decorate: GDScript apply + freeze vs native chunk_decorate on identical centre chunks
 		var dn2 := int(w.autoplay.get("decchunks", "2"))

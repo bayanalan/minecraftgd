@@ -10,14 +10,15 @@
 ## - trident (TridentItem): thrown after >= 10 ticks at speed 2.5 (damage 8, Loyalty returns), Riptide launches the
 ##   player in water/rain instead.
 ## - shield (blocks_attacks component): blocking after 5 ticks (block_delay_seconds 0.25), frontal 90 degree cone, full
-##   reduction, durability 1 + floor(damage) for damage >= 3, axes disable it for 5 s, melee attackers knocked back.
+##   reduction, durability 1 + floor(damage) for damage >= 3, axes disable it for 5 s (no knockback to attackers in Java).
 ## - spyglass: zoom (FOV x0.1) while used.
 ## - brush (BrushItem / BrushableBlockEntity): used on a block for up to 200 ticks, a stroke every 10 ticks (tick 5,
 ##   15, ...): dust particles + brushing sound; on suspicious sand / gravel 10 strokes (10-tick cooldown) dig the loot out,
 ##   dusted 0-3 = brush count 0 / <3 / <6 / more, idle 40 ticks -> the count falls by 2 every 2 ticks; completion drops
 ##   the loot item on the brushed face, turns the block into sand / gravel and costs 1 durability.
 ## While using: movement x0.2 and no sprinting (Java LocalPlayer.aiStep isUsingItem).
-## APPROXIMATE: no firework crossbow ammo, trident does not stay stuck in blocks (it drops as an item on landing).
+## - crossbow ammo: firework rockets from the offhand (straight flight 1.6 / tick, 3 durability per rocket shot),
+##   Piercing arrows pass through level entities (EntityManager), Channeling tridents call lightning (EntityManager).
 class_name UseItem
 extends RefCounted
 
@@ -102,7 +103,8 @@ static func start(world, p: Player, slot: int) -> bool:
 	match a:
 		"eat":
 			var n := s.name()
-			if p.food >= 20 and not p.is_creative() and not n in ["golden_apple", "enchanted_golden_apple", "chorus_fruit"]:
+			# wiki: Food - at full hunger only chorus fruit, golden apples, honey bottles and suspicious stew can be eaten
+			if p.food >= 20 and not p.is_creative() and not n in ["golden_apple", "enchanted_golden_apple", "chorus_fruit", "suspicious_stew"]:
 				return true
 		"bow":
 			if not p.is_creative() and _find_ammo(p) < 0:
@@ -112,7 +114,8 @@ static func start(world, p: Player, slot: int) -> bool:
 			if ch is Array and not ch.is_empty():
 				_fire_crossbow(world, p, slot)
 				return true
-			if not p.is_creative() and _find_ammo(p) < 0:
+			var offr := p.inventory.get_slot(Inventory.OFFHAND)
+			if not p.is_creative() and _find_ammo(p) < 0 and not (slot != Inventory.OFFHAND and not offr.is_empty() and offr.name() == "firework_rocket"):
 				return false
 		"spear":
 			var md: int = Res.items.max_damage[s.item]
@@ -223,19 +226,66 @@ static func _item_color(item: int) -> Color:
 	return c
 
 
-## Java LivingEntity.triggerItemUseEffects / spawnItemParticles (5 fragments 0.3-0.9 below the eye, 0.6 ahead).
+## Java LivingEntity.spawnItemParticles: n fragments of the item's sprite 0.3-0.9 below the eye, 0.6 ahead (eating,
+## an item breaking).
+static func spawn_item_particles(p: Player, item: int, n: int) -> void:
+	var yr := deg_to_rad(-p.yaw)
+	var pr := deg_to_rad(p.pitch)   # Java Vec3.xRot(-pitch) == Godot rotation about +X by +pitch
+	for i in n:
+		var v := Vector3((randf() - 0.5) * 0.1, randf() * 0.1 + 0.1, 0).rotated(Vector3.RIGHT, pr).rotated(Vector3.UP, yr)
+		var off := Vector3((randf() - 0.5) * 0.3, -randf() * 0.6 - 0.3, 0.6).rotated(Vector3.RIGHT, pr).rotated(Vector3.UP, yr)
+		Particles.item_fragment(p.eye_pos() + off, v + Vector3(0, 0.05, 0), item)
+
+
+## Java LivingEntity.triggerItemUseEffects (5 fragments per use effect).
 static func _use_effects(world, p: Player, s: ItemStack, a: String) -> void:
 	if a == "eat":
 		Audio.play("entity.generic.eat", p.pos, "Players", 0.5 + 0.5 * randi_range(0, 1), randf_range(0.8, 1.2))
-		var col := _item_color(s.item)
-		var yr := deg_to_rad(-p.yaw)
-		var pr := deg_to_rad(p.pitch)   # Java Vec3.xRot(-pitch) == Godot rotation about +X by +pitch
-		for i in 5:
-			var v := Vector3((randf() - 0.5) * 0.1, randf() * 0.1 + 0.1, 0).rotated(Vector3.RIGHT, pr).rotated(Vector3.UP, yr)
-			var off := Vector3((randf() - 0.5) * 0.3, -randf() * 0.6 - 0.3, 0.6).rotated(Vector3.RIGHT, pr).rotated(Vector3.UP, yr)
-			Particles.emit("item", p.eye_pos() + off, v + Vector3(0, 0.05, 0), col)
+		spawn_item_particles(p, s.item, 5)
 	else:
 		Audio.play("entity.generic.drink", p.pos, "Players", 0.5, randf_range(0.9, 1.0))
+
+## wiki Chorus Fruit (consume effect teleport_randomly, diameter 16): up to 16 tries at x / z +- 8 and y +- 8 (within
+## the dimension's build range); the target column is searched downward to the first solid floor and must have room
+## for the player without liquid; sounds item.chorus_fruit.teleport at both ends; fall distance resets.
+static func chorus_teleport(world, p: Player) -> bool:
+	var b := Res.blocks
+	var dt = world.get("dim_type")
+	var min_y := int(dt.get("min_y", Coords.MIN_Y)) if dt is Dictionary else Coords.MIN_Y
+	var height := int(dt.get("logical_height", dt.get("height", 384))) if dt is Dictionary else 384
+	for i in 16:
+		var tx := p.pos.x + (randf() - 0.5) * 16.0
+		var ty := clampf(p.pos.y + float(randi_range(0, 15) - 8), float(min_y), float(min_y + height - 1))
+		var tz := p.pos.z + (randf() - 0.5) * 16.0
+		var bx := int(floor(tx))
+		var bz := int(floor(tz))
+		var by := int(floor(ty))
+		while by > min_y and not _solid(world, bx, by - 1, bz):
+			by -= 1
+		if by <= min_y or not _solid(world, bx, by - 1, bz):
+			continue
+		var free := true
+		for dy in 2:
+			var st: int = world.state_at(bx, by + dy, bz)
+			if st > 0 and ((b.st_flags[st] & (BlockRegistry.F_LIQUID | BlockRegistry.F_WATERLOGGED)) != 0 or _solid(world, bx, by + dy, bz)):
+				free = false
+		if not free:
+			continue
+		var from := p.pos
+		Audio.play("item.chorus_fruit.teleport", from, "Players")
+		p.pos = Vector3(tx, float(by), tz)
+		p.prev_pos = p.pos
+		p.vel = Vector3.ZERO
+		p.fall_distance = 0.0
+		Audio.play("item.chorus_fruit.teleport", p.pos, "Players")
+		return true
+	return false
+
+
+static func _solid(world, x: int, y: int, z: int) -> bool:
+	var st: int = world.state_at(x, y, z)
+	return st > 0 and (Res.blocks.st_flags[st] & BlockRegistry.F_SOLID) != 0
+
 
 ## Java Item.finishUsingItem for consumables.
 static func _finish(world, p: Player, s: ItemStack) -> void:
@@ -246,6 +296,9 @@ static func _finish(world, p: Player, s: ItemStack) -> void:
 	if Res.items.food_nutrition[s.item] > 0:
 		if p.eat(s.item):
 			Audio.play("entity.player.burp", p.pos, "Players", 0.5, randf_range(0.9, 1.0))
+			if iname == "chorus_fruit":
+				chorus_teleport(world, p)
+				p.add_cooldown("chorus_fruit", 20)   # wiki Chorus Fruit: 1 s cooldown
 			if not p.is_creative():
 				var rem := "bowl" if iname.ends_with("_stew") or iname == "beetroot_soup" else ("glass_bottle" if iname == "honey_bottle" else "")
 				_consume(p, slot, rem)
@@ -296,6 +349,7 @@ static func _damage_item(p: Player, slot: int, n: int) -> void:
 		s.damage += 1
 	if s.damage >= md:
 		Audio.play("entity.item.break", p.pos, "Players")
+		spawn_item_particles(p, s.item, 5)   # Java LivingEntity.breakItem
 		p.inventory.set_slot(slot, ItemStack.new())
 	else:
 		p.inventory.set_slot(slot, s)
@@ -348,6 +402,10 @@ static func _load_crossbow(world, p: Player, slot: int) -> void:
 	var cb := p.inventory.get_slot(slot)
 	var n := 3 if Loot._ench(cb, "multishot") > 0 else 1
 	var ammo := _find_ammo(p)
+	# wiki Crossbow: a firework rocket in the offhand is loaded instead of arrows
+	var off := p.inventory.get_slot(Inventory.OFFHAND)
+	if slot != Inventory.OFFHAND and not off.is_empty() and off.name() == "firework_rocket":
+		ammo = Inventory.OFFHAND
 	if ammo < 0 and not p.is_creative():
 		return
 	var loaded: Array = []
@@ -369,14 +427,38 @@ static func _fire_crossbow(world, p: Player, slot: int) -> void:
 	var cb := p.inventory.get_slot(slot)
 	var loaded: Array = cb.components.get("minecraft:charged_projectiles", [])
 	var angles := [0.0, -10.0, 10.0]
+	var rockets := false
+	var pierce := Loot._ench(cb, "piercing")
 	for i in loaded.size():
 		var dir := p.look_dir().rotated(Vector3.UP, deg_to_rad(angles[mini(i, 2)]))
-		_spawn_arrow(world, p, dir, 3.15, 1.0, 2.0, true, i == 0 and not p.is_creative(), cb, ItemStack.from_dict(loaded[i]))
+		var am := ItemStack.from_dict(loaded[i])
+		if am.name() == "firework_rocket":
+			rockets = true
+			_spawn_rocket(world, p, dir, am)
+			continue
+		_spawn_arrow(world, p, dir, 3.15, 1.0, 2.0, true, i == 0 and not p.is_creative(), cb, am)
+		if pierce > 0:
+			world.entities.ents[world.entities.ents.size() - 1].data["pierce"] = pierce
 	Audio.play("item.crossbow.shoot", p.pos, "Players", 1.0, randf_range(0.9, 1.1))
 	cb.components.erase("minecraft:charged_projectiles")
 	p.inventory.set_slot(slot, cb)
-	_damage_item(p, slot, 3 if loaded.size() > 1 else 1)
+	# wiki Crossbow: 1 durability per shot (3 with Multishot); a firework rocket costs 3 (9 with Multishot)
+	_damage_item(p, slot, (3 if rockets else 1) * (3 if loaded.size() > 1 else 1))
 	world.inv_changed()
+
+
+## wiki Crossbow: a firework rocket shot from a crossbow flies in a straight line at 32 m/s (1.6 blocks per tick) and
+## explodes on contact with blocks and entities (or when its flight time ends: Java lifetime 10 x (flight + 1) +
+## random 0-5 + random 0-6 ticks, as launched rockets); inaccuracy 1 like the arrows. Piercing does not apply.
+static func _spawn_rocket(world, p: Player, dir: Vector3, am: ItemStack) -> void:
+	var v := dir.normalized() + Vector3(randfn(0, 1), randfn(0, 1), randfn(0, 1)) * 0.0075
+	world.entities.spawn_projectile("firework_rocket", p.eye_pos() - Vector3(0, 0.15, 0), v.normalized() * 1.6, p)
+	var e = world.entities.ents[world.entities.ents.size() - 1]
+	e.stack = am.copy()
+	e.stack.count = 1
+	e.data["angle"] = true
+	var fw = am.components.get("minecraft:fireworks", {})
+	e.data["life"] = 10 * ((int((fw as Dictionary).get("flight_duration", 1)) if fw is Dictionary else 1) + 1) + randi_range(0, 5) + randi_range(0, 6)
 
 
 static func _trident(world, p: Player, slot: int) -> void:
@@ -407,31 +489,64 @@ static func _trident(world, p: Player, slot: int) -> void:
 static func try_block(p: Player, amount: float, source: String, from: Vector3, attacker = null) -> bool:
 	if not is_blocking(p) or from == Vector3.INF:
 		return false
-	if source in ["fall", "drown", "starve", "out_of_world", "magic", "wither", "on_fire", "in_fire", "lava", "sonic_boom", "freeze", "cramming", "suffocation"]:
+	# 26.3 #bypasses_shield: #bypasses_armor + cactus, campfire, dry_out, falling anvil / stalactite, hot_floor,
+	# sulfur_cube_hot, in_fire, lava, lightning_bolt, sweet_berry_bush
+	if source in Player.BYPASS_ARMOR or source in ["cactus", "campfire", "dry_out", "falling_anvil", "falling_stalactite", "hot_floor", "sulfur_cube_hot", "in_fire", "lava", "lightning_bolt", "sweet_berry_bush"]:
 		return false
-	var rel := Vector3(p.pos.x - from.x, 0, p.pos.z - from.z)
-	if rel.length() < 0.001:
+	if not _shield_faces(p, from):
 		return false
-	rel = rel.normalized()
-	var view := p.look_dir()
-	view = Vector3(view.x, 0, view.z).normalized()
-	if acos(clampf(-rel.dot(view), -1.0, 1.0)) > deg_to_rad(90.0):
-		return false
-	var slot := p.using_slot
-	if amount >= 3.0:
-		_damage_item(p, slot, 1 + int(floor(amount)))
-	Audio.play("item.shield.block", p.pos, "Players", 1.0, randf_range(0.8, 1.2))
+	_shield_absorb(p, amount)
+	# wiki: Shield - an axe hit disables it for 5 s (100 ticks); attackers are knocked back only in Bedrock Edition
+	# (Java 18w43a: shields no longer knock back attackers)
 	if attacker != null and attacker is Object and attacker.get("kind") == "mob":
 		var held_name := str(attacker.data.get("held", ""))
 		if held_name.ends_with("_axe"):
 			p.shield_cooldown = 100
+			p.add_cooldown("shield", 100)   # (ItemCooldowns: the hotbar overlay)
 			Audio.play("item.shield.break", p.pos, "Players", 0.8, randf_range(0.8, 1.2))
 			stop(p)
-		else:
-			var kb: Vector3 = (attacker.pos - p.pos)
-			kb.y = 0
-			if kb.length() > 0.001:
-				attacker.vel += kb.normalized() * 0.5 + Vector3(0, 0.1, 0)
+	return true
+
+
+## wiki Shield: "directionally blocks all attacks coming from within the horizontal direction the wielder is facing"
+## (a half cylinder; pitch is unaccounted for) - blocks_attacks horizontal_blocking_angle 90 to either side.
+static func _shield_faces(p: Player, from: Vector3) -> bool:
+	var rx := from.x - p.pos.x
+	var rz := from.z - p.pos.z
+	var rl := sqrt(rx * rx + rz * rz)
+	if rl < 0.001:
+		return false
+	var yr := deg_to_rad(p.yaw)
+	# (horizontal view vector of look_dir with the pitch dropped)
+	return (-sin(yr) * rx + cos(yr) * rz) / rl >= 0.0
+
+
+## A blocked hit: wiki Item durability - "damage equal to the strength of the attack (rounded down) plus 1" when it
+## deals 3 or more (blocks_attacks item_damage threshold 3); wiki Shield sound item.shield.block, pitch 0.8-1.2.
+static func _shield_absorb(p: Player, amount: float) -> void:
+	if amount >= 3.0:
+		_damage_item(p, p.using_slot, 1 + int(floor(amount)))
+	Audio.play("item.shield.block", p.pos, "Players", 1.0, randf_range(0.8, 1.2))
+
+
+## A projectile `proj` (EntityManager.Ent) about to hit the player for `amount` from `from` (its position, Java
+## DamageSource.getSourcePosition). wiki Shield: a raised shield blocks arrows, thrown tridents, ghast / blaze fireballs
+## and fire charges, wither skulls, shulker bullets, llama spit, snowballs and eggs from the front; the burning, potion
+## effects and Levitation they carry do not reach the blocker (the caller skips them). "Arrows from a crossbow enchanted
+## with Piercing" are not blocked and cost no durability; splash / lingering potion effects are not blocked. Shooters
+## of any kind (mobs, players, dispensers): only the projectile's position counts. True = blocked (the caller then
+## deflects or ends the projectile as on a failed hit).
+static func block_projectile(p: Player, proj, from: Vector3, amount: float) -> bool:
+	if not is_blocking(p):
+		return false
+	var id: String = proj.id
+	if id == "arrow" and int(proj.data.get("pierce", 0)) > 0:
+		return false
+	if amount <= 0.0 and not (id in ["snowball", "egg", "blue_egg", "brown_egg"]):
+		return false   # (splash / lingering potions, bottles o' enchanting, dragon fireballs deal no hit damage)
+	if not _shield_faces(p, from):
+		return false
+	_shield_absorb(p, amount)
 	return true
 
 

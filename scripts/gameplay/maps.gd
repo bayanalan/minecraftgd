@@ -30,8 +30,13 @@ static func new_map(world, x: float, z: float, scale: int = 0) -> ItemStack:
 	return s
 
 
+## The map id of a filled map or of a 26.x explorer map item (ocean_monument_map, desert_village_map ...: MapItems with
+## their own model), -1 for anything else.
 static func map_id(s: ItemStack) -> int:
-	if s == null or s.is_empty() or s.name() != "filled_map":
+	if s == null or s.is_empty():
+		return -1
+	var nm := s.name()
+	if nm != "filled_map" and not (nm.ends_with("_map") and s.components.has("minecraft:map_id")):
 		return -1
 	return int(s.components.get("minecraft:map_id", -1))
 
@@ -213,6 +218,9 @@ static func update(world, id: int) -> void:
 	var maps: Dictionary = world.level.get("maps", {})
 	var md: Dictionary = maps.get(str(id), {})
 	if md.is_empty() or str(md.get("dim", "overworld")) != world.dimension or bool(md.get("locked", false)):
+		return
+	if md.has("explore"):
+		ExplorerMaps.ensure(id)   # (an explorer map whose structure search is pending - restarted after a reload)
 		return
 	var e := entry(world, id)
 	var img: Image = e["img"]
@@ -478,6 +486,10 @@ static func decorations(world, id: int) -> Array:
 	for key2 in fr:
 		var f: Dictionary = fr[key2]
 		out.append(["map/decorations/frame", int(f["mx"]), int(f["mz"]), int(f["rot"]), "", false])
+	# explorer map targets (MapItemSavedData.addTargetDecoration: rotation 180 = byte 8, ExplorerMaps)
+	for tg in md.get("targets", []):
+		var txy := _map_xy(md, float(tg["x"]), float(tg["z"]))
+		out.append([ExplorerMaps.decoration_texture(str(tg["t"])), txy.x, txy.y, 8, "", false])
 	return out
 
 

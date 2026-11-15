@@ -132,67 +132,110 @@ const WITHER := [["base", [0, 0, 0], [-10, 3.9, -0.5], [20, 3, 3], [0, 16], 0], 
 	["head1", [-8, 4, 0], [-4, -4, -4], [6, 6, 6], [32, 0], 0], ["head2", [10, 4, 0], [-4, -4, -4], [6, 6, 6], [32, 0], 0]]
 const CHICKEN_LIKE := [["body", [0, 16, 0], [-3, -4, -3], [6, 8, 6], [0, 9], 90], ["head", [0, 15, -4], [-2, -6, -2], [4, 6, 3], [0, 0], 0]]
 
+## Stat fields (wiki: Attribute / Hitbox / Experience / Breeding; item lists from the 26.3 item tags): hp, speed
+## (movement_speed attribute; baby_speed when babies differ), fly_speed (flying_speed), attack (Normal-difficulty
+## melee damage; fixed-weapon mobs include their weapon), attack_knockback, armor_points, knockback_resistance,
+## follow_range (default 16), step_height (default 0.6), w / h (adult hitbox), baby_w / baby_h (baby hitbox when it
+## is not half the adult's), xp [min, max] (adult killed by a player), food (breeding items), tame_food.
+## Per-goal speed modifiers (x speed): stroll_speed (random stroll), panic_speed (after damage, default 1.75),
+## hide_speed (bell alarm run to a bed). wiki Villager / Wandering Trader give only the attributes 0.5 / 0.7 - the
+## modifiers are Java's: villager brain walk 0.5, panic / flee 0.5 x 1.5, hide 0.5 x 1.25; wandering trader stroll
+## 0.35, panic / avoid 0.5 (MobBehaviors.FLEES).
 const DEFS := {
-	"villager": {"hp": 20, "speed": 0.25, "w": 0.6, "h": 1.95, "kind": "passive", "trader": true, "tex": "entity/villager/villager", "tex_size": [64, 64], "xp": [0, 0], "parts": VILLAGER},
-	"wandering_trader": {"hp": 20, "speed": 0.25, "w": 0.6, "h": 1.95, "kind": "passive", "trader": true, "tex": "entity/wandering_trader/wandering_trader", "tex_size": [64, 64], "xp": [0, 0], "parts": VILLAGER},
-	"zombie_villager": {"hp": 20, "speed": 0.23, "w": 0.6, "h": 1.95, "kind": "hostile", "burns": true, "attack": 3.0, "tex": "entity/zombie_villager/zombie_villager", "tex_size": [64, 64], "xp": [5, 5], "parts": ILLAGER},
+	"villager": {"hp": 20, "speed": 0.5, "stroll_speed": 0.5, "panic_speed": 0.75, "hide_speed": 0.625, "w": 0.6, "h": 1.95, "baby_w": 0.49, "baby_h": 0.98, "kind": "passive", "trader": true, "tex": "entity/villager/villager", "tex_size": [64, 64], "xp": [0, 0], "parts": VILLAGER},
+	"wandering_trader": {"hp": 20, "speed": 0.7, "stroll_speed": 0.35, "panic_speed": 0.5, "w": 0.6, "h": 1.95, "kind": "passive", "trader": true, "tex": "entity/wandering_trader/wandering_trader", "tex_size": [64, 64], "xp": [0, 0], "parts": VILLAGER},
+	"zombie_villager": {"hp": 20, "speed": 0.23, "baby_speed": 0.345, "w": 0.6, "h": 1.95, "baby_w": 0.49, "baby_h": 0.98, "kind": "hostile", "burns": true, "attack": 3.0, "armor_points": 2, "follow_range": 35.0, "tex": "entity/zombie_villager/zombie_villager", "tex_size": [64, 64], "xp": [5, 5], "parts": ILLAGER},
 	"witch": {"hp": 26, "speed": 0.25, "w": 0.6, "h": 1.95, "kind": "hostile", "ranged_potion": true, "tex": "entity/witch/witch", "tex_size": [64, 128], "xp": [5, 5], "parts": VILLAGER},
-	"pillager": {"hp": 24, "speed": 0.35, "w": 0.6, "h": 1.95, "kind": "hostile", "ranged": true, "tex": "entity/illager/pillager", "tex_size": [64, 64], "xp": [5, 5], "parts": ILLAGER},
-	"vindicator": {"hp": 24, "speed": 0.35, "w": 0.6, "h": 1.95, "kind": "hostile", "attack": 13.0, "tex": "entity/illager/vindicator", "tex_size": [64, 64], "xp": [5, 5], "parts": ILLAGER},
-	"evoker": {"hp": 24, "speed": 0.5, "w": 0.6, "h": 1.95, "kind": "hostile", "summons_vex": true, "tex": "entity/illager/evoker", "tex_size": [64, 64], "xp": [10, 10], "parts": ILLAGER},
-	"illusioner": {"hp": 32, "speed": 0.5, "w": 0.6, "h": 1.95, "kind": "hostile", "ranged": true, "tex": "entity/illager/illusioner", "tex_size": [64, 64], "xp": [5, 5], "parts": ILLAGER},
-	"ravager": {"hp": 100, "speed": 0.3, "w": 1.95, "h": 2.2, "kind": "hostile", "attack": 12.0, "tex": "entity/illager/ravager", "tex_size": [128, 128], "xp": [20, 20], "parts": RAVAGER},
-	"vex": {"hp": 14, "speed": 0.6, "w": 0.4, "h": 0.8, "kind": "hostile", "flies": true, "small_flyer": true, "attack": 9.0, "tex": "entity/illager/vex", "tex_size": [32, 32], "xp": [3, 3], "parts": VEX},
-	"iron_golem": {"hp": 100, "speed": 0.25, "w": 1.4, "h": 2.7, "kind": "passive", "golem": true, "attack": 15.0, "tex": "entity/iron_golem/iron_golem", "tex_size": [128, 128], "xp": [0, 0], "parts": IRON_GOLEM},
+	# wiki (Attribute): follow range pillager 32, vindicator / evoker 12, illusioner 18, ravager 32; ravager knockback
+	# resistance 0.75, attack knockback 1.5, step height 1
+	"pillager": {"hp": 24, "speed": 0.35, "follow_range": 32.0, "w": 0.6, "h": 1.95, "kind": "hostile", "ranged": true, "tex": "entity/illager/pillager", "tex_size": [64, 64], "xp": [5, 5], "parts": ILLAGER},
+	"vindicator": {"hp": 24, "speed": 0.35, "follow_range": 12.0, "w": 0.6, "h": 1.95, "kind": "hostile", "attack": 13.0, "tex": "entity/illager/vindicator", "tex_size": [64, 64], "xp": [5, 5], "parts": ILLAGER},
+	"evoker": {"hp": 24, "speed": 0.5, "follow_range": 12.0, "w": 0.6, "h": 1.95, "kind": "hostile", "summons_vex": true, "tex": "entity/illager/evoker", "tex_size": [64, 64], "xp": [10, 10], "parts": ILLAGER},
+	"illusioner": {"hp": 32, "speed": 0.5, "follow_range": 18.0, "w": 0.6, "h": 1.95, "kind": "hostile", "ranged": true, "tex": "entity/illager/illusioner", "tex_size": [64, 64], "xp": [5, 5], "parts": ILLAGER},
+	"ravager": {"hp": 100, "speed": 0.3, "follow_range": 32.0, "step_height": 1.0, "w": 1.95, "h": 2.2, "kind": "hostile", "attack": 12.0, "attack_knockback": 1.5, "knockback_resistance": 0.75, "tex": "entity/illager/ravager", "tex_size": [128, 128], "xp": [20, 20], "parts": RAVAGER},
+	# wiki (Attribute / Experience / Fire): vex movement speed 0.7, 5 XP, immune to fire; iron golem knockback
+	# resistance 1, step height 1
+	"vex": {"hp": 14, "speed": 0.7, "w": 0.4, "h": 0.8, "kind": "hostile", "flies": true, "small_flyer": true, "fire_immune": true, "attack": 9.0, "tex": "entity/illager/vex", "tex_size": [32, 32], "xp": [5, 5], "parts": VEX},
+	"iron_golem": {"hp": 100, "speed": 0.25, "step_height": 1.0, "w": 1.4, "h": 2.7, "kind": "passive", "golem": true, "attack": 15.0, "knockback_resistance": 1.0, "tex": "entity/iron_golem/iron_golem", "tex_size": [128, 128], "xp": [0, 0], "parts": IRON_GOLEM},
 	"snow_golem": {"hp": 4, "speed": 0.2, "w": 0.7, "h": 1.9, "kind": "passive", "golem": true, "water_hurts": true, "tex": "entity/snow_golem/snow_golem", "tex_size": [64, 64], "xp": [0, 0], "parts": SNOW_GOLEM},
-	"wolf": {"hp": 8, "speed": 0.3, "w": 0.6, "h": 0.85, "kind": "passive", "tame_food": "bone", "tex": "entity/wolf/wolf", "tex_size": [64, 32], "food": ["beef", "porkchop", "chicken", "mutton", "rabbit"], "xp": [1, 3], "parts": WOLF},
+	# wiki (Breeding) / #wolf_food: every meat (#meat) plus fish and rabbit stew; attack 4 (wiki: Attribute)
+	"wolf": {"hp": 8, "speed": 0.3, "w": 0.6, "h": 0.85, "kind": "passive", "tame_food": "bone", "attack": 4.0, "tex": "entity/wolf/wolf", "tex_size": [64, 32],
+		"food": ["beef", "chicken", "cooked_beef", "cooked_chicken", "cooked_mutton", "cooked_porkchop", "cooked_rabbit", "mutton", "porkchop", "rabbit", "rotten_flesh",
+			"cod", "cooked_cod", "salmon", "cooked_salmon", "tropical_fish", "pufferfish", "rabbit_stew"], "xp": [1, 3], "parts": WOLF},
 	"cat": {"hp": 10, "speed": 0.3, "w": 0.6, "h": 0.7, "kind": "passive", "tame_food": "cod", "tex": "entity/cat/cat_tabby", "tex_size": [64, 32], "food": ["cod", "salmon"], "xp": [1, 3], "parts": CAT},
 	"ocelot": {"hp": 10, "speed": 0.3, "w": 0.6, "h": 0.7, "kind": "passive", "tex": "entity/cat/ocelot", "tex_size": [64, 32], "food": ["cod", "salmon"], "xp": [1, 3], "parts": CAT},
-	"horse": {"hp": 22, "speed": 0.225, "w": 1.4, "h": 1.6, "kind": "passive", "rideable": true, "tex": "entity/horse/horse_brown", "tex_size": [64, 64], "food": ["golden_carrot", "golden_apple"], "xp": [1, 3], "parts": HORSE},
-	"donkey": {"hp": 20, "speed": 0.175, "w": 1.4, "h": 1.5, "kind": "passive", "rideable": true, "tex": "entity/horse/donkey", "tex_size": [64, 64], "food": ["golden_carrot", "golden_apple"], "xp": [1, 3], "parts": HORSE},
-	"mule": {"hp": 20, "speed": 0.175, "w": 1.4, "h": 1.6, "kind": "passive", "rideable": true, "tex": "entity/horse/mule", "tex_size": [64, 64], "xp": [1, 3], "parts": HORSE},
-	"skeleton_horse": {"hp": 15, "speed": 0.2, "w": 1.4, "h": 1.6, "kind": "passive", "tex": "entity/horse/horse_skeleton", "tex_size": [64, 64], "xp": [1, 3], "parts": HORSE},
-	"zombie_horse": {"hp": 15, "speed": 0.2, "w": 1.4, "h": 1.6, "kind": "passive", "tex": "entity/horse/horse_zombie", "tex_size": [64, 64], "xp": [1, 3], "parts": HORSE},
-	"camel": {"hp": 32, "speed": 0.09, "w": 1.7, "h": 2.375, "kind": "passive", "rideable": true, "tex": "entity/camel/camel", "tex_size": [128, 128], "food": ["cactus"], "xp": [1, 3], "parts": HORSE, "scale": 1.4},
-	"camel_husk": {"hp": 32, "speed": 0.09, "w": 1.7, "h": 2.375, "kind": "hostile", "tex": "entity/camel/camel_husk", "tex_size": [128, 128], "attack": 4.0, "xp": [5, 5], "parts": HORSE, "scale": 1.4},
-	"llama": {"hp": 22, "speed": 0.175, "w": 0.9, "h": 1.87, "kind": "passive", "spits": true, "tex": "entity/llama/llama_creamy", "tex_size": [128, 64], "food": ["wheat", "hay_block"], "xp": [1, 3], "parts": LLAMA},
-	"trader_llama": {"hp": 22, "speed": 0.175, "w": 0.9, "h": 1.87, "kind": "passive", "spits": true, "tex": "entity/llama/llama_creamy", "tex_size": [128, 64], "xp": [1, 3], "parts": LLAMA},
+	# wiki (Breeding / Attribute): horse + donkey breed with golden apple / enchanted golden apple / golden carrot, llamas
+	# with hay bales only (wheat heals, does not breed); step height 1 (camels 1.5); zombie horse speed is rolled in
+	# 0.2135 - 0.2846 (avg 0.24905 here; spawn_mob rolls it into data.speed) and it burns in daylight (#burn_in_daylight);
+	# camel husk is passive on its own (hostile only through its riders), 1 - 3 XP, no attack of its own. tempt: items
+	# that lure without breeding (wiki: zombie horse red mushroom, camel husk rabbit's foot, strider warped fungus on a stick)
+	"horse": {"hp": 30, "speed": 0.225, "step_height": 1.0, "w": 1.3965, "horse_regen": true, "h": 1.6, "kind": "passive", "rideable": true, "tex": "entity/horse/horse_brown", "tex_size": [64, 64], "food": ["golden_carrot", "golden_apple", "enchanted_golden_apple"], "xp": [1, 3], "parts": HORSE},
+	"donkey": {"hp": 30, "speed": 0.175, "step_height": 1.0, "w": 1.3965, "horse_regen": true, "h": 1.5, "kind": "passive", "rideable": true, "tex": "entity/horse/donkey", "tex_size": [64, 64], "food": ["golden_carrot", "golden_apple", "enchanted_golden_apple"], "xp": [1, 3], "parts": HORSE},
+	"mule": {"hp": 30, "speed": 0.175, "step_height": 1.0, "w": 1.3965, "horse_regen": true, "h": 1.6, "kind": "passive", "rideable": true, "tex": "entity/horse/mule", "tex_size": [64, 64], "xp": [1, 3], "parts": HORSE},
+	"skeleton_horse": {"hp": 15, "speed": 0.2, "step_height": 1.0, "w": 1.3965, "horse_regen": true, "h": 1.6, "kind": "passive", "tex": "entity/horse/horse_skeleton", "tex_size": [64, 64], "xp": [1, 3], "parts": HORSE},
+	"zombie_horse": {"hp": 25, "speed": 0.24905, "step_height": 1.0, "w": 1.3965, "horse_regen": true, "h": 1.6, "kind": "passive", "burns": true, "tempt": ["red_mushroom"], "tex": "entity/horse/horse_zombie", "tex_size": [64, 64], "xp": [1, 3], "parts": HORSE},
+	"camel": {"hp": 32, "speed": 0.09, "step_height": 1.5, "horse_regen": true, "w": 1.7, "h": 2.375, "kind": "passive", "rideable": true, "tex": "entity/camel/camel", "tex_size": [128, 128], "food": ["cactus"], "xp": [1, 3], "parts": HORSE, "scale": 1.4},
+	"camel_husk": {"hp": 32, "speed": 0.09, "step_height": 1.5, "horse_regen": true, "w": 1.7, "h": 2.375, "kind": "passive", "tempt": ["rabbit_foot"], "tex": "entity/camel/camel_husk", "tex_size": [128, 128], "xp": [1, 3], "parts": HORSE, "scale": 1.4},
+	"llama": {"hp": 30, "horse_regen": true, "speed": 0.175, "step_height": 1.0, "w": 0.9, "h": 1.87, "kind": "passive", "spits": true, "tex": "entity/llama/llama_creamy", "tex_size": [128, 64], "food": ["hay_block"], "xp": [1, 3], "parts": LLAMA},
+	"trader_llama": {"hp": 30, "horse_regen": true, "speed": 0.175, "step_height": 1.0, "w": 0.9, "h": 1.87, "kind": "passive", "spits": true, "tex": "entity/llama/llama_creamy", "tex_size": [128, 64], "food": ["hay_block"], "xp": [1, 3], "parts": LLAMA},
 	"mooshroom": {"hp": 10, "speed": 0.2, "w": 0.9, "h": 1.4, "kind": "passive", "tex": "entity/cow/mooshroom_red", "tex_size": [64, 64], "food": ["wheat"], "xp": [1, 3], "rig_of": "cow"},
-	"bee": {"hp": 10, "speed": 0.3, "w": 0.7, "h": 0.6, "kind": "passive", "flies": true, "small_flyer": true, "neutral_sting": true, "tex": "entity/bee/bee", "tex_size": [64, 64], "food": ["dandelion", "poppy", "sunflower"], "xp": [1, 3], "parts": BEE},
-	"fox": {"hp": 10, "speed": 0.3, "w": 0.6, "h": 0.7, "kind": "passive", "tex": "entity/fox/fox", "tex_size": [48, 32], "food": ["sweet_berries", "glow_berries"], "xp": [1, 3], "parts": FOX},
+	# wiki (Breeding) / #bee_food: every flower and flowering block; bee flying speed 0.6 (wiki: Attribute)
+	"bee": {"hp": 10, "speed": 0.3, "fly_speed": 0.6, "w": 0.7, "h": 0.6, "kind": "passive", "flies": true, "small_flyer": true, "neutral_sting": true, "tex": "entity/bee/bee", "tex_size": [64, 64],
+		"food": ["dandelion", "open_eyeblossom", "poppy", "blue_orchid", "allium", "azure_bluet", "red_tulip", "orange_tulip", "white_tulip", "pink_tulip", "oxeye_daisy",
+			"cornflower", "lily_of_the_valley", "wither_rose", "torchflower", "sunflower", "lilac", "peony", "rose_bush", "pitcher_plant", "flowering_azalea_leaves",
+			"flowering_azalea", "mangrove_propagule", "cherry_leaves", "pink_petals", "wildflowers", "chorus_flower", "spore_blossom", "cactus_flower"], "xp": [1, 3], "parts": BEE},
+	# wiki (Attribute / Hitbox): fox follow range 32, baby 0.36 x 0.42; polar bear follow range 20; turtle step height 1,
+	# baby 0.36 x 0.12; armadillo baby 0.42 x 0.39; axolotl / frog step height 1
+	"fox": {"hp": 10, "speed": 0.3, "follow_range": 32.0, "w": 0.6, "h": 0.7, "baby_w": 0.36, "baby_h": 0.42, "kind": "passive", "tex": "entity/fox/fox", "tex_size": [48, 32], "food": ["sweet_berries", "glow_berries"], "xp": [1, 3], "parts": FOX},
 	"rabbit": {"hp": 3, "speed": 0.3, "w": 0.4, "h": 0.5, "kind": "passive", "hops": false, "tex": "entity/rabbit/rabbit_brown", "tex_size": [64, 32], "food": ["carrot", "golden_carrot", "dandelion"], "xp": [1, 3], "parts": RABBIT},
 	"goat": {"hp": 10, "speed": 0.2, "w": 0.9, "h": 1.3, "kind": "passive", "rams": true, "tex": "entity/goat/goat", "tex_size": [64, 64], "food": ["wheat"], "xp": [1, 3], "parts": GOAT},
 	"panda": {"hp": 20, "speed": 0.15, "w": 1.3, "h": 1.25, "kind": "passive", "tex": "entity/panda/panda", "tex_size": [64, 64], "food": ["bamboo"], "xp": [1, 3], "parts": PANDA},
-	"polar_bear": {"hp": 30, "speed": 0.25, "w": 1.4, "h": 1.4, "kind": "passive", "defends": true, "attack": 6.0, "tex": "entity/bear/polarbear", "tex_size": [128, 64], "xp": [1, 3], "parts": POLAR_BEAR},
-	"turtle": {"hp": 30, "speed": 0.25, "w": 1.2, "h": 0.4, "kind": "passive", "amphibious": true, "tex": "entity/turtle/turtle", "tex_size": [128, 64], "food": ["seagrass"], "xp": [1, 3], "parts": TURTLE},
-	"armadillo": {"hp": 12, "speed": 0.14, "w": 0.7, "h": 0.65, "kind": "passive", "tex": "entity/armadillo/armadillo", "tex_size": [64, 64], "food": ["spider_eye"], "xp": [1, 3], "parts": PANDA, "scale": 0.45},
+	"polar_bear": {"hp": 30, "speed": 0.25, "follow_range": 20.0, "w": 1.4, "h": 1.4, "kind": "passive", "defends": true, "attack": 6.0, "tex": "entity/bear/polarbear", "tex_size": [128, 64], "xp": [1, 3], "parts": POLAR_BEAR},
+	"turtle": {"hp": 30, "speed": 0.25, "step_height": 1.0, "w": 1.2, "h": 0.4, "baby_w": 0.36, "baby_h": 0.12, "kind": "passive", "amphibious": true, "tex": "entity/turtle/turtle", "tex_size": [128, 64], "food": ["seagrass"], "xp": [1, 3], "parts": TURTLE},
+	"armadillo": {"hp": 12, "speed": 0.14, "w": 0.7, "h": 0.65, "baby_w": 0.42, "baby_h": 0.39, "kind": "passive", "tex": "entity/armadillo/armadillo", "tex_size": [64, 64], "food": ["spider_eye"], "xp": [1, 3], "parts": PANDA, "scale": 0.45},
 	"sniffer": {"hp": 14, "speed": 0.1, "w": 1.9, "h": 1.75, "kind": "passive", "tex": "entity/sniffer/sniffer", "tex_size": [192, 192], "food": ["torchflower_seeds"], "xp": [1, 3], "parts": POLAR_BEAR, "scale": 1.3},
-	"axolotl": {"hp": 14, "speed": 1.0, "w": 0.75, "h": 0.42, "kind": "passive", "swims": true, "amphibious": true, "tex": "entity/axolotl/axolotl_lucy", "tex_size": [64, 64], "food": ["tropical_fish_bucket"], "xp": [1, 3], "spawn": "in_water", "parts": AXOLOTL},
-	"frog": {"hp": 10, "speed": 1.0, "w": 0.5, "h": 0.5, "kind": "passive", "amphibious": true, "tex": "entity/frog/frog_temperate", "tex_size": [48, 48], "food": ["slime_ball"], "xp": [1, 3], "parts": FROG},
+	"axolotl": {"hp": 14, "speed": 1.0, "step_height": 1.0, "w": 0.75, "h": 0.42, "kind": "passive", "swims": true, "amphibious": true, "tex": "entity/axolotl/axolotl_lucy", "tex_size": [64, 64], "food": ["tropical_fish_bucket"], "xp": [1, 3], "spawn": "in_water", "parts": AXOLOTL},
+	"frog": {"hp": 10, "speed": 1.0, "step_height": 1.0, "w": 0.5, "h": 0.5, "kind": "passive", "amphibious": true, "tex": "entity/frog/frog_temperate", "tex_size": [48, 48], "food": ["slime_ball"], "xp": [1, 3], "parts": FROG},
 	"tadpole": {"hp": 6, "speed": 1.0, "w": 0.4, "h": 0.3, "kind": "passive", "swims": true, "fish": true, "tex": "entity/tadpole/tadpole", "tex_size": [16, 16], "xp": [0, 0], "spawn": "in_water", "parts": TADPOLE},
-	"squid": {"hp": 10, "speed": 0.4, "w": 0.8, "h": 0.8, "kind": "passive", "swims": true, "fish": true, "tex": "entity/squid/squid", "tex_size": [64, 32], "xp": [1, 3], "spawn": "in_water", "parts": SQUID},
-	"glow_squid": {"hp": 10, "speed": 0.4, "w": 0.8, "h": 0.8, "kind": "passive", "swims": true, "fish": true, "tex": "entity/squid/glow_squid", "tex_size": [64, 32], "xp": [1, 3], "spawn": "in_water", "parts": SQUID},
-	"cod": {"hp": 3, "speed": 1.0, "w": 0.5, "h": 0.3, "kind": "passive", "swims": true, "fish": true, "tex": "entity/fish/cod", "tex_size": [32, 32], "xp": [1, 3], "spawn": "in_water", "parts": COD},
-	"salmon": {"hp": 3, "speed": 1.0, "w": 0.7, "h": 0.4, "kind": "passive", "swims": true, "fish": true, "tex": "entity/fish/salmon", "tex_size": [32, 32], "xp": [1, 3], "spawn": "in_water", "parts": SALMON},
-	"tropical_fish": {"hp": 3, "speed": 1.0, "w": 0.5, "h": 0.4, "kind": "passive", "swims": true, "fish": true, "tex": "entity/fish/tropical_a", "tex_size": [32, 32], "xp": [1, 3], "spawn": "in_water", "parts": COD},
-	"pufferfish": {"hp": 3, "speed": 1.0, "w": 0.7, "h": 0.7, "kind": "passive", "swims": true, "fish": true, "poisons": true, "tex": "entity/fish/pufferfish", "tex_size": [32, 32], "xp": [1, 3], "spawn": "in_water", "parts": COD},
-	"dolphin": {"hp": 10, "speed": 1.2, "w": 0.9, "h": 0.6, "kind": "passive", "swims": true, "tex": "entity/dolphin/dolphin", "tex_size": [64, 64], "xp": [1, 3], "spawn": "in_water", "parts": DOLPHIN},
+	# wiki (Attribute / Hitbox): squids and fish movement speed 0.7 (the squid AI does not read it), baby squids
+	# 0.5 x 0.5, pufferfish hitbox 0.35 unpuffed (0.49 half / 0.7 fully puffed), baby dolphin 0.585 x 0.39
+	"squid": {"hp": 10, "speed": 0.7, "w": 0.8, "h": 0.8, "baby_w": 0.5, "baby_h": 0.5, "kind": "passive", "swims": true, "fish": true, "tex": "entity/squid/squid", "tex_size": [64, 32], "xp": [1, 3], "spawn": "in_water", "parts": SQUID},
+	"glow_squid": {"hp": 10, "speed": 0.7, "w": 0.8, "h": 0.8, "baby_w": 0.5, "baby_h": 0.5, "kind": "passive", "swims": true, "fish": true, "tex": "entity/squid/glow_squid", "tex_size": [64, 32], "xp": [1, 3], "spawn": "in_water", "parts": SQUID},
+	"cod": {"hp": 3, "speed": 0.7, "w": 0.5, "h": 0.3, "kind": "passive", "swims": true, "fish": true, "tex": "entity/fish/cod", "tex_size": [32, 32], "xp": [1, 3], "spawn": "in_water", "parts": COD},
+	"salmon": {"hp": 3, "speed": 0.7, "w": 0.7, "h": 0.4, "kind": "passive", "swims": true, "fish": true, "tex": "entity/fish/salmon", "tex_size": [32, 32], "xp": [1, 3], "spawn": "in_water", "parts": SALMON},
+	"tropical_fish": {"hp": 3, "speed": 0.7, "w": 0.5, "h": 0.4, "kind": "passive", "swims": true, "fish": true, "tex": "entity/fish/tropical_a", "tex_size": [32, 32], "xp": [1, 3], "spawn": "in_water", "parts": COD},
+	"pufferfish": {"hp": 3, "speed": 0.7, "w": 0.35, "h": 0.35, "kind": "passive", "swims": true, "fish": true, "poisons": true, "tex": "entity/fish/pufferfish", "tex_size": [32, 32], "xp": [1, 3], "spawn": "in_water", "parts": COD},
+	"dolphin": {"hp": 10, "speed": 1.2, "w": 0.9, "h": 0.6, "baby_w": 0.585, "baby_h": 0.39, "kind": "passive", "swims": true, "tex": "entity/dolphin/dolphin", "tex_size": [64, 64], "xp": [1, 3], "spawn": "in_water", "parts": DOLPHIN},
 	"guardian": {"hp": 30, "speed": 0.5, "w": 0.85, "h": 0.85, "kind": "hostile", "swims": true, "laser": true, "attack": 6.0, "tex": "entity/guardian/guardian", "tex_size": [64, 64], "xp": [10, 10], "spawn": "in_water", "parts": GUARDIAN},
-	"elder_guardian": {"hp": 80, "speed": 0.3, "w": 2.0, "h": 2.0, "kind": "hostile", "swims": true, "laser": true, "attack": 8.0, "tex": "entity/guardian/guardian_elder", "tex_size": [64, 64], "xp": [10, 10], "scale": 2.35, "spawn": "in_water", "parts": GUARDIAN},
-	"nautilus": {"hp": 15, "speed": 1.0, "w": 0.875, "h": 0.95, "kind": "passive", "swims": true, "tex": "entity/nautilus/nautilus", "tex_size": [128, 128], "xp": [1, 3], "spawn": "in_water", "parts": DOLPHIN},
-	"zombie_nautilus": {"hp": 15, "speed": 1.0, "w": 0.875, "h": 0.95, "kind": "hostile", "swims": true, "attack": 4.0, "tex": "entity/nautilus/zombie_nautilus", "tex_size": [128, 128], "xp": [5, 5], "spawn": "in_water", "parts": DOLPHIN},
-	"bat": {"hp": 6, "speed": 0.1, "w": 0.5, "h": 0.9, "kind": "passive", "flies": true, "small_flyer": true, "tex": "entity/bat/bat", "tex_size": [32, 32], "xp": [0, 0], "parts": BAT},
-	"parrot": {"hp": 6, "speed": 0.2, "w": 0.5, "h": 0.9, "kind": "passive", "flies": true, "small_flyer": true, "tex": "entity/parrot/parrot_red_blue", "tex_size": [32, 32], "food": ["wheat_seeds", "melon_seeds", "pumpkin_seeds", "beetroot_seeds"], "xp": [1, 3], "parts": PARROT},
-	"allay": {"hp": 20, "speed": 0.1, "w": 0.35, "h": 0.6, "kind": "passive", "flies": true, "small_flyer": true, "tex": "entity/allay/allay", "tex_size": [32, 32], "xp": [0, 0], "parts": ALLAY},
-	"phantom": {"hp": 20, "speed": 0.5, "w": 0.9, "h": 0.5, "kind": "hostile", "flies": true, "small_flyer": true, "swoops": true, "burns": true, "attack": 6.0, "tex": "entity/phantom/phantom", "tex_size": [64, 64], "xp": [5, 5], "parts": PHANTOM},
+	"elder_guardian": {"hp": 80, "speed": 0.3, "w": 1.9975, "h": 1.9975, "kind": "hostile", "swims": true, "laser": true, "attack": 8.0, "tex": "entity/guardian/guardian_elder", "tex_size": [64, 64], "xp": [10, 10], "scale": 2.35, "spawn": "in_water", "parts": GUARDIAN},
+	# wiki (Nautilus / Zombie Nautilus / Attribute / Breeding / Experience): attack 3, knockback resistance 0.3,
+	# zombie nautilus speed 1.1, neutral, burns in daylight (#burn_in_daylight), 1 - 3 XP; nautilus breeding food:
+	# #fishes + #nautilus_bucket_food (tamed only - not enforced)
+	"nautilus": {"hp": 15, "speed": 1.0, "w": 0.875, "h": 0.95, "kind": "passive", "swims": true, "attack": 3.0, "knockback_resistance": 0.3, "tex": "entity/nautilus/nautilus", "tex_size": [128, 128],
+		"food": ["cod", "cooked_cod", "salmon", "cooked_salmon", "pufferfish", "tropical_fish", "pufferfish_bucket", "cod_bucket", "salmon_bucket", "tropical_fish_bucket"], "xp": [1, 3], "spawn": "in_water", "parts": DOLPHIN},
+	"zombie_nautilus": {"hp": 15, "speed": 1.1, "w": 0.875, "h": 0.95, "kind": "hostile", "neutral": true, "burns": true, "swims": true, "attack": 3.0, "knockback_resistance": 0.3, "tex": "entity/nautilus/zombie_nautilus", "tex_size": [128, 128], "xp": [1, 3], "spawn": "in_water", "parts": DOLPHIN},
+	# wiki (Attribute / Parrot): bat movement speed 0.7 (Bat AI does not read it); parrots cannot breed - tamed with
+	# #parrot_food (1/10 chance per item on the wiki), flying speed 0.4; allay flying speed 0.1; phantom speed 0.7
+	"bat": {"hp": 6, "speed": 0.7, "w": 0.5, "h": 0.9, "kind": "passive", "flies": true, "small_flyer": true, "tex": "entity/bat/bat", "tex_size": [32, 32], "xp": [0, 0], "parts": BAT},
+	"parrot": {"hp": 6, "speed": 0.2, "fly_speed": 0.4, "w": 0.5, "h": 0.9, "kind": "passive", "flies": true, "small_flyer": true, "tex": "entity/parrot/parrot_red_blue", "tex_size": [32, 32],
+		"tame_food": ["wheat_seeds", "melon_seeds", "pumpkin_seeds", "beetroot_seeds", "torchflower_seeds", "pitcher_pod"], "xp": [1, 3], "parts": PARROT},
+	"allay": {"hp": 20, "speed": 0.1, "fly_speed": 0.1, "regen_every": 10, "w": 0.35, "h": 0.6, "kind": "passive", "flies": true, "small_flyer": true, "tex": "entity/allay/allay", "tex_size": [32, 32], "xp": [0, 0], "parts": ALLAY},
+	# wiki Phantom infobox: attack 2 (Easy / Normal) / 3 (Hard) - "reduced from 6 to 2" in 1.14-pre3 (the Attribute page
+	# still lists 6 + size)
+	"phantom": {"hp": 20, "speed": 0.7, "w": 0.9, "h": 0.5, "kind": "hostile", "flies": true, "small_flyer": true, "swoops": true, "burns": true, "attack": 2.0, "tex": "entity/phantom/phantom", "tex_size": [64, 64], "xp": [5, 5], "parts": PHANTOM},
 	"bogged": {"hp": 16, "speed": 0.25, "w": 0.6, "h": 1.99, "kind": "hostile", "ranged": true, "burns": true, "tex": "entity/skeleton/bogged", "tex_size": [64, 32], "attack": 2.0, "xp": [5, 5], "rig": "skeleton"},
 	"parched": {"hp": 16, "speed": 0.25, "w": 0.6, "h": 1.99, "kind": "hostile", "ranged": true, "tex": "entity/skeleton/parched", "tex_size": [64, 32], "attack": 2.0, "xp": [5, 5], "rig": "skeleton"},
-	"breeze": {"hp": 30, "speed": 0.63, "w": 0.6, "h": 1.77, "kind": "hostile", "wind_charge": true, "tex": "entity/breeze/breeze", "tex_size": [32, 32], "xp": [10, 10], "parts": ALLAY, "scale": 2.0},
-	"creaking": {"hp": 1, "speed": 0.4, "w": 0.9, "h": 2.7, "kind": "hostile", "attack": 3.0, "tex": "entity/creaking/creaking", "tex_size": [64, 64], "xp": [0, 0], "parts": CREAKING},
-	"warden": {"hp": 500, "speed": 0.3, "w": 0.9, "h": 2.9, "kind": "hostile", "attack": 30.0, "tex": "entity/warden/warden", "tex_size": [128, 128], "xp": [5, 5], "parts": IRON_GOLEM},
-	"copper_golem": {"hp": 12, "speed": 0.2, "w": 0.49, "h": 0.98, "kind": "passive", "golem": true, "tex": "entity/copper_golem/copper_golem", "tex_size": [64, 64], "xp": [0, 0], "parts": VEX, "scale": 1.6},
-	"happy_ghast": {"hp": 20, "speed": 0.05, "w": 4.0, "h": 4.0, "kind": "passive", "flies": true, "rideable": true, "tex": "entity/ghast/happy_ghast", "tex_size": [64, 64], "scale": 4.5, "xp": [0, 0], "rig": "ghast"},
-	"sulfur_cube": {"hp": 16, "speed": 0.2, "w": 2.08, "h": 2.08, "kind": "hostile", "hops": true, "splits": true, "size": 4, "tex": "entity/sulfur_cube/sulfur_cube_outer", "tex_size": [64, 32], "attack": 4.0, "xp": [4, 4], "rig": "slime"},
+	# wiki (Attribute / Warden / Fire / Experience / Hitbox): follow range breeze 24, creaking 32, warden 24; creaking
+	# step height 1.0625, copper golem 1; warden knockback resistance 1, attack knockback 1.5, immune to fire; happy
+	# ghast flying speed 0.05, 1 - 3 XP, ghastling 0.95 x 0.95; wither armor 4, follow range 40, flying speed 0.6
+	"breeze": {"hp": 30, "speed": 0.63, "follow_range": 24.0, "w": 0.6, "h": 1.77, "kind": "hostile", "wind_charge": true, "tex": "entity/breeze/breeze", "tex_size": [32, 32], "xp": [10, 10], "parts": ALLAY, "scale": 2.0},
+	"creaking": {"hp": 1, "speed": 0.4, "follow_range": 32.0, "step_height": 1.0625, "w": 0.9, "h": 2.7, "kind": "hostile", "attack": 3.0, "tex": "entity/creaking/creaking", "tex_size": [64, 64], "xp": [0, 0], "parts": CREAKING},
+	"warden": {"hp": 500, "speed": 0.3, "follow_range": 24.0, "w": 0.9, "h": 2.9, "kind": "hostile", "fire_immune": true, "attack": 30.0, "attack_knockback": 1.5, "knockback_resistance": 1.0, "tex": "entity/warden/warden", "tex_size": [128, 128], "xp": [5, 5], "parts": IRON_GOLEM},
+	"copper_golem": {"hp": 12, "speed": 0.2, "step_height": 1.0, "w": 0.49, "h": 0.98, "kind": "passive", "golem": true, "tex": "entity/copper_golem/copper_golem", "tex_size": [64, 64], "xp": [0, 0], "parts": VEX, "scale": 1.6},
+	"happy_ghast": {"hp": 20, "speed": 0.05, "fly_speed": 0.05, "w": 4.0, "h": 4.0, "baby_w": 0.95, "baby_h": 0.95, "kind": "passive", "flies": true, "rideable": true, "tex": "entity/ghast/happy_ghast", "tex_size": [64, 64], "scale": 4.5, "xp": [1, 3], "rig": "ghast"},
+	# wiki (Sulfur Cube / Attribute): passive; large cube (size 2) 8 HP (4 per size), hitbox 0.98 (0.49 per size),
+	# speed 0.4 (small 0.3), 1 - 2 XP (small none), no attack of its own; splits into two small cubes on death
+	"sulfur_cube": {"hp": 8, "speed": 0.4, "w": 0.98, "h": 0.98, "kind": "passive", "hops": true, "splits": true, "size": 2, "tex": "entity/sulfur_cube/sulfur_cube_outer", "tex_size": [64, 32], "xp": [1, 2], "rig": "slime"},
 	"giant": {"hp": 100, "speed": 0.5, "w": 3.6, "h": 12.0, "kind": "hostile", "attack": 50.0, "tex": "entity/zombie/zombie", "tex_size": [64, 64], "scale": 6.0, "xp": [5, 5], "rig": "humanoid"},
-	"wither": {"hp": 300, "speed": 0.6, "w": 0.9, "h": 3.5, "kind": "hostile", "flies": true, "boss": true, "fire_immune": true, "fireball": "wither_skull", "hover_y": 5.0, "tex": "entity/wither/wither", "tex_size": [64, 64], "scale": 2.0, "xp": [50, 50], "parts": WITHER},
+	"wither": {"hp": 300, "speed": 0.6, "fly_speed": 0.6, "follow_range": 40.0, "armor_points": 4, "w": 0.9, "h": 3.5, "kind": "hostile", "flies": true, "boss": true, "fire_immune": true, "fireball": "wither_skull", "hover_y": 5.0, "tex": "entity/wither/wither", "tex_size": [64, 64], "scale": 2.0, "xp": [50, 50], "parts": WITHER},
 }

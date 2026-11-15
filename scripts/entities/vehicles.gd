@@ -1,12 +1,12 @@
 ## Vehicles — boats (Java Boat: status IN_WATER/UNDER_WATER/ON_LAND/IN_AIR, floatBoat buoyancy
-## (waterLevel - y)/height * 0.06153846 then *0.75, invFriction 0.9 water / land friction (halved when a player
-## steers) / 0.45 under water, controlBoat: left/right +-1 deg/tick rotation, forward +0.04, back -0.005, turning
+## (waterLevel - y)/height * 0.06153846 then *0.75, invFriction 0.9 water / the block's friction on land / 0.45 under
+## water, controlBoat: left/right +-1 deg/tick rotation, forward +0.04, back -0.005, turning
 ## in place +0.005) and minecarts (Java AbstractMinecart.moveAlongTrack: velocity projected onto the rail's exit
 ## segment, position snapped to that segment, slope accel 0.0078125, powered rail boost 0.06 / brake x0.5,
 ## friction 0.997 ridden / 0.96 empty, max 0.4 blocks/tick; a rider pushes a slow cart with W).
 ## Models: Java BoatModel / MinecartModel part layouts on the installed entity/boat/<wood>.png and
-## entity/minecart/minecart.png textures. APPROXIMATE: no paddle animation, no chest/hopper/TNT/furnace carts,
-## boats do not carry mobs, no boat-on-boat collisions, single rider.
+## entity/minecart/minecart.png textures. Boats carry two riders (mobs get in when no player drives; _boat_passengers)
+## and take leads (Leads). APPROXIMATE: no paddle animation, no boat-on-boat collisions.
 class_name Vehicles
 extends RefCounted
 
@@ -134,27 +134,58 @@ static func _is_rail(st: int) -> bool:
 
 
 static func hit(em, e, p: Player) -> void:
-	e.hp -= 1.0
+	# the player's attack damage (as EntityManager.player_attack: held item damage scaled by the attack strength)
+	var held := p.inventory.held()
+	var f := p.attack_strength(0.5)
+	var dmg: float = 1.0 if held.is_empty() else float(Res.items.attack_damage[held.item])
+	damage(em, e, dmg * (0.2 + f * f * 0.8), p)
+
+
+## wiki: Boat / Minecart - every 1 HP of damage adds 10 to a damage total that falls by 1 each tick (tick_boat /
+## tick_cart); above 40 the vehicle breaks and drops itself (more than 4 HP breaks it in one hit); creative players break
+## it in one attack without a drop. wiki: Minecart with TNT - explosions set it off after 0 - 1.95 s; broken while not
+## moving it drops as an item instead of exploding. p: the attacking player, null for an explosion.
+static func damage(em, e, amount: float, p) -> void:
+	if p == null and e.id == "tnt_minecart":
+		if int(e.data.get("fuse", -1)) < 0:
+			e.data["fuse"] = em.rng.randi_range(0, 39)
+			Audio.play("entity.tnt.primed", e.pos, "Blocks")
+		return
+	var creative: bool = p != null and p.is_creative()
+	e.data["dmg"] = float(e.data.get("dmg", 0.0)) + amount * 10.0
 	e.hurt_time = 10
 	Audio.play("entity.boat.paddle_water" if e.kind == "boat" else "entity.minecart.riding", e.pos, "Neutral", 0.4)
-	if e.hp <= 0.0 or p.is_creative():
-		if p.vehicle == e:
-			Taming.dismount(em, p)
-		if not p.is_creative() and em.world.gamerule("doEntityDrops", true):
-			em.spawn_item(e.pos + Vector3(0, 0.3, 0), ItemStack.named(e.id, 1))
-		for it in e.data.get("items", []):
-			var s := ItemStack.from_dict(it)
-			if not s.is_empty():
-				em.spawn_item(e.pos + Vector3(0, 0.3, 0), s)
-		if e.id == "tnt_minecart" and not p.is_creative():
-			em.explode(e.pos + Vector3(0, 0.3, 0), 4.0, em.world.gamerule("tntExplodes", true))
-		em._remove(e)
+	if float(e.data["dmg"]) <= 40.0 and not creative:
+		return
+	var rider: Player = em.world.player
+	if rider.vehicle == e:
+		Taming.dismount(em, rider)
+	var moving := Vector2(e.vel.x, e.vel.z).length() > 0.001
+	if e.id == "tnt_minecart" and not creative and moving:
+		# wiki Minecart with TNT: destroyed while moving (not by a Creative player) it goes off after a random 0 - 1.95 s
+		if int(e.data.get("fuse", -1)) < 0:
+			e.data["fuse"] = em.rng.randi_range(0, 19) + em.rng.randi_range(0, 19)
+			Audio.play("entity.tnt.primed", e.pos, "Blocks")
+		return
+	if e.data.get("leash") != null:
+		Leads._drop(em, e)
+	for m in _passengers(e):
+		_unseat(m)   # (wiki Boat: mobs leave when the boat is destroyed)
+	if not creative and em.world.gamerule("doEntityDrops", true):
+		em.spawn_item(e.pos + Vector3(0, 0.3, 0), ItemStack.named(e.id, 1))
+	for it in e.data.get("items", []):
+		var s := ItemStack.from_dict(it)
+		if not s.is_empty():
+			em.spawn_item(e.pos + Vector3(0, 0.3, 0), s)
+	em._remove(e)
 
 
 ## Right-click a vehicle. Chest boats: sneak opens the chest (Java); container carts open their inventory; furnace
 ## carts take coal/charcoal (3600 ticks of fuel each) and push away from the player; TNT carts prime with flint.
 static func interact(em, e, p: Player, held: ItemStack) -> void:
 	var nm := "" if held.is_empty() else held.name()
+	if e.kind == "boat" and (nm == "lead" or e.data.get("leash") != null) and Leads.interact(em, e, p, held):
+		return   # wiki Boat: leads attach to boats
 	var n := container_size(e)
 	if n > 0 and (e.kind == "minecart" or p.sneaking):
 		var cs = load("res://scripts/ui/container_screen.gd").new()
@@ -164,7 +195,7 @@ static func interact(em, e, p: Player, held: ItemStack) -> void:
 		return
 	if e.id == "furnace_minecart":
 		if nm == "coal" or nm == "charcoal":
-			e.data["fuel"] = mini(32000, int(e.data.get("fuel", 0)) + 3600)
+			e.data["fuel"] = mini(32767, int(e.data.get("fuel", 0)) + 3600)   # wiki: Minecart with Furnace - 3600 per coal, at most 32767
 			if not p.is_creative():
 				p.inventory.consume_held()
 		var dv: Vector3 = e.pos - p.pos
@@ -176,6 +207,8 @@ static func interact(em, e, p: Player, held: ItemStack) -> void:
 		return
 	if e.kind == "minecart" and e.id != "minecart":
 		return
+	if e.kind == "boat" and _passengers(e).size() >= (1 if e.id.contains("chest") else 2):
+		return   # (wiki Boat: a full boat takes no one else)
 	if p.vehicle == null and not p.sneaking:
 		Taming.mount(em, e, p)
 
@@ -219,9 +252,10 @@ static func cart_extras(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 				if fuse <= 0:
 					em._remove(e)
 					var sp := Vector2(e.vel.x, e.vel.z).length()
-					em.explode(e.pos + Vector3(0, 0.3, 0), 4.0 + em.rng.randf() * 1.5 * minf(5.0, sp), em.world.gamerule("tntExplodes", true))
+					# wiki: Minecart with TNT - power 4 plus a random speed bonus of at most 7.5; TNT drops are not decayed
+					em.explode(e.pos + Vector3(0, 0.3, 0), 4.0 + em.rng.randf() * 1.5 * minf(5.0, sp), em.world.gamerule("tntExplodes", true), false, em.world.gamerule("tntExplosionDropDecay", false))
 		"hopper_minecart":
-			if e.age % 4 != 0:
+			if e.age % 4 != 0 or e.data.get("locked", false):
 				return
 			var items: Array = e.data.get("items", [])
 			for o in em.ents:
@@ -256,6 +290,8 @@ static func tick_boat(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 	var rider: Player = p if p.vehicle == e else null
 	if e.hurt_time > 0:
 		e.hurt_time -= 1
+	if float(e.data.get("dmg", 0.0)) > 0.0:
+		e.data["dmg"] = maxf(0.0, float(e.data["dmg"]) - 1.0)   # wiki: Boat - the damage total recovers 1 per tick
 	# status (Java Boat.getStatus): water level over the boat's bottom slice
 	var lvl := -1e9
 	var under := false
@@ -291,10 +327,10 @@ static func tick_boat(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 		"air":
 			inv = 0.9
 		"land":
+			# wiki: Boat - top speeds land 2.0, ice 40, blue ice 72.72 blocks/s with forward 16 blocks/s^2: the block's own
+			# friction (0.6 / 0.98 / 0.989), not halved for a rider (that made land speed 1.14 blocks/s)
 			var below: int = gs.call(int(floor(e.pos.x)), int(floor(e.pos.y - 0.1)), int(floor(e.pos.z)))
 			inv = float(blocks.block_info[blocks.st_block[maxi(below, 0)]]["friction"]) if below > 0 else 0.6
-			if rider != null:
-				inv /= 2.0
 	e.vel = Vector3(e.vel.x * inv, e.vel.y + grav, e.vel.z * inv)
 	e.charge = int(float(e.charge) * inv)   # deltaRotation (stored x1000)
 	if buoy > 0.0:
@@ -323,6 +359,70 @@ static func tick_boat(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 	_move(em, e, gs, blocks)
 	if rider != null:
 		seat(e, rider)
+	if not e.dead:
+		_boat_passengers(em, e, rider, status)
+
+
+## wiki Boat: two riders, mobs included (a chest boat: one); a mob touching a boat that no player drives gets in if it
+## is narrower than the boat and not an aquatic / ambient mob; mobs stay until the boat breaks or sinks. Seats (Java
+## Boat.positionRider): alone in the middle, two riders at 0.2 forward / 0.6 back - the player takes the front seat.
+const NO_BOAT := ["bat", "cod", "salmon", "pufferfish", "tropical_fish", "dolphin", "squid", "glow_squid", "axolotl", "tadpole",
+	"guardian", "elder_guardian", "nautilus", "zombie_nautilus", "creaking", "ender_dragon", "wither", "warden", "iron_golem",
+	"spider", "ghast", "happy_ghast", "ravager", "horse", "donkey", "mule", "skeleton_horse", "zombie_horse", "camel",
+	"camel_husk", "llama", "trader_llama", "sniffer", "strider", "allay", "vex", "bee", "parrot", "phantom", "breeze", "blaze"]
+
+
+static func _passengers(e) -> Array:
+	var out: Array = []
+	for m in e.rt.get("pass", []):
+		if m != null and is_instance_valid(m) and not m.dead and m.rt.get("riding") == e:
+			out.append(m)
+	return out
+
+
+static func _unseat(m) -> void:
+	m.rt.erase("riding")
+	m.vel = Vector3.ZERO
+
+
+static func _boat_passengers(em, e, rider: Player, status: String) -> void:
+	var riders := _passengers(e)
+	var cap := 1 if e.id.contains("chest") else 2
+	if status == "under":
+		for m0 in riders:
+			_unseat(m0)   # (sinking: everyone floats off)
+		riders.clear()
+	elif rider == null and riders.size() + (1 if rider != null else 0) < cap and e.age % 2 == 0:
+		var mn := Vector3(e.pos.x - e.w / 2 - 0.2, e.pos.y + 0.01, e.pos.z - e.w / 2 - 0.2)
+		var mx := Vector3(e.pos.x + e.w / 2 + 0.2, e.pos.y + e.h - 0.01, e.pos.z + e.w / 2 + 0.2)
+		for o in em.ents:
+			if riders.size() >= cap:
+				break
+			if o.kind != "mob" or o.dead or o.death_time > 0 or o.rt.has("riding") or o == em.world.player.vehicle or o.w >= e.w:
+				continue
+			if o.id in NO_BOAT and o.baby_age >= 0:
+				continue
+			if o.pos.x + o.w / 2 < mn.x or o.pos.x - o.w / 2 > mx.x or o.pos.z + o.w / 2 < mn.z or o.pos.z - o.w / 2 > mx.z or o.pos.y + o.h < mn.y or o.pos.y > mx.y:
+				continue
+			o.rt["riding"] = e
+			riders.append(o)
+	e.rt["pass"] = riders
+	var n := riders.size() + (1 if rider != null else 0)
+	var yr := deg_to_rad(e.yaw)
+	var fwd := Vector3(-sin(yr), 0, cos(yr))
+	for i in riders.size():
+		var m = riders[i]
+		var off := 0.0
+		if n > 1:
+			off = -0.6 if (rider != null or i == 1) else 0.2
+		m.prev = m.pos
+		m.pos = e.pos + fwd * off + Vector3(0, -0.2, 0)
+		m.vel = Vector3.ZERO
+		m.fall = 0.0
+		m.body_yaw = e.yaw
+	if rider != null and n > 1:
+		rider.pos += fwd * 0.2
+		rider.prev_pos = rider.pos
 
 
 static func _fluid_h(gs: Callable, blocks: BlockRegistry, x: int, y: int, z: int, st: int) -> float:
@@ -358,6 +458,8 @@ static func tick_cart(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 	var rider: Player = p if p.vehicle == e else null
 	if e.hurt_time > 0:
 		e.hurt_time -= 1
+	if float(e.data.get("dmg", 0.0)) > 0.0:
+		e.data["dmg"] = maxf(0.0, float(e.data["dmg"]) - 1.0)   # wiki: Minecart - the damage total falls by 1 each tick
 	var bx := int(floor(e.pos.x))
 	var bz := int(floor(e.pos.z))
 	var by := int(floor(e.pos.y))
@@ -368,7 +470,21 @@ static func tick_cart(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 	if not _is_rail(st):
 		# off the rails: gravity + ground drag (Java comeOffTrack, max 0.4)
 		e.vel.y -= 0.04
+		var y_before: float = e.pos.y
 		_move(em, e, gs, blocks)
+		if e.dead:
+			return
+		if not e.on_ground and e.pos.y < y_before:
+			e.fall += y_before - e.pos.y
+		elif e.on_ground:
+			# wiki Minecart with TNT: hitting the ground after falling more than 3 blocks (not onto a rail) explodes it at
+			# once, the power bonus from the fall distance / 10 (random x 1.5 x min(5, ...); Java MinecartTNT.explode)
+			if e.id == "tnt_minecart" and e.fall > 3.0:
+				var fb := minf(5.0, e.fall / 10.0)
+				em._remove(e)
+				em.explode(e.pos + Vector3(0, 0.3, 0), 4.0 + em.rng.randf() * 1.5 * fb, em.world.gamerule("tntExplodes", true), false, em.world.gamerule("tntExplosionDropDecay", false))
+				return
+			e.fall = 0.0
 		if e.on_ground:
 			e.vel.x *= 0.5
 			e.vel.z *= 0.5
@@ -377,6 +493,7 @@ static func tick_cart(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 		if rider != null:
 			seat(e, rider)
 		return
+	e.fall = 0.0   # (landing on a rail never sets a TNT cart off)
 	var shape := str(blocks.get_prop(st, "shape")) if blocks.has_prop(st, "shape") else "north_south"
 	var ex: Array = EXITS.get(shape, EXITS["north_south"])
 	var a: Vector3i = ex[0]
@@ -384,6 +501,15 @@ static func tick_cart(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 	var nm := blocks.name_of(st)
 	var powered := nm == "powered_rail" and blocks.has_prop(st, "powered") and str(blocks.get_prop(st, "powered")) == "true"
 	var brake := nm == "powered_rail" and not powered
+	if nm == "detector_rail" and str(blocks.get_prop(st, "powered")) != "true":
+		Sensors.detector_check(em.world, Vector3i(bx, by, bz), st)   # wiki Detector Rail: a cart on it powers it
+	var act_on := nm == "activator_rail" and str(blocks.get_prop(st, "powered")) == "true"
+	# wiki Activator Rail: an active rail ejects riders and disables hopper minecarts (an inactive one re-enables them)
+	if act_on and rider != null:
+		Taming.dismount(em, rider)
+		rider = null
+	if e.id == "hopper_minecart" and nm == "activator_rail":
+		e.data["locked"] = act_on
 	# slope acceleration (downhill = toward the low exit)
 	if a.y == 1:
 		e.vel += Vector3(b.x - a.x, 0, b.z - a.z).normalized() * 0.0078125

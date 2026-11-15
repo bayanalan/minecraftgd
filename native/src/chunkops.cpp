@@ -3,7 +3,7 @@
 //     -> [sections: Array[24] of [pal, idx, wide], heightmap, gen_surface, gen_top, gen_floor]
 //        (VanillaGenerator.generate tail: WORLD_SURFACE_WG scan, pristine surface/floor, Chunk.fill_from_column,
 //         Chunk.recompute_heightmap)
-//   chunk_decorate(secs, writes: Array[PackedInt32Array] (sorted origins), x0, z0, flags, opacity, consts, biomes, temps)
+//   chunk_decorate(secs, writes: Array[PackedInt32Array] (sorted origins), x0, z0, flags, opacity, consts, biomes, temps, st_block, leaf_info, ore_mask)
 //     -> [sections, heightmap]   (Features.apply write modes + Features._freeze)
 //     consts: [F_REPLACEABLE, F_LEAVES, F_FULL_SHAPE, WATER, ICE, SNOW, ice block id, packed_ice block id, sea level]
 //   st_block passed for the ice name test.
@@ -185,12 +185,21 @@ bool fn_chunk_decorate(const Args &a, void *ret) {
 	expand(secs, col.data());
 	auto FL = [&](int st) { return (st >= 0 && st < nfl) ? fl[st] : 0; };
 	// Features.apply: write lists of the 3x3 origins in (cz, cx) order; modes 0 force, 1 replaceable, 2 air
+	// (3 = ore: W_ORE | rule << 2, tested against arg 11, the per-state ore rule bits of Features.ore_mask)
+	const void *omv = a.count > 11 ? a.obj(11, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY) : nullptr;
+	int64_t nom = omv ? size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, omv) : 0;
+	const int32_t *om = nom > 0 ? i32(omv) : nullptr;
 	int64_t nw = size_of(GDEXTENSION_VARIANT_TYPE_ARRAY, wl);
 	// cross-origin carving next to another origin's liquid is skipped (consts[9] = F_LIQUID, [10] = cave air): every
 	// origin's features ran on pristine terrain, so a lake carving air beside a neighbour's pool (Java: the lake sees the
 	// water and aborts, or the pool sees the air and is not placed) would leave the pool open on one side
 	int F_LIQ = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, cv) >= 11 ? k[9] : 0;
 	int CAVE_AIR = F_LIQ ? k[10] : -1;
+	// consts[11] = n, then n (snowy=false, snowy=true) state pairs: SnowAndFreezeFeature sets SNOWY on the block under new snow
+	int64_t nkc = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, cv);
+	int NSNOWY = nkc >= 12 ? k[11] : 0;
+	if (12 + 2 * (int64_t)NSNOWY > nkc) NSNOWY = 0;
+	const int32_t *snowy_pairs = k + 12;
 	// liquid writes over the chunk + 1-block border: 18 x 18 x HEIGHT cells, value = origin list index + 1 (255 = several;
 	// 0 = none). A thread-local flat array (a hash map here tripled the decorate time)
 	static thread_local std::vector<uint8_t> tl_liq;
@@ -248,10 +257,90 @@ bool fn_chunk_decorate(const Args &a, void *ret) {
 			int i = ((y - MIN_Y) << 8) | ((z & 15) << 4) | (x & 15);
 			if (mode != 0) {
 				int cur = col[i];
+				if ((mode & 3) == 3) {
+					// ore write (Features.W_ORE | rule << 2): only while the cell still passes the ore's target rule test
+					if (nom > 0 && (cur <= 0 || cur >= nom || !((om[cur] >> (mode >> 2)) & 1))) continue;
+					col[i] = st;
+					continue;
+				}
 				if (mode == 2 && cur != 0 && !(FL(cur) & F_REPL)) continue;
 				if (mode == 1 && cur != 0 && !(FL(cur) & (F_REPL | F_LEAVES))) continue;
 			}
 			col[i] = st;
+		}
+	}
+	// Java TreeFeature.updateLeaves: leaf distances by a breadth-first walk from logs through leaves (6 steps at most;
+	// unreached leaves keep their state). Arg 10 (optional): per state 0 other, -1 log (#logs), leaves (stride << 4 |
+	// current distance 1..7). The walk covers the chunk plus a 6-block margin; outside the chunk the logs / leaves come
+	// from the 3x3 origins' write lists (trees reaching in from neighbours).
+	const void *lfv = a.count > 10 ? a.obj(10, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY) : nullptr;
+	int64_t nlf = lfv ? size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, lfv) : 0;
+	if (nlf > 0) {
+		const int32_t *lf = i32(lfv);
+		auto LF = [&](int st) -> int32_t { return (st > 0 && st < nlf) ? lf[st] : 0; };
+		static const int M = 6, GW = 16 + 2 * M, GA = GW * GW;
+		static thread_local std::vector<uint8_t> tl_cls, tl_dist;
+		static thread_local std::vector<int32_t> tl_q;
+		bool any_leaf = false;
+		for (int i = 0; i < 98304 && !any_leaf; i++) if (LF(col[i]) > 0) any_leaf = true;
+		if (any_leaf) {
+			if (tl_cls.size() != (size_t)GA * HEIGHT) { tl_cls.assign((size_t)GA * HEIGHT, 0); tl_dist.assign((size_t)GA * HEIGHT, 7); }
+			else { std::memset(tl_cls.data(), 0, tl_cls.size()); std::memset(tl_dist.data(), 7, tl_dist.size()); }
+			uint8_t *cls = tl_cls.data();
+			uint8_t *dist = tl_dist.data();
+			auto gi = [&](int x, int y, int z) -> int {
+				int gx = x - (x0 - M), gz = z - (z0 - M), gy = y - MIN_Y;
+				if (gx < 0 || gx >= GW || gz < 0 || gz >= GW || gy < 0 || gy >= HEIGHT) return -1;
+				return gy * GA + gz * GW + gx;
+			};
+			// margin from the write lists (in application order), then the finished chunk itself
+			for (int64_t li = 0; li < nw; li++) {
+				const void *wa = internal(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY)((GDExtensionVariantPtr)array_get(wl, li));
+				int64_t n = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, wa);
+				const int32_t *w = n ? i32(wa) : nullptr;
+				for (int64_t q = 0; q + 4 < n; q += 5) {
+					int x = w[q], z = w[q + 2];
+					if (x >= x0 && x < x0 + 16 && z >= z0 && z < z0 + 16) continue;
+					int ci = gi(x, w[q + 1], z);
+					if (ci < 0) continue;
+					int32_t c = LF(w[q + 3]);
+					cls[ci] = c < 0 ? 1 : (c > 0 ? 2 : 0);
+				}
+			}
+			for (int y = 0; y < HEIGHT; y++)
+				for (int lz = 0; lz < 16; lz++)
+					for (int lx = 0; lx < 16; lx++) {
+						int32_t c = LF(col[(y << 8) | (lz << 4) | lx]);
+						cls[y * GA + (lz + M) * GW + lx + M] = c < 0 ? 1 : (c > 0 ? 2 : 0);
+					}
+			tl_q.clear();
+			for (int i = 0; i < GA * HEIGHT; i++)
+				if (cls[i] == 1) { dist[i] = 0; tl_q.push_back(i); }
+			for (size_t h = 0; h < tl_q.size(); h++) {
+				int c = tl_q[h];
+				int d = dist[c] + 1;
+				if (d >= 7) continue;
+				int gy = c / GA, rem = c % GA, gz = rem / GW, gx = rem % GW;
+				const int nb[6] = {gx > 0 ? c - 1 : -1, gx < GW - 1 ? c + 1 : -1, gz > 0 ? c - GW : -1, gz < GW - 1 ? c + GW : -1,
+					gy > 0 ? c - GA : -1, gy < HEIGHT - 1 ? c + GA : -1};
+				for (int k2 = 0; k2 < 6; k2++) {
+					int n2 = nb[k2];
+					if (n2 < 0 || cls[n2] != 2 || dist[n2] <= d) continue;
+					dist[n2] = (uint8_t)d;
+					tl_q.push_back(n2);
+				}
+			}
+			for (int y = 0; y < HEIGHT; y++)
+				for (int lz = 0; lz < 16; lz++)
+					for (int lx = 0; lx < 16; lx++) {
+						int i = (y << 8) | (lz << 4) | lx;
+						int32_t c = LF(col[i]);
+						if (c <= 0) continue;
+						int d = dist[y * GA + (lz + M) * GW + lx + M];
+						if (d >= 7) continue;
+						int cur = c & 15, stride = c >> 4;
+						col[i] += (d - cur) * stride;
+					}
 		}
 	}
 	// Features._freeze on the chunk-local heightmap
@@ -275,7 +364,11 @@ bool fn_chunk_decorate(const Args &a, void *ret) {
 				int above = (y >= MIN_Y && y < MIN_Y + HEIGHT) ? col[((y - MIN_Y) << 8) | (lz << 4) | lx] : 0;
 				if (above == 0 && (FL(top) & (F_FULL | F_LEAVES))) {
 					int tb = top < nstb ? stb[top] : -1;
-					if (tb != ICE_B && tb != PICE_B && y >= MIN_Y && y < MIN_Y + HEIGHT) col[((y - MIN_Y) << 8) | (lz << 4) | lx] = SNOW;
+					if (tb != ICE_B && tb != PICE_B && y >= MIN_Y && y < MIN_Y + HEIGHT) {
+						col[((y - MIN_Y) << 8) | (lz << 4) | lx] = SNOW;
+						for (int q = 0; q < NSNOWY; q++)
+							if (snowy_pairs[q * 2] == top) { col[((y - 1 - MIN_Y) << 8) | (lz << 4) | lx] = snowy_pairs[q * 2 + 1]; break; }
+					}
 				}
 			}
 		}
@@ -946,9 +1039,101 @@ bool fn_merge_surfaces(const Args &a, void *ret) {
 	return true;
 }
 
+// Java worldgen fluid ticks (NoiseBasedChunkGenerator / carvers markPosForPostprocessing where the aquifer status
+// changes, SpringFeature.scheduleTick): generated fluid that can flow on its first tick. fluid_exposed(nine: Array[9]
+// (Chunk.sec_refs of the 3x3 chunks around, null = missing), kinds: PackedByteArray per state (1 air, 2 water /
+// waterlogged, 3 lava), cx, cz) -> [PackedInt32Array local positions x | z << 4 | (y + 64) << 8 of the centre chunk's
+// fluid cells with air below or beside, the other fluid below / beside, or (lava) water above].
+bool fn_fluid_exposed(const Args &a, void *ret) {
+	const void *nv = a.obj(0, GDEXTENSION_VARIANT_TYPE_ARRAY);
+	const void *kv = a.obj(1, GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY);
+	if (!nv || !kv || size_of(GDEXTENSION_VARIANT_TYPE_ARRAY, nv) != 9) return false;
+	int64_t nk = size_of(GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY, kv);
+	const uint8_t *kinds = nk ? bytes(kv) : nullptr;
+	int64_t ccx = a.i(2), ccz = a.i(3);
+	struct Sec { bool init = false; const int32_t *pal = nullptr; int64_t np = 0; const uint8_t *idx = nullptr; const int32_t *wide = nullptr; };
+	static thread_local Sec secs[9][24];
+	const void *carr[9];
+	for (int k = 0; k < 9; k++) {
+		const void *e = array_get(nv, k);
+		carr[k] = (e && variant_get_type((GDExtensionConstVariantPtr)e) == GDEXTENSION_VARIANT_TYPE_ARRAY) ? internal(GDEXTENSION_VARIANT_TYPE_ARRAY)((GDExtensionVariantPtr)e) : nullptr;
+		if (carr[k] && size_of(GDEXTENSION_VARIANT_TYPE_ARRAY, carr[k]) < 72) carr[k] = nullptr;
+		for (int s = 0; s < 24; s++) secs[k][s].init = false;
+	}
+	auto get_packed = [](const void *arr, int64_t k, GDExtensionVariantType t) -> const void * {
+		const void *e = array_get(arr, k);
+		if (!e || variant_get_type((GDExtensionConstVariantPtr)e) != t) return nullptr;
+		return internal(t)((GDExtensionVariantPtr)e);
+	};
+	auto sec = [&](int k, int s) -> Sec & {
+		Sec &sc = secs[k][s];
+		if (!sc.init) {
+			sc.init = true;
+			sc.np = 0;
+			const void *pv = get_packed(carr[k], s * 3, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY);
+			const void *iv = get_packed(carr[k], s * 3 + 1, GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY);
+			const void *wv = get_packed(carr[k], s * 3 + 2, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY);
+			sc.np = pv ? size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, pv) : 0;
+			sc.pal = sc.np ? i32(pv) : nullptr;
+			sc.idx = (iv && size_of(GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY, iv) >= 4096) ? bytes(iv) : nullptr;
+			sc.wide = (wv && size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, wv) >= 4096) ? i32(wv) : nullptr;
+		}
+		return sc;
+	};
+	// kind of the block at chunk-relative (x, y, z), x / z in -1..16; 0 for missing chunks (never "exposed")
+	auto kind_at = [&](int x, int y, int z) -> int {
+		if (y < -64 || y >= 320) return y >= 320 ? 1 : 0;
+		int ci = (x >> 4) + 1, cj = (z >> 4) + 1;
+		int k = cj * 3 + ci;
+		if (!carr[k]) return 0;
+		Sec &sc = sec(k, (y + 64) >> 4);
+		int64_t st;
+		if (sc.np == 0) st = 0;
+		else if (sc.np == 1) st = sc.pal[0];
+		else {
+			int li = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+			int64_t pi = sc.wide ? sc.wide[li] : (sc.idx ? sc.idx[li] : 0);
+			st = (pi >= 0 && pi < sc.np) ? sc.pal[pi] : 0;
+		}
+		return (st >= 0 && st < nk) ? kinds[st] : 0;
+	};
+	std::vector<int32_t> out;
+	if (carr[4]) {
+		for (int s = 0; s < 24; s++) {
+			Sec &sc = sec(4, s);
+			bool any = false;
+			for (int64_t p = 0; p < sc.np && !any; p++) { int32_t st = sc.pal[p]; if (st >= 0 && st < nk && kinds[st] >= 2) any = true; }
+			if (!any) continue;
+			int y0 = -64 + s * 16;
+			for (int ly = 0; ly < 16; ly++) {
+				int y = y0 + ly;
+				for (int z = 0; z < 16; z++)
+					for (int x = 0; x < 16; x++) {
+						int kd = kind_at(x, y, z);
+						if (kd < 2) continue;
+						int other = kd == 2 ? 3 : 2;
+						bool ex = false;
+						int nb[5] = {kind_at(x, y - 1, z), kind_at(x + 1, y, z), kind_at(x - 1, y, z), kind_at(x, y, z + 1), kind_at(x, y, z - 1)};
+						for (int q = 0; q < 5 && !ex; q++) if (nb[q] == 1 || nb[q] == other) ex = true;
+						if (!ex && kd == 3 && kind_at(x, y + 1, z) == 2) ex = true;
+						if (ex) out.push_back(x | (z << 4) | ((y + 64) << 8));
+					}
+			}
+		}
+	}
+	(void)ccx; (void)ccz;
+	resize(GDEXTENSION_VARIANT_TYPE_ARRAY, ret, 1);
+	Owned o(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY);
+	resize(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, o.ptr(), (int64_t)out.size());
+	if (!out.empty()) memcpy(i32_w(o.ptr()), out.data(), out.size() * sizeof(int32_t));
+	array_set_native(ret, 0, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, o.ptr());
+	return true;
+}
+
 } // namespace
 
 void register_chunkops(const char *cls) {
+	register_method(cls, "fluid_exposed", fn_fluid_exposed, 4);
 	register_method(cls, "merge_surfaces", fn_merge_surfaces, 1);
 	register_method(cls, "leaf_search", fn_leaf_search, 6);
 	register_method(cls, "rt_sample", fn_rt_sample, 4);
@@ -961,5 +1146,5 @@ void register_chunkops(const char *cls) {
 	register_method(cls, "boxes_hit", fn_boxes_hit, 7);
 	register_method(cls, "rs_candidates", fn_rs_candidates, 10);
 	register_method(cls, "chunk_finish", fn_chunk_finish, 4);
-	register_method(cls, "chunk_decorate", fn_chunk_decorate, 10);
+	register_method(cls, "chunk_decorate", fn_chunk_decorate, 12);
 }

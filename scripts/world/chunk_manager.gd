@@ -41,6 +41,12 @@ var _fill_t0 := 0
 static var _pininfo: bool = OS.get_cmdline_user_args().has("--pininfo")
 
 
+var _fill_check_ms := 0
+const FILL_SHARE := 0.4   # main-thread dispatch / upload share of the frame while boosted (0.7 measured: no faster)
+var _boost := false       # fill / catching up: boosted workers and main-thread budgets
+var _user_jobs := false   # Chunk Builder Threads set to a fixed count (--workers=N / the video option)
+
+
 func _adapt_workers() -> void:
 	# background cluster set: wide (every cluster but the main thread's) while loading or while incomplete chunks lie
 	# 3+ rings inside the render distance (initial fill, after a teleport, falling behind); the low-class cluster once
@@ -54,8 +60,23 @@ func _adapt_workers() -> void:
 		fring = maxi(absi(fw0.x - _center.x), absi(fw0.y - _center.y))
 		inner = fring <= radius - 3
 	# the fill after a loading screen stays wide until every ring inside the render distance is complete once
-	if _fill_phase and not loading and (fring >= radius or Time.get_ticks_msec() - _fill_t0 > 30000):
-		_fill_phase = false
+	if _fill_phase and not loading:
+		# done once every chunk within the render distance is shown (the dispatch frontier also passes chunks that only
+		# wait for neighbours, so it ended the fill almost at once); checked 4x a second
+		var fm := Time.get_ticks_msec()
+		if fm - _fill_check_ms >= 250:
+			_fill_check_ms = fm
+			var all_shown := true
+			for wi in _wanted_n:
+				var ww: Vector2i = _w_at(wi)
+				if maxi(absi(ww.x - _center.x), absi(ww.y - _center.y)) > radius:
+					continue
+				var wc: Chunk = chunks.get((ww.x << 32) | (ww.y & 0xFFFFFFFF))
+				if wc == null or not wc.shown:
+					all_shown = false
+					break
+			if all_shown or fm - _fill_t0 > 30000:
+				_fill_phase = false
 	if not inner:
 		_inner_since = 0
 	elif _inner_since == 0:
@@ -66,7 +87,20 @@ func _adapt_workers() -> void:
 			print("[pin] %d ms: background clusters %s (frontier ring inner %s, loading %s)" % [Time.get_ticks_msec(), "wide" if wide else "low", str(inner), str(loading)])
 		bg_wide = wide
 		pin_epoch += 1
-	if loading or not adaptive_jobs:
+	if loading:
+		return
+	# the first fill of the render distance after a loading screen, and catching up after falling 3+ rings behind
+	# (teleport, fast travel), use the loading-screen worker count until the chunks are shown (with 5 workers the fill
+	# from ring 2 to 16 took ~12 s); steady streaming keeps the normal count (more workers cost main-thread FPS)
+	if not _user_jobs:
+		var boost := _fill_phase or (inner and Time.get_ticks_usec() - _inner_since > 400000)
+		_boost = boost
+		var bj := clampi(OS.get_processor_count() * 2 / 3, _full_jobs, 10) if boost else _full_jobs
+		if not adaptive_jobs or boost:
+			if bj != max_jobs:
+				max_jobs = bj   # surplus workers retire when they finish their current job (_worker_loop)
+			return
+	if not adaptive_jobs:
 		return
 	var near := false
 	if _frontier < _wanted_n:
@@ -84,6 +118,7 @@ func _adapt_workers() -> void:
 func set_worker_count(n: int) -> void:
 	var base := clampi(OS.get_processor_count() / 3, 2, 5) if n <= 0 else clampi(n, 1, 16)
 	_full_jobs = base
+	_user_jobs = n > 0
 	if n > 0:
 		adaptive_jobs = false
 	if loading:
@@ -179,12 +214,23 @@ var _light_update: Dictionary = {}    # key -> true (block change in a lit chunk
 ## Update jobs (relight/remesh caused by block changes in chunks already shown) share max_update_jobs worker
 ## slots (+1 while the player edits nearby) and are coalesced per chunk, so random ticks (grass spread, leaf decay,
 ## fluids) can never starve generation of missing terrain.
-var max_update_jobs := 1
+var max_update_jobs := 2
 var _upd_inflight := 0
 var _next_update: Dictionary = {}    # key -> earliest usec for the next non-urgent update job
 var _urgent_until: Dictionary = {}   # key -> usec until which updates of this chunk are urgent (player edits)
-const MESH_UPDATE_US := 300000
+const MESH_UPDATE_US := 200000    # below a water flow step (5 ticks = 250 ms): 300 ms beat against it (steps merged)
 const LIGHT_UPDATE_US := 150000   # per-chunk relight batching for frequent changes (flowing water, TNT); was 600 ms
+const MESH_UPDATE_NEAR_US := 50000    # within 2 chunks of the player: flows / pistons / farms update like Java (next frames)
+const LIGHT_UPDATE_NEAR_US := 50000
+## A relight started by an update and the remesh it needs are one update: the remesh starts when the light commits
+## (it waited for the throttle the relight had just set - 50 / 150 ms more per flow step) and keeps the relight's period.
+var _chain: Dictionary = {}          # key -> true: the update relight committed, its remesh may start now
+## BlockUpdates: block changes made by a game tick's scheduled updates that run in slices over several frames mark their
+## chunks here (hold_marks); their update work waits until the last slice ran (release_held), so the whole step of a
+## flow is remeshed and shown together.
+var hold_marks := false
+var _held: Dictionary = {}           # chunk key -> true
+var _held_us := 0
 var thread_registries: bool = not OS.get_cmdline_user_args().has("--sharedreg")   # A/B: --sharedreg = old shared registries
 var _tl_gens: Dictionary = {}         # worker thread id -> private WorldGenerator (avoids shared-refcount contention)
 var _tl_mutex := Mutex.new()
@@ -316,6 +362,8 @@ func set_block(x: int, y: int, z: int, st: int) -> int:
 	var lz := z & 15
 	var g := (y - Coords.MIN_Y) / Mesher.GH
 	var ly := (y - Coords.MIN_Y) % Mesher.GH
+	_batch_ids.clear()
+	_collecting = true
 	_mark_mesh(c, g)
 	if ly == 0 and g > 0:
 		_mark_mesh(c, g - 1)
@@ -331,6 +379,11 @@ func set_block(x: int, y: int, z: int, st: int) -> int:
 			var n := get_chunk(c.cx + dx, c.cz + dz)
 			if n != null:
 				_mark_mesh(n, g)
+	_collecting = false
+	# (a flow step - air / fluid to air / fluid - opens no batch: no solid faces appear or vanish, and the batch held
+	# flow steps on chunk / group borders until the neighbour's relight and remesh, up to EDIT_BATCH_US)
+	if _batch_ids.size() > 1 and ((blocks.st_flags[old] & (BlockRegistry.F_AIR | BlockRegistry.F_LIQUID)) == 0 or (blocks.st_flags[st] & (BlockRegistry.F_AIR | BlockRegistry.F_LIQUID)) == 0):
+		_open_edit_batch()
 	# relight: centre always; neighbours if within 15 blocks of their border
 	var light_changes := blocks.st_opacity[old] != blocks.st_opacity[st] or blocks.st_emit[old] != blocks.st_emit[st]
 	if light_changes:
@@ -344,20 +397,102 @@ func set_block(x: int, y: int, z: int, st: int) -> int:
 					if n2.light_valid:
 						_light_update[Coords.chunk_key(n2.cx, n2.cz)] = true
 						_work[Coords.chunk_key(n2.cx, n2.cz)] = true
+						if hold_marks:
+							_held[Coords.chunk_key(n2.cx, n2.cz)] = true
 					else:
 						_light_dirty[Coords.chunk_key(n2.cx, n2.cz)] = true
 						_work[Coords.chunk_key(n2.cx, n2.cz)] = true
 	return old
 
 
+## The mesh group holding block (x, y, z) was rebuilt from blocks at least as new as `epoch` (cm.block_epoch right
+## after an edit): the edit is on screen.
+func mesh_caught_up(x: int, y: int, z: int, epoch: int) -> bool:
+	if y < Coords.MIN_Y or y >= Coords.MAX_Y:
+		return true
+	var gid := Coords.chunk_key(x >> 4, z >> 4) * 8 + (y - Coords.MIN_Y) / Mesher.GH
+	return int(dbg_bepoch.get(gid, -1)) >= epoch
+
+
 func _mark_mesh(c: Chunk, g: int) -> void:
 	if g < 0 or g >= Coords.SECTIONS / Mesher.GROUP:
 		return
+	if _collecting and c.shown:
+		_batch_ids.append(Coords.chunk_key(c.cx, c.cz) * 8 + g)
 	_work[(c.cx << 32) | (c.cz & 0xFFFFFFFF)] = true
 	if c.shown:
 		c.update_groups |= 1 << g
+		if hold_marks:
+			if _held.is_empty():
+				_held_us = Time.get_ticks_usec()
+			_held[(c.cx << 32) | (c.cz & 0xFFFFFFFF)] = true
 	else:
 		c.dirty_groups |= 1 << g
+
+
+## BlockUpdates finished the sliced updates of a tick: their chunks' update work may start (this frame's dispatch).
+func release_held() -> void:
+	if _held.is_empty():
+		return
+	for k in _held:
+		_work[k] = true
+	_held.clear()
+
+
+## Edit batches: one block change that touches several mesh groups (a block on a group / chunk border) swaps all their
+## new meshes in the same frame. Committed one by one (the per-frame upload budget spreads them over frames) the edited
+## group showed its new faces before the neighbour group added the faces the block had covered: see-through holes into
+## caves, far more often than Java's threaded rebuilds. Results built from a snapshot older than the edit pass through;
+## a batch is flushed after EDIT_BATCH_US even if a group never remeshes.
+const EDIT_BATCH_US := 150000
+var _batch_ids: Array = []
+var dbg_bepoch: Dictionary = {}   # group id -> block epoch of the newest committed mesh (probes)
+var _collecting := false
+var _edit_batch: Dictionary = {}   # group id (chunk key * 8 + group) -> batch {ids, held, epoch, t}
+var _batches: Array = []
+
+
+func _open_edit_batch() -> void:
+	var b := {"ids": {}, "held": [], "epoch": block_epoch, "t": Time.get_ticks_usec()}
+	for id in _batch_ids:
+		b["ids"][id] = true
+		_edit_batch[id] = b
+	_batches.append(b)
+
+
+## A mesh result of a batched group: held until every group of its batch has a result built after the edit.
+## Returns true when the caller must not commit it (held, or committed here with the rest of its batch).
+func _hold_for_batch(r: Array, key: int) -> bool:
+	var id: int = key * 8 + int(r[3])
+	var b = _edit_batch.get(id)
+	if b == null or int(r[9]) < int(b["epoch"]):
+		return false
+	_edit_batch.erase(id)
+	(b["ids"] as Dictionary).erase(id)
+	(b["held"] as Array).append(r)
+	if not (b["ids"] as Dictionary).is_empty():
+		return true
+	_flush_batch(b)
+	return true
+
+
+func _flush_batch(b: Dictionary) -> void:
+	_batches.erase(b)
+	for id in (b["ids"] as Dictionary).keys():
+		if _edit_batch.get(id) == b:
+			_edit_batch.erase(id)
+	for r in b["held"]:
+		var hc: Chunk = r[1]
+		var hk := Coords.chunk_key(hc.cx, hc.cz)
+		_commit_one("mesh", r, hc, hk, chunks.get(hk) == hc and hc.state != Chunk.EVICTED)
+	(b["held"] as Array).clear()
+
+
+func _flush_old_batches() -> void:
+	var now := Time.get_ticks_usec()
+	for b in _batches.duplicate():
+		if now - int(b["t"]) > EDIT_BATCH_US:
+			_flush_batch(b)
 
 
 ## Player edits: update work for the 3x3 chunks around (x, z) runs immediately for the next second.
@@ -370,12 +505,16 @@ func mark_urgent(x: int, z: int) -> void:
 			_work[uk] = true
 
 
-func _can_update(key: int, now: int) -> bool:
+func _can_update(key: int, now: int, chained := false) -> bool:
 	var urgent: bool = int(_urgent_until.get(key, 0)) > now
+	if not _held.is_empty() and not urgent and _held.has(key):
+		if now - _held_us < 500000:
+			return false   # (release_held puts it back in the work set)
+		release_held()   # (safety: a tick's slices never take this long)
 	if _upd_inflight >= max_update_jobs + (1 if urgent else 0):
 		_upd_wait[key] = true   # re-evaluated when a running update commits
 		return false
-	if urgent:
+	if urgent or chained:
 		return true
 	var nu := int(_next_update.get(key, 0))
 	if now >= nu:
@@ -400,22 +539,37 @@ var _full_cursor := 0
 var _frontier := 0   # index in _wanted before which every chunk is complete or idle (reset when _wanted changes)
 const DISPATCH_BUDGET_US := 1000   # upper bound of the per-frame dispatch budget
 var _disp_budget_us := 1000        # this frame's: 15 % of the recent frame time, 300 .. DISPATCH_BUDGET_US
-var _idle: Dictionary = {}          # chunk key -> true: evaluated, nothing to start until an event (cleared on moves)
+var _idle: Dictionary = {}          # chunk key -> packed centre it was evaluated at: nothing to start until an event
+var _ckey := 0                       # packed current centre (the value idle entries store)
 var _disp_wake_us := 1 << 62
 
 
 ## Idle state depends on the Chebyshev distance to the centre only through the radius thresholds (create <= r+2,
 ## features <= r+1, decorate / light / mesh <= r): after a centre move only chunks in that band can change status.
+## Chunks near the render distance edge may need work after the centre moved (their neighbours / wanted state
+## changed): idle entries in the band radius - 1 .. radius + 3 recorded at another centre are treated as not idle by the
+## walk (was ~750 dictionary erases in the frame of every chunk crossing).
 func _unidle_band(pcx: int, pcz: int) -> void:
-	var lo := maxi(0, radius - 1)
-	var hi := radius + 3
-	for dz in range(-hi, hi + 1):
-		var adz := absi(dz)
-		for dx in range(-hi, hi + 1):
-			var d := maxi(absi(dx), adz)
-			if d < lo:
-				continue
-			_idle.erase(((pcx + dx) << 32) | ((pcz + dz) & 0xFFFFFFFF))
+	_ckey = (pcx << 32) | (pcz & 0xFFFFFFFF)
+
+
+func _idle_now(key: int) -> bool:
+	var iv = _idle.get(key)
+	if iv == null:
+		return false
+	if int(iv) == _ckey:
+		return true
+	return maxi(absi((key >> 32) - _center.x), absi(((key << 32) >> 32) - _center.y)) < radius - 1
+
+
+## First index of the current wanted order whose ring (Chebyshev distance to the centre) is >= r.
+func _first_at_ring(r: int) -> int:
+	var offs := _wanted_offs
+	for i in offs.size():
+		var o: int = offs[i]
+		if maxi(absi((o >> 10) - 512), absi((o & 1023) - 512)) >= r:
+			return i
+	return 0
 
 
 func kick() -> void:
@@ -450,6 +604,11 @@ func update(pos: Vector3, forward: Vector3) -> void:
 	if loading:   # loading screen: no gameplay to keep smooth -> large main-thread budgets
 		_upload_budget_us = 12000.0
 		_disp_budget_us = 4000
+	elif _boost:
+		# first fill after the loading screen: the world appearing fast matters more than these few seconds of frame
+		# time (main-thread dispatch / upload were the limit at ~150 chunks / s, not the workers)
+		_upload_budget_us = clampf(_frame_us_avg * FILL_SHARE, 800.0, 6000.0)
+		_disp_budget_us = int(clampf(_frame_us_avg * FILL_SHARE, 300.0, 3000.0))
 	# look-ahead bias only while travelling (> 4 blocks/s): standing still, rings complete strictly inside-out
 	if now - _mv_ms >= 500:
 		var sp := Vector2(pos.x - _mv_pos.x, pos.z - _mv_pos.z).length() / maxf(0.001, (now - _mv_ms) / 1000.0)
@@ -457,14 +616,26 @@ func update(pos: Vector3, forward: Vector3) -> void:
 		_mv_pos = pos
 		_mv_ms = now
 	if Vector2i(pcx, pcz) != _center or now - _last_sort_ms > 750:
+		var old_center := _center
+		var old_fring := -1
+		if _frontier < _wanted_n and _frontier < _wanted_offs.size():
+			var ofw: Vector2i = _w_at(_frontier)
+			old_fring = maxi(absi(ofw.x - old_center.x), absi(ofw.y - old_center.y))
 		_center = Vector2i(pcx, pcz)
 		_last_sort_ms = now
 		var center_moved := Vector2i(pcx, pcz) != _rb_center
 		_rb_center = Vector2i(pcx, pcz)
 		if _rebuild_wanted(pcx, pcz, forward):
 			_full = true   # new order / new positions: walk the wanted list (idle chunks are skipped cheaply)
-			_full_cursor = 0
-			_frontier = 0
+			# a move of at most one chunk (or a new heading): every chunk 3+ rings inside the old frontier ring was
+			# before the old frontier (complete or idle), so the walk restarts there instead of at the centre (the walk
+			# over ~1400 entries after every chunk crossing was ~20 % of the main thread on x86); heading biases are
+			# < 0.6 ring
+			var nf := 0
+			if old_fring > 3 and extra_centers.is_empty() and absi(pcx - old_center.x) <= 1 and absi(pcz - old_center.y) <= 1:
+				nf = _first_at_ring(old_fring - 3)
+			_full_cursor = nf
+			_frontier = nf
 		if center_moved or not extra_centers.is_empty():
 			_unload_far(pcx, pcz)
 		if not extra_centers.is_empty():
@@ -630,7 +801,19 @@ func _dispatch(pcx: int, pcz: int) -> void:
 		# that no longer needs its slot leaves it free, so the next waiters are woken on the following frame
 		var free_slots := max_update_jobs - _upd_inflight
 		if free_slots > 0:
-			for k in _upd_wait.keys().slice(0, free_slots):
+			var wk: Array = _upd_wait.keys()
+			if wk.size() > free_slots:
+				# nearest first (a flow step near the player queues 9 relights; far ones must not delay them)
+				var wr: Array = []
+				for wi2 in wk.size():
+					var wkk: int = wk[wi2]
+					wr.append(maxi(absi((wkk >> 32) - _center.x), absi(((wkk << 32) >> 32) - _center.y)) * 0x100000000 + wi2)
+				wr.sort()
+				var wk2: Array = []
+				for wv in wr.slice(0, free_slots):
+					wk2.append(wk[wv & 0xFFFFFFFF])
+				wk = wk2
+			for k in wk.slice(0, free_slots):
 				_upd_wait.erase(k)
 				_work[k] = true
 				disp_stats["wake_updwait"] = int(disp_stats.get("wake_updwait", 0)) + 1
@@ -680,7 +863,7 @@ func _dispatch(pcx: int, pcz: int) -> void:
 				for j in range(i, ks.size()):
 					_work[ks[j]] = true
 				return
-			_idle[key2] = true
+			_idle[key2] = _ckey
 	if not _full:
 		return
 	# 2) walk of the wanted list from the frontier: every entry before _frontier is complete or idle (they only need
@@ -704,7 +887,7 @@ func _dispatch(pcx: int, pcz: int) -> void:
 		# complete chunks need nothing until an event puts them in the work set
 		var skip := c != null and c.shown and c.light_valid and c.dirty_groups == 0 and c.update_groups == 0 and not _light_update.has(key) and not _light_dirty.has(key)
 		# evaluated before with nothing startable (waiting for neighbours / its own job): skip until an event
-		if not skip and _idle.has(key) and not _work.has(key):
+		if not skip and not _work.has(key) and _idle_now(key):
 			skip = true
 		if skip:
 			if adv:
@@ -718,7 +901,7 @@ func _dispatch(pcx: int, pcz: int) -> void:
 			_full_cursor = _frontier   # capacity-limited (loading / travelling): walk again from the frontier
 			disp_stats["full_cap"] += 1
 			return
-		_idle[key] = true
+		_idle[key] = _ckey
 	_full = false
 	_full_cursor = _frontier
 
@@ -767,7 +950,7 @@ func _dispatch_one(cx: int, cz: int, key: int, c: Chunk, rr: float, feat_stage: 
 	if _light_update.has(key) and not _jobs_light.has(key) and c.light_valid:
 		if _can_update(key, now):
 			_light_update.erase(key)
-			_next_update[key] = now + LIGHT_UPDATE_US
+			_next_update[key] = now + (LIGHT_UPDATE_NEAR_US if d_main <= 2.0 else LIGHT_UPDATE_US)
 			_start_light(c, true)
 			return 0
 	if c.light_valid and c.dirty_groups != 0 and d_main <= rr and _all_neighbors_at_least(c, Chunk.DATA_READY):
@@ -778,16 +961,24 @@ func _dispatch_one(cx: int, cz: int, key: int, c: Chunk, rr: float, feat_stage: 
 				c.dirty_groups &= ~(1 << g)
 				c.update_groups &= ~(1 << g)
 				_start_mesh(c, g, false)
-	elif c.light_valid and c.update_groups != 0 and d_main <= rr and _can_update(key, now):
+	elif c.light_valid and c.update_groups != 0 and d_main <= rr and _can_update(key, now, _chain.has(key) and not _jobs_light.has(key)):
+		# every pending group of the chunk starts together (one update slot per chunk; the per-chunk throttle let one
+		# group through per period, so a chunk's groups trickled in over seconds); throttle period shorter near the player
+		var started := false
 		for g in Coords.SECTIONS / Mesher.GROUP:
 			if (c.update_groups >> g) & 1 and not _jobs_mesh.has(key * 8 + g):
 				if _inflight >= max_jobs + queue_depth:
-					return 1
-				if not _can_update(key, now):
-					return 0
+					break
 				c.update_groups &= ~(1 << g)
-				_next_update[key] = now + MESH_UPDATE_US
 				_start_mesh(c, g, true)
+				started = true
+		if started:
+			if _chain.has(key):
+				_chain.erase(key)   # (the remesh of a relight keeps the relight's throttle period)
+			else:
+				_next_update[key] = now + (MESH_UPDATE_NEAR_US if d_main <= 2.0 else MESH_UPDATE_US)
+		if c.update_groups != 0 and _inflight >= max_jobs + queue_depth:
+			return 1
 	return 0
 
 
@@ -1168,7 +1359,7 @@ func _start_mesh(c: Chunk, g: int, update := false) -> void:
 	var tints := _tints(c)
 	if tracing:
 		_mt("  tints", Time.get_ticks_usec() - tt)
-	var job := {"snaps": snaps, "light": c.light_halo_secs, "group": g, "tints": tints, "opts": mesh_opts}   # registry: the worker's own
+	var job := {"snaps": snaps, "light": c.light_halo_secs, "group": g, "tints": tints, "opts": mesh_opts, "bepoch": block_epoch}   # registry: the worker's own
 	_submit(_job_mesh.bind(c, g, job, c.mesh_epoch, update, trd != null), _pri(c, 0) - (1000 if update else 0))
 	if tracing:
 		_mt("  start_mesh", Time.get_ticks_usec() - tsm)
@@ -1189,7 +1380,7 @@ func _job_mesh(c: Chunk, g: int, job: Dictionary, epoch: int, update: bool, use_
 				packed[mi] = Native.inst.tr_pack(arrays, (1 if mi < 2 and section_buckets else 0), om)   # opaque / cutout: per-section buckets
 			mi += 1
 		res["packed"] = packed
-	_push_result(["mesh", c, epoch, g, res, Time.get_ticks_usec() - t0, t0, Time.get_ticks_usec(), update])
+	_push_result(["mesh", c, epoch, g, res, Time.get_ticks_usec() - t0, t0, Time.get_ticks_usec(), update, int(job.get("bepoch", 0))])
 
 
 ## Biome-blended grass/foliage/water colours for the 16x16 columns (surface biome).
@@ -1266,6 +1457,8 @@ func _tints_gd(c: Chunk) -> PackedColorArray:
 # ---------------------------------------------------------------- commits
 
 func _commit_results() -> void:
+	if not _batches.is_empty():
+		_flush_old_batches()
 	_mutex.lock()
 	var res := _results
 	_results = []
@@ -1300,6 +1493,8 @@ func _commit_results() -> void:
 			busy_us[kind] = int(busy_us.get(kind, 0)) + dur
 			busy_n[kind] = int(busy_n.get(kind, 0)) + 1
 		var alive: bool = chunks.get(key) == c and c.state != Chunk.EVICTED
+		if kind == "mesh" and not _edit_batch.is_empty() and r.size() > 9 and _hold_for_batch(r, key):
+			continue
 		var tk0 := Time.get_ticks_usec()
 		_commit_one(kind, r, c, key, alive)
 		if tracing:
@@ -1308,6 +1503,17 @@ func _commit_results() -> void:
 		_mutex.lock()
 		_results = deferred + _results
 		_mutex.unlock()
+
+
+## A commit may write blocks into loaded neighbours (features / decoration reach across chunk borders): new block
+## versions for the chunk and its 8 neighbours (Collision region caches).
+func _bump_around(c: Chunk) -> void:
+	for dz in range(-1, 2):
+		for dx in range(-1, 2):
+			var n: Chunk = chunks.get(Coords.chunk_key(c.cx + dx, c.cz + dz))
+			if n != null:
+				Chunk._bseq += 1
+				n.bepoch = Chunk._bseq
 
 
 ## One worker result applied on the main thread.
@@ -1329,6 +1535,7 @@ func _commit_one(kind: String, r: Array, c: Chunk, key: int, alive: bool) -> voi
 				c.from_disk = r[4]
 				c.state = Chunk.DECORATED if r[4] else Chunk.DATA_READY
 				block_epoch += 1
+				_bump_around(c)
 				if r[4]:
 					c.decorated = true
 					_remesh_built_against(c)
@@ -1364,6 +1571,7 @@ func _commit_one(kind: String, r: Array, c: Chunk, key: int, alive: bool) -> voi
 				c.decorated = true
 				_release_raw_around(c)
 				block_epoch += 1
+				_bump_around(c)
 				BlockEntities.index_chunk(self, c)
 				_leaf_cache_clear(c.cx, c.cz)
 				BlockUpdates.on_chunk_ready(c.cx, c.cz)
@@ -1390,12 +1598,17 @@ func _commit_one(kind: String, r: Array, c: Chunk, key: int, alive: bool) -> voi
 				_tr(c, "light_c")
 				_tr_add(c, "lights")
 				var first := not c.light_valid
+				var old_halo: Array = c.light_halo_secs
 				c.light_halo_secs = r[3]
 				c.light_valid = true
 				if first:
 					c.dirty_groups = 0x3F
 				elif r[7] and c.shown:
-					c.update_groups |= _nonempty_groups(c)
+					# only the groups whose light changed (every relight remeshed all of the chunk's groups one by one: with
+					# flowing water the group holding the water surface waited behind the others and the flow showed late)
+					c.update_groups |= _light_changed_groups(old_halo, r[3]) & _nonempty_groups(c)
+					if c.update_groups != 0:
+						_chain[key] = true
 				else:
 					c.dirty_groups |= _nonempty_groups(c)
 			"mesh":
@@ -1405,6 +1618,8 @@ func _commit_one(kind: String, r: Array, c: Chunk, key: int, alive: bool) -> voi
 				_jobs_mesh.erase(key * 8 + g)
 				if not alive:
 					return
+				if r.size() > 9 and int(r[9]) > int(dbg_bepoch.get(key * 8 + g, -1)):
+					dbg_bepoch[key * 8 + g] = int(r[9])   # probes: newest block epoch on screen per group
 				stats["meshed"] += 1
 				stats["mesh_ms"] = lerpf(stats["mesh_ms"], r[5] / 1000.0, 0.1)
 				var tu := Time.get_ticks_usec()
@@ -1452,6 +1667,27 @@ func _mesh_pending(key: int) -> bool:
 ## Chunk counts as visible: lit and every mesh group built and uploaded at least once.
 func is_visible_chunk(c: Chunk) -> bool:
 	return c != null and c.shown
+
+
+## Mesh groups whose light differs between two Lighting.compute results: a changed section marks its group, and the
+## neighbouring group when it is a group's first / last section (faces on the border read light across it).
+func _light_changed_groups(old: Array, new: Array) -> int:
+	var ng := Coords.SECTIONS / Mesher.GROUP
+	if old.size() != new.size():
+		return (1 << ng) - 1
+	var m := 0
+	for s in new.size():
+		var a = old[s]
+		var b = new[s]
+		if typeof(a) == typeof(b) and a == b:
+			continue
+		var g := s / Mesher.GROUP
+		m |= 1 << g
+		if s % Mesher.GROUP == 0 and g > 0:
+			m |= 1 << (g - 1)
+		if s % Mesher.GROUP == Mesher.GROUP - 1 and g + 1 < ng:
+			m |= 1 << (g + 1)
+	return m
 
 
 func _nonempty_groups(c: Chunk) -> int:
@@ -1712,6 +1948,7 @@ func _drain_drops(pcx: int, pcz: int, n: int) -> void:
 		_light_dirty.erase(key)
 		_light_update.erase(key)
 		_next_update.erase(key)
+		_chain.erase(key)
 		_urgent_until.erase(key)
 
 

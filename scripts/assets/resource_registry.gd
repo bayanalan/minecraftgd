@@ -32,6 +32,7 @@ var atlas: AtlasBuilder
 var baker: ModelBaker
 var mat_opaque: ShaderMaterial
 var mat_cutout: ShaderMaterial
+var mat_item_block: ShaderMaterial   # block models of entities: light per instance (voxel_item.gdshader)
 var mat_translucent: ShaderMaterial
 var grass_colormap: Image
 var foliage_colormap: Image
@@ -222,6 +223,22 @@ func _load_asset_index() -> void:
 		var j = JSON.parse_string(FileAccess.get_file_as_string(idx))
 		if j is Dictionary and j.get("objects") is Dictionary:
 			asset_index = j["objects"]
+	_apply_window_icon()
+
+
+## Java Window.setIcon: the game's window / taskbar icon from the installed version's own assets (icons/icon_*.png in
+## the asset index) - read at run time, never shipped (the exported .exe keeps Recraft's own file icon).
+func _apply_window_icon() -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	for n in ["icons/icon_256x256.png", "icons/icon_128x128.png", "icons/icon_48x48.png", "icons/icon_32x32.png"]:
+		var p := sound_object_path(n)
+		if p == "":
+			continue
+		var img := Image.new()   # (hashed object files have no extension: decode the PNG bytes directly)
+		if img.load_png_from_buffer(FileAccess.get_file_as_bytes(p)) == OK and not img.is_empty():
+			DisplayServer.set_icon(img)
+			return
 
 
 ## Absolute path of a hashed sound object, e.g. "minecraft/sounds/dig/stone1.ogg" -> objects/xx/hash.
@@ -239,9 +256,11 @@ func _make_materials() -> void:
 	mat_opaque.shader = load("res://shaders/voxel_opaque.gdshader")
 	mat_cutout = ShaderMaterial.new()
 	mat_cutout.shader = load("res://shaders/voxel_cutout.gdshader")
+	mat_item_block = ShaderMaterial.new()
+	mat_item_block.shader = load("res://shaders/voxel_item.gdshader")
 	mat_translucent = ShaderMaterial.new()
 	mat_translucent.shader = load("res://shaders/voxel_translucent.gdshader")
-	for m in [mat_opaque, mat_cutout, mat_translucent]:
+	for m in [mat_opaque, mat_cutout, mat_translucent, mat_item_block]:
 		m.set_shader_parameter("block_tex", atlas.texture)
 	mat_translucent.render_priority = 1
 

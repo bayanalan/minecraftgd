@@ -164,6 +164,7 @@ func bake(model_id: String, rx: int = 0, ry: int = 0, uvlock: bool = false) -> D
 	var quads := PackedFloat32Array()
 	var boxes: Array = []
 	var res := {"quads": quads, "boxes": boxes, "ok": true, "ao": m["ao"], "particle": ""}
+	var placed := {}   # quad corner key -> true (coplanar duplicates: emissive overlays, flowerbed stems)
 	res["particle"] = resolve_tex(m["textures"], "#particle")
 	var els = m["elements"]
 	if not (els is Array):
@@ -256,6 +257,26 @@ func bake(model_id: String, rx: int = 0, ry: int = 0, uvlock: bool = false) -> D
 					var su: float = float(uv[0]) if (i == 0 or i == 1) else float(uv[2])
 					var sv: float = float(uv[1]) if (i == 0 or i == 3) else float(uv[3])
 					uvs.append(Vector2(su, sv) / 16.0)
+			# Java draws a later element over an earlier one at the same place (depth test LEQUAL): open eyeblossom's
+			# emissive cross, flowerbed stems. Exactly coplanar quads z-fought here; a repeat moves 1/1024 block out
+			# along its own facing (after element and block-state rotation).
+			var qk_parts: Array = []
+			for k in 4:
+				var pk: Vector3 = pts[k]
+				qk_parts.append("%.4f,%.4f,%.4f" % [pk.x, pk.y, pk.z])
+			qk_parts.sort()
+			var qkey := "|".join(qk_parts) + "|%d" % dir
+			if placed.has(qkey) and cull < 0:   # (cube overlays - grass block sides - are merged by analyze_cube)
+				var fc: Vector3 = ((corners[0] as Vector3) + (corners[2] as Vector3)) * 0.5
+				var fa2: Vector3 = fc
+				var fb2: Vector3 = fc + DIR_VEC[dir] * 16.0
+				if has_erot:
+					fa2 = _rot_point(fa2, r_axis, r_ang, r_org, r_rescale)
+					fb2 = _rot_point(fb2, r_axis, r_ang, r_org, r_rescale)
+				var nrm := (_state_rot(fb2 / 16.0, rx, ry) - _state_rot(fa2 / 16.0, rx, ry)).normalized()
+				for k in 4:
+					pts[k] = (pts[k] as Vector3) + nrm * (1.0 / 1024.0)
+			placed[qkey] = true
 			for k in 4:
 				var p: Vector3 = pts[k]
 				var u: Vector2 = uvs[k]

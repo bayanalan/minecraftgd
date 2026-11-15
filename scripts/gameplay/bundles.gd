@@ -4,7 +4,7 @@
 ## - bundle on cursor, right-click an empty slot: take the newest item out into the slot
 ## - items on cursor, left-click a bundle: put the cursor items in
 ## - empty cursor, right-click a bundle: take the newest item out onto the cursor
-## Using a bundle in the world empties it in front of the player. Slot bar: fullness (blue, red when full).
+## Using a bundle in the world throws out its newest stack. Slot bar: fullness (blue, red when full).
 ## Contents live in the item component minecraft:bundle_contents (Array of item dicts).
 class_name Bundles
 extends RefCounted
@@ -116,18 +116,16 @@ static func click(ui, sl: Dictionary, st: ItemStack, right: bool) -> bool:
 	return false
 
 
-## Java BundleItem.dropContent (use in the world).
+## Java BundleItem.dropContent (use in the world): wiki: Bundle - one group of items (the newest stack) is emptied per
+## use (since 24w36a), thrown like a player drop (40-tick pickup delay, wiki: Item (entity)).
 static func drop_all(world, b: ItemStack) -> bool:
-	var items := contents(b)
-	if items.is_empty():
+	if contents(b).is_empty():
 		return false
 	var p: Player = world.player
-	for d in items:
-		var e = world.entities.spawn_item(p.eye_pos() - Vector3(0, 0.3, 0), ItemStack.from_dict(d))
-		if e != null:
-			e.vel = p.look_dir() * 0.3 + Vector3(randf_range(-0.05, 0.05), 0.1, randf_range(-0.05, 0.05))
-			e.pickup_delay = 40
-	b.components.erase("minecraft:bundle_contents")
+	var e = world.entities.spawn_item(p.eye_pos() - Vector3(0, 0.3, 0), remove_one(b))
+	if e != null:
+		e.vel = p.look_dir() * 0.3 + Vector3(randf_range(-0.05, 0.05), 0.1, randf_range(-0.05, 0.05))
+		e.pickup_delay = 40
 	Audio.play("item.bundle.drop_contents", p.pos, "Players")
 	world.inv_changed()
 	return true

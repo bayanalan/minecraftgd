@@ -11,6 +11,16 @@ const DEFAULTS := {
 	"opacity": -1, "waterloggable": false, "render": "", "drops_self": true, "fence_like": false,
 }
 
+# Java instabreak blocks (destroy time 0) not covered by a family rule
+const INSTABREAK := ["short_grass", "tall_grass", "fern", "large_fern", "short_dry_grass", "tall_dry_grass", "bush", "firefly_bush",
+	"dead_bush", "leaf_litter", "wildflowers", "pink_petals", "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet", "oxeye_daisy",
+	"cornflower", "lily_of_the_valley", "wither_rose", "torchflower", "open_eyeblossom", "closed_eyeblossom", "cactus_flower", "sunflower",
+	"lilac", "rose_bush", "peony", "pitcher_plant", "mangrove_propagule", "wheat", "carrots", "potatoes", "beetroots", "torchflower_crop",
+	"pitcher_crop", "sweet_berry_bush", "flower_pot", "azalea", "flowering_azalea", "spore_blossom", "nether_sprouts", "pale_hanging_moss",
+	"nether_wart", "decorated_pot", "fire", "soul_fire", "redstone_torch", "redstone_wall_torch", "end_rod", "tripwire_hook"]
+# Java strength(hardness, resistance) for plants the families get wrong
+const SPECIAL_STRENGTH := {"cocoa": [0.2, 3.0], "chorus_flower": [0.4, 0.4], "chorus_plant": [0.4, 0.4], "bamboo_sapling": [1.0, 1.0], "bamboo": [1.0, 1.0]}
+
 # Exact-name overrides: [hardness, resistance, tool, light]
 const EXACT := {
 	"air": [0, 0, "", 0], "cave_air": [0, 0, "", 0], "void_air": [0, 0, "", 0],
@@ -76,6 +86,10 @@ const EXACT := {
 	"copper_bulb": [3, 6, "pickaxe", 0], "creaking_heart": [10, 10, "axe", 0], "resin_block": [0, 0, "", 0],
 }
 
+# wiki Light (light-emitting blocks table): emitters the EXACT table above does not cover (every copper lantern: 15)
+const EXTRA_LIGHT := {"large_amethyst_bud": 4, "medium_amethyst_bud": 2, "small_amethyst_bud": 1, "calibrated_sculk_sensor": 1,
+	"copper_torch": 14, "copper_wall_torch": 14, "lava_cauldron": 15, "firefly_bush": 2}
+
 # Suffix/prefix family rules evaluated in order: [match_kind, token, hardness, resistance, tool]
 const FAMILIES := [
 	["suffix", "_planks", 2, 3, "axe"], ["suffix", "_log", 2, 2, "axe"], ["suffix", "_wood", 2, 2, "axe"],
@@ -114,10 +128,32 @@ const NO_COLLIDE_TOKENS := ["torch", "sapling", "_tulip", "flower", "short_grass
 	"small_dripleaf", "red_shrub", "shelf_mushroom", "_shrub", "cactus_flower", "eyeblossom", "short_dry_grass", "tall_dry_grass",
 	"cushion", "string", "hanging_moss", "dripleaf_stem", "propagule", "sprouts"]
 
+## Blocks with Java's WATERLOGGED property (SimpleWaterloggedBlock; wiki Waterlogging, Java "Source" column). The jar's
+## blockstate files only name the properties their models use, so most of these get the property from here. Not
+## waterloggable in Java: fence gates, candle cakes, jack o'lanterns, sea lanterns (an older name pattern gave it them).
+const WATERLOGGABLE := ["chest", "rail", "ladder", "scaffolding", "conduit", "light", "barrier", "pointed_dripstone", "big_dripleaf",
+	"big_dripleaf_stem", "small_dripleaf", "sea_pickle", "hanging_roots", "glow_lichen", "lightning_rod", "heavy_core", "decorated_pot",
+	"campfire", "soul_campfire", "candle", "lantern", "soul_lantern", "sculk_sensor", "calibrated_sculk_sensor", "sculk_shrieker",
+	"sculk_vein", "resin_clump", "mangrove_roots", "mangrove_propagule", "dried_ghast", "amethyst_cluster", "small_amethyst_bud",
+	"medium_amethyst_bud", "large_amethyst_bud", "chain"]
+const WATERLOGGABLE_SUFFIX := ["_slab", "_stairs", "_wall", "_fence", "_trapdoor", "_sign", "_pane", "_bars", "_chain", "_lantern", "_coral",
+	"_coral_fan", "_coral_wall_fan", "_candle", "_rail", "_leaves", "_shelf", "_grate", "_chest", "_lightning_rod", "copper_golem_statue"]
+
+
+static func is_waterloggable(name: String) -> bool:
+	if name in WATERLOGGABLE:
+		return true
+	if name == "jack_o_lantern" or name == "sea_lantern":
+		return false
+	for suf in WATERLOGGABLE_SUFFIX:
+		if name.ends_with(suf):
+			return true
+	return false
+
 const REPLACEABLE := ["air", "cave_air", "void_air", "water", "lava", "short_grass", "tall_grass", "fern", "large_fern",
 	"dead_bush", "vine", "snow", "fire", "soul_fire", "seagrass", "tall_seagrass", "glow_lichen", "light", "structure_void",
 	"crimson_roots", "warped_roots", "nether_sprouts", "hanging_roots", "bubble_column", "short_dry_grass", "tall_dry_grass",
-	"leaf_litter", "bush"]
+	"leaf_litter", "bush", "red_shrub", "resin_clump"]   # (= 26.3 #replaceable)
 
 const GRAVITY := ["sand", "red_sand", "gravel", "suspicious_sand", "suspicious_gravel", "anvil", "chipped_anvil",
 	"damaged_anvil", "dragon_egg", "scaffolding", "pointed_dripstone"]
@@ -189,7 +225,60 @@ static func java_outline(name: String, sp: Dictionary) -> PackedFloat32Array:
 		"spore_blossom":
 			return b.call(2, 13, 2, 14, 16, 14)
 		"redstone_wire":
-			return b.call(0, 0, 0, 16, 1, 16)
+			# Java RedStoneWireBlock: the centre dot plus an arm to each connected side
+			var wx0 := 0.0 if sp.get("west", "none") != "none" else 3.0
+			var wx1 := 16.0 if sp.get("east", "none") != "none" else 13.0
+			var wz0 := 0.0 if sp.get("north", "none") != "none" else 3.0
+			var wz1 := 16.0 if sp.get("south", "none") != "none" else 13.0
+			return b.call(wx0, 0, 3, wx1, 1, 13) + b.call(3, 0, wz0, 13, 1, wz1)
+	# code shapes of small blocks (Java getShape, not the model's element boxes)
+	var facing := str(sp.get("facing", "north"))
+	if name in ["torch", "soul_torch", "redstone_torch", "copper_torch"]:
+		return b.call(6, 0, 6, 10, 10, 10)
+	if name in ["wall_torch", "soul_wall_torch", "redstone_wall_torch", "copper_wall_torch"]:
+		return {"north": b.call(5.5, 3, 11, 10.5, 13, 16), "south": b.call(5.5, 3, 0, 10.5, 13, 5), "west": b.call(11, 3, 5.5, 16, 13, 10.5), "east": b.call(0, 3, 5.5, 5, 13, 10.5)}.get(facing, b.call(5.5, 3, 11, 10.5, 13, 16))
+	if name == "lantern" or name == "soul_lantern" or name.ends_with("copper_lantern"):
+		if sp.get("hanging", "false") == "true":
+			return b.call(5, 1, 5, 11, 8, 11) + b.call(6, 8, 6, 10, 10, 10)
+		return b.call(5, 0, 5, 11, 7, 11) + b.call(6, 7, 6, 10, 9, 10)
+	if name == "flower_pot" or name.begins_with("potted_"):
+		return b.call(5, 0, 5, 11, 6, 11)
+	if name == "ladder":
+		return {"north": b.call(0, 0, 13, 16, 16, 16), "south": b.call(0, 0, 0, 16, 16, 3), "west": b.call(13, 0, 0, 16, 16, 16), "east": b.call(0, 0, 0, 3, 16, 16)}.get(facing, b.call(0, 0, 13, 16, 16, 16))
+	if name == "rail" or name.ends_with("_rail"):
+		return b.call(0, 0, 0, 16, 8, 16) if str(sp.get("shape", "")).begins_with("ascending") else b.call(0, 0, 0, 16, 2, 16)
+	if name.ends_with("_wall_sign"):
+		return {"north": b.call(0, 4.5, 14, 16, 12.5, 16), "south": b.call(0, 4.5, 0, 16, 12.5, 2), "east": b.call(0, 4.5, 0, 2, 12.5, 16), "west": b.call(14, 4.5, 0, 16, 12.5, 16)}.get(facing, b.call(0, 4.5, 14, 16, 12.5, 16))
+	if name.ends_with("_sign") and not name.ends_with("_hanging_sign"):
+		return b.call(4, 0, 4, 12, 16, 12)
+	if name.ends_with("_hanging_sign") and not name.contains("_wall_"):
+		return b.call(3, 0, 3, 13, 16, 13)
+	if name.ends_with("_wall_banner"):
+		return {"north": b.call(0, 0, 14, 16, 12.5, 16), "south": b.call(0, 0, 0, 16, 12.5, 2), "west": b.call(14, 0, 0, 16, 12.5, 16), "east": b.call(0, 0, 0, 2, 12.5, 16)}.get(facing, b.call(0, 0, 14, 16, 12.5, 16))
+	if name.ends_with("_banner"):
+		return b.call(4, 0, 4, 12, 16, 12)
+	if name.ends_with("_wall_head") or name.ends_with("_wall_skull"):
+		var pw := 1.0 if name == "piglin_wall_head" else 0.0
+		return {"north": b.call(4 - pw, 4, 8, 12 + pw, 12, 16), "south": b.call(4 - pw, 4, 0, 12 + pw, 12, 8), "east": b.call(0, 4, 4 - pw, 8, 12, 12 + pw), "west": b.call(8, 4, 4 - pw, 16, 12, 12 + pw)}.get(facing, b.call(4, 4, 8, 12, 12, 16))
+	if (name.ends_with("_head") and name != "piston_head") or name.ends_with("_skull"):
+		return b.call(3, 0, 3, 13, 8, 13) if name == "piglin_head" else b.call(4, 0, 4, 12, 8, 12)
+	if name == "candle" or name.ends_with("_candle"):
+		match int(sp.get("candles", "1")):
+			2:
+				return b.call(5, 0, 6, 11, 6, 9)
+			3:
+				return b.call(5, 0, 6, 10, 6, 11)
+			4:
+				return b.call(5, 0, 5, 11, 6, 10)
+		return b.call(7, 0, 7, 9, 6, 9)
+	if name == "end_rod" or name.ends_with("lightning_rod"):
+		if facing == "up" or facing == "down":
+			return b.call(6, 0, 6, 10, 16, 10)
+		return b.call(6, 6, 0, 10, 10, 16) if facing == "north" or facing == "south" else b.call(0, 6, 6, 16, 10, 10)
+	if name == "repeater" or name == "comparator":
+		return b.call(0, 0, 0, 16, 2, 16)
+	if name == "daylight_detector":
+		return b.call(0, 0, 0, 16, 6, 16)
 	if name.ends_with("_sapling") or name == "mangrove_propagule":
 		return b.call(2, 0, 2, 14, 12, 14)
 	if name in ["dandelion", "poppy", "blue_orchid", "allium", "azure_bluet", "oxeye_daisy", "cornflower", "lily_of_the_valley", "wither_rose", "torchflower", "open_eyeblossom", "closed_eyeblossom"] or name.ends_with("_tulip"):
@@ -211,6 +300,10 @@ static func get_props(name: String) -> Dictionary:
 				p["hardness"] = float(f[2]); p["resistance"] = float(f[3]); p["tool"] = f[4]
 				hit = true
 				break
+	if EXTRA_LIGHT.has(name):
+		p["light"] = int(EXTRA_LIGHT[name])
+	elif name.ends_with("copper_lantern"):
+		p["light"] = 15
 	if not hit:
 		# derived shapes inherit base material hardness (oak_stairs -> oak_planks etc.)
 		for suf in ["_stairs", "_slab", "_wall", "_fence"]:
@@ -226,12 +319,20 @@ static func get_props(name: String) -> Dictionary:
 						break
 				hit = true
 				break
-	if name.ends_with("_slab") or name.ends_with("_stairs") or name.ends_with("_wall") or name.ends_with("_fence") or name.ends_with("_fence_gate") or name.ends_with("_trapdoor") or name.ends_with("_sign") or name.ends_with("_pane") or name == "iron_bars" or name.ends_with("_chain") or name == "chain" or name.ends_with("lantern") or name.ends_with("_coral_fan") or name.ends_with("_coral") or name.contains("candle") or name == "ladder" or name.ends_with("_rail") or name == "rail" or name.ends_with("_leaves") or name == "pointed_dripstone" or name.ends_with("_shelf") or name == "conduit" or name.ends_with("_grate") or name == "scaffolding" or name == "big_dripleaf" or name == "small_dripleaf" or name == "sea_pickle" or name.ends_with("_chest") or name == "chest" or name == "hanging_roots" or name == "glow_lichen" or name == "lightning_rod" or name.ends_with("lightning_rod") or name == "heavy_core" or name == "decorated_pot":
+	# Java Properties.instabreak() / strength(0): plants, crops, small redstone parts, pots (they fell through to the 1.0
+	# default and took half a second to break)
+	if INSTABREAK.has(name) or name.ends_with("_sapling") or name.ends_with("_tulip") or name.begins_with("potted_") or name.ends_with("_stem") and (name.contains("melon") or name.contains("pumpkin")):
+		p["hardness"] = 0.0
+		p["resistance"] = 0.0
+	elif SPECIAL_STRENGTH.has(name):
+		p["hardness"] = float(SPECIAL_STRENGTH[name][0])
+		p["resistance"] = float(SPECIAL_STRENGTH[name][1])
+	if is_waterloggable(name):
 		p["waterloggable"] = true
 	for t in NO_COLLIDE_TOKENS:
 		if name == t or (t.length() > 3 and name.contains(t)):
 			# exclusions where token matches but block has collision
-			if name.ends_with("_block") or name.ends_with("_planks") or name.ends_with("_ore") or name.ends_with("_wall") or name.ends_with("_log") or name in ["mushroom_stem", "light_gray_wool", "sugar_cane_x"] or name.contains("lightning") or name.contains("lightweight") or name.ends_with("_stairs") or name.ends_with("_slab") or name.ends_with("_carpet") or name.contains("light_gray") or name.contains("light_blue") or name.ends_with("_coral_block") or name.contains("redstone_lamp") or name.contains("daylight") or name.contains("candle") or name.contains("lantern") or name.contains("_hyphae") or name.ends_with("_stem") and not name.contains("melon") and not name.contains("pumpkin") or name.ends_with("_wood") or name.ends_with("_trapdoor") or name.ends_with("_door") or name == "big_dripleaf" or name.ends_with("_fence") or name.ends_with("froglight") or name.ends_with("_shelf") or name.begins_with("potted_") or name.contains("campfire") or name.contains("cauldron") or name.ends_with("shroomlight") or name == "chorus_flower" or name.contains("azalea") or name.ends_with("_leaves"):
+			if name.ends_with("_block") or name.ends_with("_planks") or name.ends_with("_ore") or name.ends_with("_wall") or name.ends_with("_log") or name in ["mushroom_stem", "light_gray_wool", "sugar_cane_x"] or name.contains("lightning") or name.contains("lightweight") or name.ends_with("_stairs") or name.ends_with("_slab") or name.ends_with("_carpet") or name.contains("light_gray") or name.contains("light_blue") or name.ends_with("_coral_block") or name.contains("redstone_lamp") or name.contains("daylight") or name.contains("candle") or name.contains("lantern") or name.contains("_hyphae") or name.ends_with("_stem") and not name.contains("melon") and not name.contains("pumpkin") or name.ends_with("_wood") or name.ends_with("_trapdoor") or name.ends_with("_door") or name == "big_dripleaf" or name.ends_with("_fence") or name.ends_with("froglight") or name.ends_with("_shelf") or name.begins_with("potted_") or name.contains("campfire") or name.contains("cauldron") or name.ends_with("shroomlight") or name == "chorus_flower" or name.contains("azalea") or name.ends_with("_leaves") or name.ends_with("mangrove_roots"):
 				continue
 			p["collide"] = false
 			break
@@ -241,7 +342,10 @@ static func get_props(name: String) -> Dictionary:
 		p["replaceable"] = true
 	if GRAVITY.has(name) or name.ends_with("_concrete_powder"):
 		p["gravity"] = true
-	if name.ends_with("_planks") or name.ends_with("_log") or name.ends_with("_leaves") or name.ends_with("_wool") or name.ends_with("_wood") or name == "bookshelf" or name.ends_with("_carpet") or name == "tnt" or name.ends_with("_fence") or name == "hay_block" or name.ends_with("_cushion"):
+	# "flammable" = catches fire from lava (F_FLAMMABLE, RandomTickable._ignited_by_lava). wiki Fire: hay bales and moss carpets
+	# do not; nether wood (crimson / warped) and nether brick never burn
+	var nether_wood := name.contains("crimson") or name.contains("warped") or name.begins_with("nether_brick")
+	if not nether_wood and (name.ends_with("_planks") or name.ends_with("_log") or name.ends_with("_leaves") or name.ends_with("_wool") or name.ends_with("_wood") or name == "bookshelf" or (name.ends_with("_carpet") and not name.ends_with("moss_carpet")) or name == "tnt" or name.ends_with("_fence") or name.ends_with("_cushion")):
 		p["flammable"] = true
 	if name in ["ice", "packed_ice", "frosted_ice"]:
 		p["friction"] = 0.98
@@ -269,6 +373,10 @@ static func get_props(name: String) -> Dictionary:
 			p["requires_tool"] = true
 	if name in ["cobweb"]:
 		p["requires_tool"] = true
+	# wiki hardness / harvest data per block id (the family rules above are only the fallback)
+	if BlockHardness.HARDNESS.has(name):
+		p["hardness"] = float(BlockHardness.HARDNESS[name])
+		p["requires_tool"] = BlockHardness.NEEDS_TOOL.has(name)
 	p["sound"] = sound_group(name)
 	if name.ends_with("_leaves") or name.contains("glass") or name in ["ice", "water", "cobweb", "frosted_ice", "slime_block", "honey_block"]:
 		p["opacity"] = 1 if (name.ends_with("_leaves") or name in ["water", "ice", "frosted_ice", "cobweb"]) else 0
@@ -292,7 +400,41 @@ static func is_known(name: String) -> bool:
 	return false
 
 
+## Sound type volume / pitch (Java SoundType; most are 1.0 / 1.0) - BlockSounds.VOLUME_PITCH when generated.
+static func sound_volume_pitch(group: String) -> Array:
+	var t = BlockSounds.VOLUME_PITCH.get(group, null)
+	return t if t is Array else [1.0, 1.0]
+
+
+## Java block sounds by kind: place / break at (volume + 1) / 2 and pitch x 0.8 (BlockItem.place, level event 2001),
+## mining hit at (volume + 1) / 8 and pitch x 0.5 (continueDestroyBlock), fall at volume x 0.5 and pitch x 0.75.
+static func play_block_sound(st: int, kind: String, at: Vector3, bus: String = "Blocks") -> void:
+	if st <= 0:
+		return
+	var g := str(Res.blocks.block_info[Res.blocks.st_block[st]]["sound"])
+	var vp := sound_volume_pitch(g)
+	var v := float(vp[0])
+	var pt := float(vp[1])
+	match kind:
+		"place", "break":
+			Audio.play(sound_event(g, kind), at, bus, (v + 1.0) / 2.0, pt * 0.8)
+		"hit":
+			Audio.play(sound_event(g, kind), at, bus, (v + 1.0) / 8.0, pt * 0.5)
+		"fall":
+			Audio.play(sound_event(g, kind), at, bus, v * 0.5, pt * 0.75)
+
+
+## Sound event of a block sound type ("break", "step", "place", "hit", "fall"); some types reuse other events.
+static func sound_event(group: String, kind: String) -> String:
+	var ev = BlockSounds.EVENTS.get(group, null)
+	if ev is Dictionary and (ev as Dictionary).has(kind):
+		return str(ev[kind])
+	return "block." + group + "." + kind
+
+
 static func sound_group(name: String) -> String:
+	if BlockSounds.TYPE.has(name):
+		return str(BlockSounds.TYPE[name])
 	if name.ends_with("_planks") or name.ends_with("_log") or name.ends_with("_wood") or name.contains("oak") or name.contains("spruce") or name.contains("birch") or name.contains("jungle") or name.contains("acacia") or name.contains("mangrove") or name.contains("crafting_table") or name.contains("bookshelf") or name.contains("chest") or name.contains("barrel") or name.contains("poplar"):
 		return "wood"
 	if name.contains("grass") or name.ends_with("_leaves") or name.contains("sapling") or name.contains("fern") or name.contains("flower") or name.contains("tulip") or name.contains("hay") or name.contains("vine") or name.contains("moss"):

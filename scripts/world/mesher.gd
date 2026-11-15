@@ -713,7 +713,7 @@ static func _emit_fluid(surf: Surf, blocks: BlockRegistry, pad: PackedInt32Array
 	var fflags := blocks.st_flags
 	var up_same := _same_fluid(fflags[pad[i + PL]], is_lava)
 	var dn := pad[i - PL]
-	var draw_down := not _same_fluid(fflags[dn], is_lava) and not ((blocks.st_cull[dn] >> 1) & 1)
+	var draw_down := not _same_fluid(fflags[dn], is_lava) and not ((blocks.st_cull[dn] >> 1) & 1) and not (blocks.st_cull[st] & 1)
 	var h := _cell_h(blocks, pad, i, is_lava)
 	var cnw := 1.0
 	var cne := 1.0
@@ -760,7 +760,15 @@ static func _emit_fluid(surf: Surf, blocks: BlockRegistry, pad: PackedInt32Array
 		cc.a = SHADE[1]
 		var cs := [cc, cc, cc, cc]
 		surf.quad(pts, uvc, cs, layer, -1.0, sks, bls, false)
+		# FluidState.shouldRenderBackwardUpFace: underside only under open water (a 3x3 cell above neither water nor opaque)
+		var back := false
 		if not is_lava:
+			for oz in range(-1, 2):
+				for ox in range(-1, 2):
+					var f2 := fflags[pad[i + PL + oz * PX + ox]]
+					if not _same_fluid(f2, false) and (f2 & BlockRegistry.F_OPAQUE) == 0:
+						back = true
+		if back:
 			surf.quad([pts[3], pts[2], pts[1], pts[0]], [uvc[3], uvc[2], uvc[1], uvc[0]], cs, layer, -1.0, sks, bls, false)
 	if draw_down:
 		var lt2 := _maxlight(plight[i - PL], plight[i])
@@ -779,6 +787,8 @@ static func _emit_fluid(surf: Surf, blocks: BlockRegistry, pad: PackedInt32Array
 		if _same_fluid(nf, is_lava):
 			continue
 		if (blocks.st_cull[nb] >> OPP[d]) & 1:
+			continue
+		if (blocks.st_cull[st] >> d) & 1:
 			continue
 		var p1: Vector3
 		var p2: Vector3

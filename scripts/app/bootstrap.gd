@@ -408,6 +408,45 @@ func _ready() -> void:
 				for i in 120:
 					await get_tree().process_frame
 				print("[ui] world started: %s, folder %s, spawn ready %s" % [str(world != null), world.folder if world != null else "-", str(world.spawn_ready) if world != null else "-"])
+				if OS.get_cmdline_user_args().has("--uislash") and world != null:
+					# dev: "/" key presses in the running game: US key (key + character in one event), a layout where Shift+7
+					# types "/", and the key and its character arriving as two events
+					for mode in ["us", "shift7", "split"]:
+						var evs: Array = []
+						var kd := InputEventKey.new()
+						kd.pressed = true
+						if mode == "shift7":
+							kd.keycode = KEY_SLASH
+							kd.physical_keycode = KEY_7
+							kd.key_label = KEY_7
+							kd.shift_pressed = true
+							kd.unicode = 47
+						else:
+							kd.keycode = KEY_SLASH
+							kd.physical_keycode = KEY_SLASH
+							kd.key_label = KEY_SLASH
+							kd.unicode = 0 if mode == "split" else 47
+						evs.append(kd)
+						if mode == "split":
+							var kc := InputEventKey.new()
+							kc.pressed = true
+							kc.unicode = 47
+							evs.append(kc)
+						var ku := InputEventKey.new()
+						ku.keycode = kd.keycode
+						ku.physical_keycode = kd.physical_keycode
+						ku.pressed = false
+						evs.append(ku)
+						for ev in evs:
+							Input.parse_input_event(ev)
+							await get_tree().process_frame
+						for i in 10:
+							await get_tree().process_frame
+						var scr = world.screen
+						print("[ui] %s / : screen %s, chat text \"%s\"" % [mode, scr.get_script().resource_path.get_file() if scr != null else "-", scr.edit.text if scr != null and scr.get("edit") != null else "-"])
+						world.close_screen()
+						for i in 5:
+							await get_tree().process_frame
 			DirAccess.make_dir_recursive_absolute("user://autoplay")
 			var img := get_viewport().get_texture().get_image()
 			if img != null:
@@ -441,6 +480,10 @@ func _autoplay() -> void:
 	if not opts.has("res"):
 		Settings.values["display_mode"] = "borderless"
 		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
+	if opts.has("structcheck"):   # --structcheck=1: record structure writes, report which ones the finished world lost
+		Features.struct_record = true
+	if opts.has("rd"):   # --rd=N: render distance for this run (in memory only)
+		Settings.values["render_distance"] = int(opts["rd"])
 	var folder := "autoplay_" + str(opts["gen"]) + "_" + str(opts["seed"])
 	if opts.has("fpsbench"):
 		# FPS benchmark: RD16 / SD12, uncapped (V-Sync off, no FPS cap, no background cap / focus pause), 1920x1080;

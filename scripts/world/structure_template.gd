@@ -23,7 +23,7 @@ var bs := PackedInt32Array()      # palette index per block
 var nbt: Dictionary = {}          # block index -> nbt Dictionary (block entities, jigsaws)
 var jigsaws: Array = []           # [{pos, front, top, name, target, pool, final_state, rollable, sel, place}]
 var full_cube := PackedByteArray()
-var ents: Array = []             # [Vector3 local pos, entity id, is_baby]
+var ents: Array = []             # [Vector3 local pos, entity id, is_baby, villager profession ("" = none given)]
 
 
 static func get_template(tid: String) -> StructureTemplate:
@@ -43,10 +43,12 @@ static func get_template(tid: String) -> StructureTemplate:
 
 ## Parsed templates are cached as native binary in the private asset cache (<cache>/<version>/templates/), keyed by
 ## the block-state registry size so a registry change invalidates them. Saves the GDScript NBT parse on later runs.
+## CACHE_FORMAT: bumped when the cached fields change (2: template villagers carry their profession).
+const CACHE_FORMAT := 2
 static func _load_cached(key: String) -> StructureTemplate:
 	var dir := AssetImporter.CACHE_ROOT.path_join(Res.version).path_join("templates")
 	var f := dir.path_join(key.replace("/", "__") + ".bin")
-	var fp := Res.blocks.st_block.size()
+	var fp := Res.blocks.st_block.size() + CACHE_FORMAT * 16777216
 	if FileAccess.file_exists(f):
 		var v = bytes_to_var(FileAccess.get_file_as_bytes(f))
 		if v is Dictionary and int(v.get("fp", -1)) == fp:
@@ -125,7 +127,10 @@ static func _load(key: String) -> StructureTemplate:
 		var enb: Dictionary = en.get("nbt", {})
 		var eid := str(enb.get("id", "")).trim_prefix("minecraft:")
 		if eid != "":
-			t.ents.append([Vector3(float(ep[0]), float(ep[1]), float(ep[2])), eid, int(enb.get("Age", 0)) < 0])
+			# village villagers come as unemployed / nitwit templates (VillagerData.profession)
+			var vd = enb.get("VillagerData", {})
+			var vprof := str((vd as Dictionary).get("profession", "")).trim_prefix("minecraft:") if vd is Dictionary else ""
+			t.ents.append([Vector3(float(ep[0]), float(ep[1]), float(ep[2])), eid, int(enb.get("Age", 0)) < 0, vprof])
 	# (y, x, z) order via native sorts of packed keys (sort_custom with a lambda was the template-load hot spot)
 	var all: Array = _sorted_yxz(full) + _sorted_yxz(other) + _sorted_yxz(withn)
 	var n_full := full.size()
@@ -190,6 +195,31 @@ static func transform_m(p: Vector3i, rot: int, mirror: int, pivot: Vector3i) -> 
 	elif mirror == 2:
 		p = Vector3i(p.x, p.y, -p.z)
 	return transform(p, rot, pivot)
+
+
+## Java StructureTemplate.transform(Vec3, Mirror, Rotation, pivot) for entity positions: a block spans [x, x + 1], so
+## mirroring and turning a continuous position adds 1 where Java does (a rotated cage keeps its allays inside).
+static func transform_vec(p: Vector3, rot: int, mirror: int, pivot: Vector3i) -> Vector3:
+	var d := p.x
+	var e := p.y
+	var f := p.z
+	var mirrored := true
+	if mirror == 2:
+		f = 1.0 - f
+	elif mirror == 1:
+		d = 1.0 - d
+	else:
+		mirrored = false
+	var i := float(pivot.x)
+	var j := float(pivot.z)
+	match rot:
+		3:
+			return Vector3(i - j + f, e, i + j + 1.0 - d)
+		1:
+			return Vector3(i + j + 1.0 - f, e, j - i + d)
+		2:
+			return Vector3(i + i + 1.0 - d, e, j + j + 1.0 - f)
+	return Vector3(d, e, f) if mirrored else p
 
 
 ## Java StructureTemplate.getBoundingBox(pos, rotation, pivot, mirror): [min, max] inclusive.
@@ -365,21 +395,15 @@ func place(f: Features, c: Features.FCtx, origin: Vector3i, rot: int, procs: Arr
 	# template entities (villagers, golems, animals): Java addEntitiesToWorld, clipped to the chunk
 	for en in (ents if entities else []):
 		var lp0: Vector3 = en[0]
-		var tp: Vector3
-		match rot:
-			1:
-				tp = Vector3(-lp0.z, lp0.y, lp0.x)
-			2:
-				tp = Vector3(-lp0.x, lp0.y, -lp0.z)
-			3:
-				tp = Vector3(lp0.z, lp0.y, -lp0.x)
-			_:
-				tp = lp0
+		var tp := transform_vec(lp0, rot, mirror, pivot)
 		var wpos := Vector3(origin) + tp
 		if gravity:
 			wpos.y = f.height(c, "WORLD_SURFACE_WG", int(floor(wpos.x)), int(floor(wpos.z))) + lp0.y
 		if wpos.x >= cmin.x and wpos.x < cmax.x + 1 and wpos.z >= cmin.z and wpos.z < cmax.z + 1:
-			c.entities.append({"k": "mob", "id": en[1], "p": [wpos.x, wpos.y, wpos.z], "b": -24000 if en[2] else 0})
+			var ed := {"k": "mob", "id": en[1], "p": [wpos.x, wpos.y, wpos.z], "b": -24000 if en[2] else 0}
+			if en.size() > 3 and str(en[3]) != "":
+				ed["vp"] = str(en[3])   # (EntityManager._deser: the villager's profession)
+			c.entities.append(ed)
 	var blocks := f.blocks
 	var pal: PackedInt32Array = palettes[clampi(palette_idx, 0, palettes.size() - 1)]
 	var jig := blocks.block_id("jigsaw")
@@ -529,9 +553,20 @@ static func _data_marker(f: Features, c: Features.FCtx, kind: String, name: Stri
 					c.entities.append({"k": "frame", "id": "item_frame", "p": [fp.x, fp.y, fp.z], "y": 0.0, "d": {"n": [nv.x, nv.y, nv.z], "rot": 0}, "s": ItemStack.named("elytra", 1).to_dict()})
 
 
+## Java StructureTemplate.placeInWorld: a placed block with block entity data that is a RandomizableContainer (chests,
+## barrels, shulker boxes, dispensers, droppers, hoppers, crafters, decorated pots) gets LootTableSeed = random.nextLong()
+## from the structure's per-chunk random - consumed even without a loot table, so later pieces' features (snow / ice
+## piles, hay) draw the same numbers as Java.
+static func _random_container(n: String) -> bool:
+	return (n.ends_with("chest") and n != "ender_chest") or n == "barrel" or n.ends_with("shulker_box") or n in ["dispenser", "dropper", "hopper", "crafter", "decorated_pot"]
+
+
 static func _block_entity(c: Features.FCtx, blocks: BlockRegistry, wp: Vector3i, st: int, data) -> void:
+	var seed := 0
+	if data is Dictionary and st > 0 and c.r != null and _random_container(blocks.name_of(st)):
+		seed = c.r.next_long()
 	if data is Dictionary and (data as Dictionary).has("LootTable"):
-		c.block_entities[wp] = {"id": blocks.name_of(st), "loot_table": str(data["LootTable"]).trim_prefix("minecraft:"), "loot_seed": int(data.get("LootTableSeed", 0))}
+		c.block_entities[wp] = {"id": blocks.name_of(st), "loot_table": str(data["LootTable"]).trim_prefix("minecraft:"), "loot_seed": seed if seed != 0 else int(data.get("LootTableSeed", 0))}
 	elif data is Dictionary and (data as Dictionary).has("normal_config"):
 		c.block_entities[wp] = {"id": "trial_spawner", "normal": str(data["normal_config"]), "ominous": str(data.get("ominous_config", ""))}
 	elif data is Dictionary and str(data.get("id", "")) == "minecraft:vault":

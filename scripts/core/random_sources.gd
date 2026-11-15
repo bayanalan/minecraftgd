@@ -128,6 +128,79 @@ class Xoroshiro:
 		return a + next_int_bound(b_inclusive - a + 1)
 
 
+
+## Java WorldgenRandom wrapping a XoroshiroRandomSource (ChunkGenerator.applyBiomeDecoration: feature and structure
+## piece placement): next(bits) = the TOP bits of the Xoroshiro output, (int)(nextLong() >>> 64 - bits); every other
+## call is java.util.Random's formula over next(bits) (BitRandomSource: nextInt(bound) power-of-two / rejection loop,
+## nextLong = next(32) << 32 + next(32), nextFloat = next(24), nextDouble = next(26) << 27 + next(27), nextBoolean =
+## next(1)). fork / forkPositional use the raw Xoroshiro longs. (Xoroshiro's own nextInt(bound) - Lemire on the low
+## 32 bits - is what XoroshiroRandomSource uses unwrapped: aquifers, surface rules, random ticks.)
+class WorldgenXoro extends Xoroshiro:
+	static func seeded(seed: int) -> Xoroshiro:
+		var x := Xoroshiro.from_seed(seed)
+		var w := WorldgenXoro.new(x.lo, x.hi)
+		return w
+
+	func _raw() -> int:
+		var l := lo
+		var m := hi
+		var s := l + m
+		var n: int = ((s << 17) | ((s >> 47) & 0x1FFFF)) + l
+		m ^= l
+		lo = ((l << 49) | ((l >> 15) & 0x1FFFFFFFFFFFF)) ^ m ^ (m << 21)
+		hi = (m << 28) | ((m >> 36) & 0xFFFFFFF)
+		return n
+
+	## next(bits) as a Java int (bits 32: signed)
+	func _next(bits: int) -> int:
+		var v := (_raw() >> (64 - bits)) & ((1 << bits) - 1)
+		if bits == 32 and v >= 0x80000000:
+			v -= 0x100000000
+		return v
+
+	func next_long() -> int:
+		var a := _next(32)
+		var b := _next(32)
+		return (a << 32) + b
+
+	func next_int() -> int:
+		return _next(32)
+
+	func next_bits(bits: int) -> int:
+		return _next(bits) & ((1 << bits) - 1)
+
+	func next_int_bound(bound: int) -> int:
+		if (bound & (bound - 1)) == 0:
+			return (bound * _next(31)) >> 31
+		var i := _next(31)
+		var j := i % bound
+		while i - j + (bound - 1) > 0x7FFFFFFF:
+			i = _next(31)
+			j = i % bound
+		return j
+
+	func next_double() -> float:
+		var a := _next(26)
+		var b := _next(27)
+		return float((a << 27) + b) * 1.1102230246251565e-16
+
+	func next_float() -> float:
+		return float(_next(24)) * 5.9604645e-8
+
+	func next_bool() -> bool:
+		return _next(1) != 0
+
+	func consume(n: int) -> void:
+		for i in n:
+			_next(32)
+
+	func fork_positional() -> XoroPositional:
+		var a := _raw()
+		var b := _raw()
+		return XoroPositional.new(a, b)
+
+
+
 class XoroPositional:
 	var lo: int
 	var hi: int

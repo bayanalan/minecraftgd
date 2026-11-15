@@ -7,8 +7,10 @@
 class_name BlockUpdates
 
 const MAX_PER_TICK := 2000
-static var queue: Dictionary = {}   # due tick -> Array[Vector3i]
+static var queue: Dictionary = {}   # due tick -> Array[Vector3i] (entries whose pending due differs are stale)
 static var pending: Dictionary = {} # Vector3i -> due (dedupe)
+static var by_chunk: Dictionary = {} # chunk key -> {Vector3i: true}: positions with a pending tick (saved with the chunk)
+static var _min_due := 1 << 62
 static var _rt_rng := RandomNumberGenerator.new()
 static var last_sched := 0
 static var last_random_us := 0
@@ -19,7 +21,22 @@ static var prof_n: Dictionary = {}
 
 static func reset() -> void:
 	queue.clear()
+	_release_pending = true   # (chunks held for the dropped updates: released on the next step_hits)
+	if Res.blocks != null:
+		_fluid_tables()   # (built at world start: ~30 ms over the registry, it was a hitch on the first fluid tick)
+	_gen_wait.clear()
+	_due.clear()
+	_due_t.clear()
+	_due_i = 0
+	_fdue.clear()
+	_fdue_t.clear()
+	_fdue_i = 0
+	_due_ck.clear()
+	_exec_tick = -1
+	_last_run_t = -1
 	pending.clear()
+	by_chunk.clear()
+	_min_due = 1 << 62
 	rtl_dirty = true
 	_rtb_active = false
 	_rtb_again = false
@@ -38,17 +55,163 @@ static func lava_delay(world) -> int:
 
 
 static func schedule(world, p: Vector3i, delay: int) -> void:
-	var due: int = world.game_time + maxi(1, delay)
-	if pending.has(p) and int(pending[p]) <= due:
+	# (a tick's updates sliced over later frames count their delays from their own tick: _exec_tick)
+	var due: int = (_exec_tick if _exec_tick >= 0 else int(world.game_time)) + maxi(1, delay)
+	var cur = pending.get(p)
+	if cur != null and int(cur) <= due:
 		return
 	pending[p] = due
+	var ck := Coords.chunk_key(p.x >> 4, p.z >> 4)
+	var bc = by_chunk.get(ck)
+	if bc == null:
+		bc = {}
+		by_chunk[ck] = bc
+	bc[p] = true
 	if not queue.has(due):
 		queue[due] = []
 	queue[due].append(p)
+	if due < _min_due:
+		_min_due = due
+
+
+static func _unindex(p: Vector3i) -> void:
+	var ck := Coords.chunk_key(p.x >> 4, p.z >> 4)
+	var bc = by_chunk.get(ck)
+	if bc != null:
+		bc.erase(p)
+		if bc.is_empty():
+			by_chunk.erase(ck)
+
+
+## Java ChunkAccess ticks container: the chunk's pending ticks as [x, y, z, delay]* (saved with it). drop: the chunk
+## unloads, its ticks leave the queue (LevelTicks keeps ticks only for loaded chunks; they resume when it loads).
+static func store_ticks(world, c: Chunk, drop: bool) -> void:
+	var ck := Coords.chunk_key(c.cx, c.cz)
+	if drop:
+		_gen_wait.erase(ck)   # (an unloading chunk stops waiting for its worldgen fluid ticks)
+	var bc = by_chunk.get(ck)
+	var out: Array = []
+	if bc != null:
+		for p in bc:
+			out.append([p.x, p.y, p.z, maxi(0, int(pending.get(p, world.game_time)) - world.game_time)])
+			if drop:
+				pending.erase(p)
+		if drop:
+			by_chunk.erase(ck)
+	# collected updates not run yet (step_hits slices) are due now: saved with delay 0, dropped from the run lists
+	if _due_ck.has(ck):
+		for i in range(_due_i, _due.size()):
+			var q: Vector3i = _due[i]
+			if q.y > -100000 and (q.x >> 4) == c.cx and (q.z >> 4) == c.cz:
+				out.append([q.x, q.y, q.z, 0])
+				if drop:
+					_due[i] = Vector3i(0, -100000, 0)   # (skipped: below the world)
+		for i in range(_fdue_i, _fdue.size()):
+			var q: Vector3i = _fdue[i]
+			if q.y > -100000 and (q.x >> 4) == c.cx and (q.z >> 4) == c.cz:
+				out.append([q.x, q.y, q.z, 0])
+				if drop:
+					_fdue[i] = Vector3i(0, -100000, 0)
+		if drop:
+			_due_ck.erase(ck)
+	c.scheduled = out
+	if not out.is_empty():
+		c.modified = true
+
+
+## Java worldgen fluid ticks: aquifer water where the aquifer status changes (NoiseBasedChunkGenerator / carvers mark
+## it for post-processing; LevelChunk.postProcessGeneration ticks it when the chunk becomes full) and SpringFeature's
+## scheduled tick make generated water / lava next to open space flow on load: waterfalls out of cliff springs,
+## cave aquifer edges, lava pools meeting water. Here: every generated fluid cell with air below or beside it (or the
+## other fluid next to it) gets a tick when its chunk is first decorated (native scan, one chunk per frame).
+static var _gen_q: Array = []
+static var _kinds := PackedByteArray()
+
+
+static var _gen_wait: Dictionary = {}   # chunk key -> Chunk: decorated, waiting for its 3 x 3 neighbours to decorate
+
+
+## A chunk that just decorated / loaded from disk may complete a waiting neighbour's 3 x 3 (event driven: no polling;
+## called from on_chunk_ready).
+static func _gen_wake(cx: int, cz: int) -> void:
+	for dz in range(-1, 2):
+		for dx in range(-1, 2):
+			var wk := Coords.chunk_key(cx + dx, cz + dz)
+			var wc = _gen_wait.get(wk)
+			if wc != null:
+				_gen_wait.erase(wk)
+				_gen_q.append(wc)
+
+
+static func gen_fluid_ticks(_world, c: Chunk) -> void:
+	if c.from_disk or c.gen_ticked:
+		return
+	c.gen_ticked = true
+	_gen_q.append(c)
+
+
+static func _gen_step(world) -> void:
+	# Java LevelChunk.postProcessGeneration runs when the chunk becomes FULL, i.e. after its 3 x 3 neighbourhood has
+	# finished its features: exposure is judged against decorated neighbours only. A neighbour that is still raw has
+	# cave air where its pool walls, moss and plants come later - water flowed into it and broke worldgen plants (lush
+	# caves dropped dripleaves, glow berries, azaleas while chunks loaded). Chunks still waiting go to the back.
+	var c: Chunk = _gen_q.pop_front()
+	if c == null or c.state == Chunk.EVICTED or not world.cm.chunks.has(Coords.chunk_key(c.cx, c.cz)):
+		return
+	if not _neighbours_decorated(world, c):
+		_gen_wait[Coords.chunk_key(c.cx, c.cz)] = c   # (woken by on_chunk_ready of a neighbour; dropped on unload)
+		if _gen_wait.size() > 4096:
+			_gen_wait.clear()   # (safety: far unloaded leftovers)
+		return
+	var blocks := Res.blocks
+	if _kinds.size() != blocks.total_states:
+		_kinds.resize(blocks.total_states)
+		for s in blocks.total_states:
+			var fl := blocks.st_flags[s]
+			var nm := blocks.name_of(s)
+			_kinds[s] = 1 if (s == 0 or nm == "air" or nm == "cave_air" or nm == "void_air") else (3 if (fl & BlockRegistry.F_LIQUID) and (fl & BlockRegistry.F_LAVA) else (2 if fl & (BlockRegistry.F_LIQUID | BlockRegistry.F_WATERLOGGED) else 0))
+	if not (Native.chunkops_ok and Native.inst != null and Native.inst.has_method("fluid_exposed")):
+		return
+	var nine: Array = []
+	nine.resize(9)
+	for dz in 3:
+		for dx in 3:
+			var nc: Chunk = world.cm.chunks.get(Coords.chunk_key(c.cx + dx - 1, c.cz + dz - 1))
+			if nc != null and nc.state >= Chunk.DATA_READY:
+				nine[dz * 3 + dx] = nc.sec_refs()
+	var pos: PackedInt32Array = Native.inst.fluid_exposed(nine, _kinds, c.cx, c.cz)[0]
+	var x0 := c.cx * 16
+	var z0 := c.cz * 16
+	# spread over 10 ticks: a chunk can expose hundreds of fluid cells (cave aquifers), and a tick's updates are shown
+	# together once they all ran (Java ticks them on the first tick; here the waterfalls start within half a second)
+	var gi := 0
+	for v in pos:
+		schedule(world, Vector3i(x0 + (v & 15), (v >> 8) - 64, z0 + ((v >> 4) & 15)), 1 + gi % 10)
+		gi += 1
+
+
+static func _neighbours_decorated(world, c: Chunk) -> bool:
+	for dz in range(-1, 2):
+		for dx in range(-1, 2):
+			var nc: Chunk = world.cm.chunks.get(Coords.chunk_key(c.cx + dx, c.cz + dz))
+			if nc == null or not nc.decorated:
+				return false
+	return true
+
+
+## A chunk loaded from a save: its stored ticks back into the queue.
+static func restore_ticks(world, c: Chunk) -> void:
+	for e in c.scheduled:
+		if e is Array and (e as Array).size() >= 4:
+			schedule(world, Vector3i(int(e[0]), int(e[1]), int(e[2])), int(e[3]))
+	c.scheduled = []
+
+
+const _NB_SCHED := [Vector3i(0, 1, 0), Vector3i(0, -1, 0), Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1), Vector3i.ZERO]
 
 
 static func schedule_neighbors(world, p: Vector3i) -> void:
-	for d in [Vector3i(0, 1, 0), Vector3i(0, -1, 0), Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1), Vector3i.ZERO]:
+	for d in _NB_SCHED:
 		var q: Vector3i = p + d
 		var st: int = world.state_at(q.x, q.y, q.z)
 		if st <= 0:
@@ -77,32 +240,330 @@ static func tick(world) -> void:
 	_random_ticks(world)
 
 
+## Java LevelTicks.tick: every tick due at or before now runs, oldest first (a tick whose game tick was skipped -
+## world not ready yet, a long frame - runs late instead of being lost; ticks were only taken from the exact current
+## tick and older ones were thrown away every 200 ticks, leaving flows standing until a block next to them changed).
+static var sched_peak_us := 0   # (probes) worst tick_scheduled time / count
+static var sched_peak_n := 0
+static var sched_calls := 0
+static var sched_total_us := 0
+static var sched_total_n := 0
+static var sched_first_us := 0
+
+
 static func tick_scheduled(world) -> void:
+	# the game: a tick's due updates run in budgeted slices over the frames that follow (step_hits) - a burst of fluid
+	# ticks (chunks loading next to cave water / lava) never lands in one frame. A rest of earlier ticks keeps running
+	# first (in tick order; each update schedules from its own tick: _exec_tick). Test worlds (no player) run them at once.
+	var defer: bool = world.get("player") != null
 	var t: int = world.game_time
 	var n := 0
-	if queue.has(t):
-		var lst: Array = queue[t]
-		queue.erase(t)
+	if _min_due > t:
+		last_sched = 0
+		return
+	var keys: Array = []
+	for k in queue:
+		if int(k) <= t:
+			keys.append(k)
+	keys.sort()
+	# Java: only chunks within the simulation distance tick; ticks elsewhere wait (checked again a second later)
+	var sim := int(Settings.get_v("simulation_distance"))
+	var pl = world.get("player")
+	if pl == null:
+		sim = 1 << 20   # (test worlds have no player)
+	var pcx := int(floor(pl.pos.x)) >> 4 if pl != null else 0
+	var pcz := int(floor(pl.pos.z)) >> 4 if pl != null else 0
+	for k in keys:
+		var lst: Array = queue[k]
+		queue.erase(k)
 		for p in lst:
+			if int(pending.get(p, -1)) != int(k):
+				continue   # stale: re-scheduled earlier (already ran) or its chunk unloaded
+			if maxi(absi((p.x >> 4) - pcx), absi((p.z >> 4) - pcz)) > sim:
+				pending.erase(p)
+				schedule(world, p, 20)
+				continue
 			pending.erase(p)
+			_unindex(p)
 			if n < MAX_PER_TICK:
-				_scheduled(world, p)
+				if defer:
+					_due_add(p, t, maxi(absi((p.x >> 4) - pcx), absi((p.z >> 4) - pcz)) <= NEAR_CHUNKS)
+				else:
+					_scheduled(world, p)
 				n += 1
 			else:
 				schedule(world, p, 1)
+	_min_due = 1 << 62
+	for k2 in queue:
+		_min_due = mini(_min_due, int(k2))
 	last_sched = n
-	# drop stale entries (e.g. after time jumps)
-	if queue.size() > 0 and t % 200 == 0:
-		for k in queue.keys():
-			if int(k) < t:
-				for p in queue[k]:
-					pending.erase(p)
-				queue.erase(k)
+
+
+## Collected due updates, in tick order: near the player (NEAR_CHUNKS) and farther away. Each frame's share runs the
+## near ones first (a backlog of far ticks - chunks streaming in with springs / aquifer water - never delays the flows
+## the player watches) and holds their block changes until their tick's updates all ran; far ones take the rest.
+const NEAR_CHUNKS := 3
+static var _due: Array = []
+static var _due_t := PackedInt64Array()   # the game tick each collected update belongs to
+static var _due_i := 0
+static var _fdue: Array = []
+static var _fdue_t := PackedInt64Array()
+static var _fdue_i := 0
+static var _due_ck: Dictionary = {}       # chunk key -> collected updates not run yet (store_ticks scans only those)
+## While an update runs, schedule() counts delays from its own tick: Java runs a tick's due updates inside that tick,
+## so a flow advances exactly every 5 ticks - counting from the frame's game_time made slices that spilled into the next
+## tick schedule their followers a tick late, and the flow front frayed into steps on consecutive ticks (measured:
+## changes on ticks 35, 36 and 37 of one step).
+static var _exec_tick := -1
+static var _last_run_t := -1   # tick of the last near update run (its block changes are held until that tick's all ran)
+static var _release_pending := false
+
+
+static func _due_add(p: Vector3i, t: int, near: bool) -> void:
+	if near:
+		_due.append(p)
+		_due_t.append(t)
+	else:
+		_fdue.append(p)
+		_fdue_t.append(t)
+	var ck := Coords.chunk_key(p.x >> 4, p.z >> 4)
+	_due_ck[ck] = int(_due_ck.get(ck, 0)) + 1
+
+
+static func _due_ran(p: Vector3i) -> void:
+	var ck := Coords.chunk_key(p.x >> 4, p.z >> 4)
+	var c := int(_due_ck.get(ck, 0)) - 1
+	if c > 0:
+		_due_ck[ck] = c
+	else:
+		_due_ck.erase(ck)
+
+
+static func due_count() -> int:
+	return (_due.size() - _due_i) + (_fdue.size() - _fdue_i)
+
+
+static func _run_due(world, n: int, budget_us: int = 1 << 40) -> void:
+	var t0 := Time.get_ticks_usec()
+	var done := 0
+	if _due_i < _due.size():
+		# block changes of a sliced tick are shown together when the tick's last update ran (ChunkManager holds their
+		# chunks' update work meanwhile): a step of a flow appears at once instead of in pieces over the frames
+		var cmh = world.cm if world.get("cm") is ChunkManager else null
+		if cmh != null:
+			cmh.hold_marks = true
+		while _due_i < _due.size() and done < n and (done == 0 or Time.get_ticks_usec() - t0 < budget_us):
+			var tt: int = _due_t[_due_i]
+			if tt != _last_run_t:
+				if _last_run_t >= 0 and cmh != null:
+					cmh.release_held()   # every update of the previous tick ran
+				_last_run_t = tt
+			_exec_tick = tt
+			var p: Vector3i = _due[_due_i]
+			_due_i += 1
+			done += 1
+			if p.y > -100000:
+				_due_ran(p)
+				_scheduled(world, p)
+		_exec_tick = -1
+		if cmh != null:
+			cmh.hold_marks = false
+		if _due_i >= _due.size():
+			_due.clear()
+			_due_t.clear()
+			_due_i = 0
+			_last_run_t = -1
+			if cmh != null:
+				cmh.release_held()
+		elif _due_i >= 4096:
+			_due = _due.slice(_due_i)   # (a long backlog: drop the part already run)
+			_due_t = _due_t.slice(_due_i)
+			_due_i = 0
+	while _fdue_i < _fdue.size() and done < n and (done == 0 or Time.get_ticks_usec() - t0 < budget_us):
+		_exec_tick = _fdue_t[_fdue_i]
+		var fp: Vector3i = _fdue[_fdue_i]
+		_fdue_i += 1
+		done += 1
+		if fp.y > -100000:
+			_due_ran(fp)
+			_scheduled(world, fp)
+	_exec_tick = -1
+	if _fdue_i >= _fdue.size():
+		_fdue.clear()
+		_fdue_t.clear()
+		_fdue_i = 0
+	elif _fdue_i >= 4096:
+		_fdue = _fdue.slice(_fdue_i)
+		_fdue_t = _fdue_t.slice(_fdue_i)
+		_fdue_i = 0
+	var dt := Time.get_ticks_usec() - t0
+	sched_calls += 1
+	sched_total_us += dt
+	sched_total_n += done
+	if dt > sched_peak_us:
+		sched_peak_us = dt
+		sched_peak_n = done
 
 
 ## Random-tick sampling of the tick (handlers run spread over the following frames: step_hits).
 static func tick_random(world) -> void:
 	_random_ticks(world)
+	tick_precipitation(world)
+
+
+## Java ServerLevel.tickChunk weather column: per ticking chunk, randomTickSpeed rolls of 1 in 48 (the wiki's 1/16 per
+## chunk tick at the default speed 3), each picking a random column for tickPrecipitation. Hits are drawn directly
+## (geometric gaps over all rolls of the simulation area) instead of rolling every chunk.
+static var _pr_rng := RandomNumberGenerator.new()
+static var pr_stats := PackedInt32Array([0, 0, 0, 0])   # (probes) calls, columns, snow placed, ice placed
+
+
+static func tick_precipitation(world) -> void:
+	pr_stats[0] += 1
+	if world.dimension != "overworld":
+		return
+	var speed := int(world.gamerule("randomTickSpeed", 3))
+	var pl = world.get("player")
+	if speed <= 0 or pl == null:
+		return
+	var sim := int(Settings.get_v("simulation_distance"))
+	var side := sim * 2 + 1
+	var total := side * side * speed
+	var lq := log(1.0 - 1.0 / 48.0)
+	var pcx := int(floor(pl.pos.x)) >> 4
+	var pcz := int(floor(pl.pos.z)) >> 4
+	var i := int(log(1.0 - _pr_rng.randf()) / lq)
+	while i < total:
+		var cell := i / speed
+		var cx := pcx - sim + cell % side
+		var cz := pcz - sim + cell / side
+		var c: Chunk = world.cm.get_chunk(cx, cz)
+		if c != null and c.state >= Chunk.DECORATED and c.state != Chunk.EVICTED:
+			pr_stats[1] += 1
+			_precip_column(world, c, cx * 16 + _pr_rng.randi_range(0, 15), cz * 16 + _pr_rng.randi_range(0, 15))
+		i += 1 + int(log(1.0 - _pr_rng.randf()) / lq)
+
+
+## Java ServerLevel.tickPrecipitation at the MOTION_BLOCKING top of a column: still water at the edge of a cold area
+## freezes (any weather); while it rains, snow falls on cold ground (adding layers up to snowAccumulationHeight) and
+## the block below gets Block.handlePrecipitation (cauldrons: rain 5 %, snow 10 % per hit).
+static var _pblock := PackedByteArray()   # per state: 1 = stops the precipitation column search (fluid, or collides and not snow)
+
+
+static func _precip_column(world, c: Chunk, x: int, z: int) -> void:
+	var blocks := Res.blocks
+	var snow_id := blocks.block_id("snow")
+	if _pblock.size() != blocks.total_states:
+		var fl: PackedInt32Array = blocks.st_flags
+		_pblock.resize(blocks.total_states)
+		for s0 in range(1, blocks.total_states):
+			_pblock[s0] = 1 if (fl[s0] & BlockRegistry.F_LIQUID) != 0 or ((fl[s0] & BlockRegistry.F_COLLIDE) != 0 and blocks.st_block[s0] != snow_id) else 0
+	var pb := _pblock
+	# the topmost fluid / colliding non-snow block of the column, read straight from the section palettes
+	var y := Coords.MIN_Y - 1
+	var col := ((z & 15) << 4) | (x & 15)
+	for s in range(Coords.SECTIONS - 1, -1, -1):
+		var sec: Chunk.Section = c.sections[s]
+		var pal := sec.pal
+		if pal.size() == 1:
+			if pb[pal[0]] != 0:
+				y = Coords.MIN_Y + s * 16 + 15
+				break
+			continue
+		var wide := sec.wide
+		var idx := sec.idx
+		var found := -1
+		for ly in range(15, -1, -1):
+			var vi := (ly << 8) | col
+			if pb[pal[wide[vi]] if wide.size() > 0 else pal[idx[vi]]] != 0:
+				found = ly
+				break
+		if found >= 0:
+			y = Coords.MIN_Y + s * 16 + found
+			break
+	var top := y + 1   # blockpos (MOTION_BLOCKING height); y = blockpos.below()
+	if top >= Coords.MAX_Y:
+		return
+	var bio := c.biome_at(x & 15, top, z & 15)
+	if bio < 0:
+		return
+	var cold_top := _temperature(world, bio, top) < 0.15
+	var cold_below := _temperature(world, bio, y) < 0.15
+	# Biome.shouldFreeze(pos below, mustBeAtEdge): a water source block, block light < 10, not surrounded by water
+	if cold_below and y >= Coords.MIN_Y and (c.get_light(x & 15, y, z & 15) & 15) < 10:
+		var bst := c.get_block(x & 15, y, z & 15)
+		if blocks.name_of(bst) == "water" and int(blocks.st_level[bst]) == 0:
+			var edge := false
+			for d in [Vector2i(-1, 0), Vector2i(1, 0), Vector2i(0, -1), Vector2i(0, 1)]:
+				if not _is_water(world.state_at(x + d.x, y, z + d.y)):
+					edge = true
+					break
+			if edge:
+				world.set_block(x, y, z, blocks.default_state("ice"))
+				pr_stats[3] += 1
+	if not world.raining:
+		return
+	var has_precip: bool = world.biomes.precipitation[bio] != 0
+	# Biome.shouldSnow(blockpos): cold, block light < 10, air or snow there, and snow could stay (SnowLayerBlock.canSurvive)
+	var maxh := int(world.gamerule("snowAccumulationHeight", 1))
+	if maxh > 0 and has_precip and cold_top and (c.get_light(x & 15, top, z & 15) & 15) < 10:
+		var cur := c.get_block(x & 15, top, z & 15)
+		if (cur == 0 or blocks.st_block[cur] == snow_id) and _snow_survives(world, x, top, z):
+			if cur != 0 and blocks.st_block[cur] == snow_id:
+				var layers := int(blocks.get_prop(cur, "layers"))
+				if layers < mini(maxh, 8):
+					world.set_block(x, top, z, blocks.with_prop(cur, "layers", str(layers + 1)))
+			else:
+				world.set_block(x, top, z, blocks.default_state("snow"))
+				pr_stats[2] += 1
+	# Block.handlePrecipitation on the block below (Biome.getPrecipitationAt there)
+	if has_precip and y >= Coords.MIN_Y:
+		var bst2 := c.get_block(x & 15, y, z & 15)
+		var bn := blocks.name_of(bst2)
+		var snowing := cold_below
+		if bn == "cauldron":
+			if _pr_rng.randf() < (0.1 if snowing else 0.05):
+				world.set_block(x, y, z, blocks.default_state("powder_snow_cauldron" if snowing else "water_cauldron"))
+		elif (bn == "water_cauldron" and not snowing) or (bn == "powder_snow_cauldron" and snowing):
+			var lv := int(blocks.get_prop(bst2, "level"))
+			if lv != 3 and _pr_rng.randf() < (0.1 if snowing else 0.05):
+				world.set_block(x, y, z, blocks.with_prop(bst2, "level", str(lv + 1)))
+
+
+## Biome.getTemperature(pos) (height-adjusted above sea level + 17).
+static func _temperature(world, bio: int, y: int) -> float:
+	var gen = world.gen
+	if gen != null and gen.has_method("biome_temperature_at"):
+		return gen.biome_temperature_at(bio, 0, y, 0)
+	var t: float = world.biomes.temperature[bio]
+	if y > 80:
+		t -= float(y - 80) * 0.05 / 40.0
+	return t
+
+
+## Level.isWaterAt: the fluid there is water (source, flowing or waterlogged).
+static func _is_water(st: int) -> bool:
+	if st <= 0:
+		return false
+	var b := Res.blocks
+	return b.name_of(st) == "water" or b.name_of(st) == "bubble_column" or (b.has_prop(st, "waterlogged") and b.get_prop(st, "waterlogged") == "true")
+
+
+## SnowLayerBlock.canSurvive: not on #cannot_support_snow_layer (ice, packed ice, barrier); always on
+## #support_override_snow_layer (honey block, soul sand, mud); else a full top face or a full snow stack.
+static func _snow_survives(world, x: int, y: int, z: int) -> bool:
+	var below: int = world.state_at(x, y - 1, z)
+	if below <= 0:
+		return false
+	var b := Res.blocks
+	var bn := b.name_of(below)
+	if bn in ["ice", "packed_ice", "barrier"]:
+		return false
+	if bn in ["honey_block", "soul_sand", "mud"]:
+		return true
+	if bn == "snow":
+		return int(b.get_prop(below, "layers")) == 8
+	return ((b.st_cull[below] >> 1) & 1) == 1   # full top face
 
 
 static func _scheduled(world, p: Vector3i) -> void:
@@ -118,6 +579,8 @@ static func _scheduled(world, p: Vector3i) -> void:
 	if fl & BlockRegistry.F_WATERLOGGED:
 		_spread_java(world, p, st, false)   # a waterlogged block spreads as a water source
 	if fl & BlockRegistry.F_GRAVITY and name != "scaffolding" and name != "pointed_dripstone":
+		if name.ends_with("_concrete_powder") and Growth.concrete_check(world, p, st):
+			return   # (wiki Concrete Powder: a block update next to water)
 		var below: int = world.state_at(p.x, p.y - 1, p.z)
 		if below == 0 or (below > 0 and (blocks.st_flags[below] & (BlockRegistry.F_REPLACEABLE | BlockRegistry.F_LIQUID))):
 			world.set_block(p.x, p.y, p.z, 0)
@@ -135,7 +598,7 @@ static func _scheduled(world, p: Vector3i) -> void:
 	if name.ends_with("_button") and blocks.get_prop(st, "powered") == "true":
 		world.set_block(p.x, p.y, p.z, blocks.with_prop(st, "powered", "false"))
 		Redstone.on_changed(world, p)
-		Audio.play("block.stone_button.click_off", Vector3(p), "Blocks")
+		Audio.play("block.%s_button.click_off" % Sensors.set_type(name), Vector3(p) + Vector3(0.5, 0.5, 0.5), "Blocks")
 		return
 	if not _has_support(world, p, st):
 		world.set_block(p.x, p.y, p.z, 0)
@@ -145,6 +608,45 @@ static func _scheduled(world, p: Vector3i) -> void:
 		schedule_neighbors(world, p)
 
 
+## The block tag a plant's mayPlaceOn reads in 26.3 (data/minecraft/tags/block/supports_*), "" when the plant is not
+## covered here ("#cactus_flower" / "#sturdy": code rules).
+static var _sup_cache: Dictionary = {}
+
+
+static func _support_tag(name: String) -> String:
+	var c = _sup_cache.get(name)
+	if c != null:
+		return c
+	var t := ""
+	if name == "cactus_flower":
+		t = "#cactus_flower"
+	elif name == "leaf_litter":
+		t = "#sturdy"
+	elif name == "wither_rose":
+		t = "supports_wither_rose"
+	elif name in ["dead_bush", "short_dry_grass", "tall_dry_grass"]:
+		t = "supports_dry_vegetation"
+	elif name in ["azalea", "flowering_azalea"]:
+		t = "supports_azalea"
+	elif name in ["big_dripleaf", "big_dripleaf_stem", "small_dripleaf"]:
+		t = "#dripleaf"
+	elif name in ["mangrove_propagule", "spore_blossom", "chorus_flower", "chorus_plant"]:
+		t = ""   # (own rules: hanging propagules, ceiling blossoms, chorus on end stone)
+	elif name in ["wheat", "carrots", "potatoes", "beetroots", "torchflower_crop", "pitcher_crop"]:
+		t = "supports_crops"
+	elif name in ["melon_stem", "pumpkin_stem", "attached_melon_stem", "attached_pumpkin_stem"]:
+		t = "supports_stem_crops"
+	elif name == "nether_wart":
+		t = "supports_nether_wart"
+	elif name in ["crimson_roots", "warped_roots", "crimson_fungus", "warped_fungus", "nether_sprouts"]:
+		t = "supports_" + name
+	elif name in ["short_grass", "fern", "tall_grass", "large_fern", "sweet_berry_bush", "bush", "firefly_bush", "pink_petals", "wildflowers"] \
+			or name.ends_with("_sapling") and name != "bamboo_sapling" or Tags.has_block("small_flowers", name) or Tags.has_block("flowers", name) and name != "cactus_flower" and name != "flowering_azalea" and not name.ends_with("_leaves"):
+		t = "supports_vegetation"
+	_sup_cache[name] = t
+	return t
+
+
 static func _has_support(world, p: Vector3i, st: int) -> bool:
 	var blocks := Res.blocks
 	var name := blocks.name_of(st)
@@ -152,19 +654,52 @@ static func _has_support(world, p: Vector3i, st: int) -> bool:
 	if below < 0:
 		return true
 	var bname := blocks.name_of(maxi(below, 0))
+	if Res.mode == "vanilla":
+		var sup := _support_tag(name)
+		if sup == "#dripleaf":
+			return _dripleaf_support(world, p, st, name, below, bname)
+		if sup != "":
+			# 26.3 data-driven mayPlaceOn tags; the upper half of a tall plant stands on its lower half
+			if blocks.has_prop(st, "half") and blocks.get_prop(st, "half") == "upper":
+				return below > 0 and blocks.st_block[below] == blocks.st_block[st]
+			if sup == "#cactus_flower":
+				# Java CactusFlowerBlock.mayPlaceOn: #support_override_cactus_flower or a sturdy centre on top
+				return below > 0 and (Tags.has_block("support_override_cactus_flower", bname) or (blocks.st_flags[below] & BlockRegistry.F_FULL_SHAPE) != 0)
+			if sup == "#sturdy":
+				return below > 0 and (blocks.st_flags[below] & (BlockRegistry.F_FULL_SHAPE | BlockRegistry.F_COLLIDE)) == (BlockRegistry.F_FULL_SHAPE | BlockRegistry.F_COLLIDE)
+			return below > 0 and Tags.has_block(sup, bname)
 	if name in ["short_grass", "fern", "dandelion", "poppy", "tall_grass", "large_fern", "dead_bush", "sweet_berry_bush"] or name.ends_with("_tulip") or name.ends_with("_sapling") or name in ["allium", "azure_bluet", "oxeye_daisy", "cornflower", "lily_of_the_valley", "blue_orchid"]:
 		return below > 0 and (bname in ["grass_block", "dirt", "podzol", "coarse_dirt", "farmland", "moss_block", "mud", "rooted_dirt", "mycelium", "sand", "red_sand", "terracotta"] or bname == name and blocks.has_prop(st, "half"))
 	if name in ["crimson_roots", "warped_roots", "nether_sprouts", "crimson_fungus", "warped_fungus"]:
 		# Java RootsBlock / NetherSproutsBlock / FungusBlock.mayPlaceOn: #nylium, soul soil, #dirt (mycelium), farmland
 		return below > 0 and bname in ["crimson_nylium", "warped_nylium", "soul_soil", "grass_block", "dirt", "podzol", "coarse_dirt", "farmland", "moss_block", "mud", "rooted_dirt", "mycelium", "muddy_mangrove_roots", "pale_moss_block"]
-	if name in ["wheat", "carrots", "potatoes", "beetroots"] or name.ends_with("_stem"):
-		return bname == "farmland"
+	if name in ["wheat", "carrots", "potatoes", "beetroots", "melon_stem", "pumpkin_stem", "attached_melon_stem", "attached_pumpkin_stem"]:
+		return bname == "farmland"   # (only these: big_dripleaf_stem / mushroom_stem / crimson_stem used to match "_stem")
 	if name == "torch" or name == "redstone_torch" or name == "soul_torch" or name.ends_with("_carpet") or name.ends_with("_pressure_plate") or name == "redstone_wire" or name.ends_with("rail") or name == "snow":
 		return below > 0 and (blocks.st_flags[below] & BlockRegistry.F_COLLIDE) != 0
 	if name == "sugar_cane":
-		return bname == "sugar_cane" or bname in ["grass_block", "dirt", "sand", "red_sand", "podzol"]
+		# wiki Sugar Cane: on sugar cane, or on grass / dirt / podzol / mycelium / sand / moss / mud (26.3 #supports_sugar_cane)
+		# whose side touches water, a waterlogged block or frosted ice (#supports_sugar_cane_adjacently) - not above / diagonal
+		if bname == "sugar_cane":
+			return true
+		var scs := Tags.blocks("supports_sugar_cane")
+		if below <= 0 or not (scs.has(bname) if not scs.is_empty() else bname in ["grass_block", "dirt", "coarse_dirt", "rooted_dirt", "podzol", "mycelium", "sand", "red_sand", "suspicious_sand", "moss_block", "pale_moss_block", "mud", "muddy_mangrove_roots"]):
+			return false
+		for d in HDIRS:
+			var ws: int = world.state_at(p.x + d.x, p.y - 1, p.z + d.z)
+			if ws < 0 or _same_fluid(ws, false) or (ws > 0 and (blocks.name_of(ws) == "frosted_ice" or Tags.has_block("supports_sugar_cane_adjacently", blocks.name_of(ws)))):
+				return true
+		return false
 	if name == "cactus":
-		return bname == "cactus" or bname == "sand" or bname == "red_sand"
+		# wiki Cactus: breaks with a legacy-solid block or lava beside it, or water / lava above; stands on cactus or #sand
+		for d2 in HDIRS:
+			var ss: int = world.state_at(p.x + d2.x, p.y, p.z + d2.z)
+			if ss > 0 and (blocks.st_flags[ss] & (BlockRegistry.F_SOLID | BlockRegistry.F_LAVA)) != 0:
+				return false
+		var cup: int = world.state_at(p.x, p.y + 1, p.z)
+		if cup > 0 and (blocks.st_flags[cup] & BlockRegistry.F_LIQUID) != 0:
+			return false
+		return bname == "cactus" or bname == "sand" or bname == "red_sand" or bname == "suspicious_sand"
 	if name.ends_with("_wall_torch") or name.ends_with("_wall_sign") or name == "ladder" or (name.ends_with("_button") and blocks.get_prop(st, "face") == "wall"):
 		var f := blocks.get_prop(st, "facing")
 		var off := {"north": Vector3i(0, 0, 1), "south": Vector3i(0, 0, -1), "west": Vector3i(1, 0, 0), "east": Vector3i(-1, 0, 0)}.get(f, Vector3i.ZERO)
@@ -176,6 +711,26 @@ static func _has_support(world, p: Vector3i, st: int) -> bool:
 	if name.ends_with("_cushion"):
 		return below > 0 and (blocks.st_cull[below] >> 1) & 1 == 1
 	return true
+
+
+## Dripleaves (wiki Big Dripleaf / Small Dripleaf, 26.3 #supports_big_dripleaf / #supports_small_dripleaf): a big
+## dripleaf stands on its stem or a support block; a stem needs a stem or support below and a stem or the leaf above
+## (breaking any part collapses the plant); a small dripleaf stands on clay / moss, or underwater (waterlogged) on the
+## big dripleaf supports; its upper half on the lower half.
+static func _dripleaf_support(world, p: Vector3i, st: int, name: String, below: int, bname: String) -> bool:
+	var blocks := Res.blocks
+	if name == "small_dripleaf":
+		if blocks.get_prop(st, "half") == "upper":
+			return below > 0 and bname == "small_dripleaf"
+		return below > 0 and (Tags.has_block("supports_small_dripleaf", bname) or (blocks.get_prop(st, "waterlogged") == "true" and Tags.has_block("supports_big_dripleaf", bname)))
+	var ok_below := below > 0 and (bname == "big_dripleaf_stem" or (name == "big_dripleaf" and bname == "big_dripleaf") or Tags.has_block("supports_big_dripleaf", bname))
+	if not ok_below or name == "big_dripleaf":
+		return ok_below
+	var above: int = world.state_at(p.x, p.y + 1, p.z)
+	if above < 0:
+		return true
+	var an := blocks.name_of(maxi(above, 0))
+	return above > 0 and (an == "big_dripleaf_stem" or an == "big_dripleaf")
 
 
 # ---------------------------------------------------------------- fluids
@@ -228,87 +783,592 @@ static func _falling(st: int) -> bool:
 	return st > 0 and (Res.blocks.st_flags[st] & BlockRegistry.F_LIQUID) != 0 and Res.blocks.st_level[st] >= 8
 
 
-## FlowingFluid.canHoldAnyFluid: liquid containers (waterloggable blocks) and non-motion-blocking blocks except doors,
-## signs, ladders, sugar cane, bubble columns, portals, gateways, structure voids.
-static func _can_hold(st: int, _lava: bool) -> bool:
-	if st == 0:
-		return true
+## Per-state fluid tables (built once per registry; the flow code is hot): canHoldAnyFluid / canHoldSpecificFluid
+## classes and the collision faces for canPassThroughWall. Read through string property lookups and face-mask
+## dictionaries a scheduled fluid update cost ~370 us (a flow step of ~40 updates ~15 ms, sliced over the tick's frames
+## and spilling into the next tick).
+const FK_HOLD := 1     # FlowingFluid.canHoldAnyFluid
+const FK_TAKES := 2    # a dry waterloggable block: takes a water source (SimpleWaterloggedBlock.canPlaceLiquid)
+const FK_FULL := 4     # a liquid container that takes nothing (waterlogged, double slab, kelp / seagrass / bubble column)
+const FK_W := 8        # its fluid is water (water block, waterlogged, kelp / seagrass / bubble column)
+const FK_L := 16       # lava block
+const FK_SRC := 32     # its fluid is a source (level 0, or waterlogged)
+static var _fk := PackedByteArray()
+static var _famt := PackedByteArray()      # fluid amount (FluidState.getAmount): 8 source / falling, 8 - level flowing
+static var _ffaces := PackedInt32Array()   # bits 0-5: face fully covered by the collision shape, 6-11: face touched at all
+static var _flowst := PackedInt32Array()   # FlowingFluid.getFlowing states: (lava ? 9 : 0) + (falling ? 8 : amount - 1)
+static var _fsolid := PackedByteArray()    # BlockState.isSolid (source conversion over solid ground)
+
+
+static func _fluid_tables() -> void:
 	var b := Res.blocks
-	if b.has_prop(st, "waterlogged"):
-		return true   # LiquidBlockContainer
-	var fl := b.st_flags[st]
-	if fl & BlockRegistry.F_LIQUID:
-		return true
-	if fl & BlockRegistry.F_COLLIDE:
-		return false   # blocksMotion
-	var nm := b.name_of(st)
-	if nm.ends_with("_door") or nm == "ladder" or nm.ends_with("_sign") or nm == "sugar_cane" or nm == "bubble_column" or nm == "nether_portal" or nm == "end_portal" or nm == "end_gateway" or nm == "structure_void":
-		return false
-	return true
+	if _fk.size() == b.total_states:
+		return
+	var n := b.total_states
+	_fk.resize(n)
+	_famt.resize(n)
+	_ffaces.resize(n)
+	_fsolid.resize(n)
+	_flowst.resize(18)
+	for fi in 18:
+		var lv: int = 8 if fi % 9 == 8 else 8 - (fi % 9 + 1)
+		_flowst[fi] = b.with_prop(b.LAVA if fi >= 9 else b.WATER, "level", str(lv))
+	var by_shape := {}
+	for st in n:
+		var k := 0
+		var fl := b.st_flags[st]
+		_fsolid[st] = 1 if (fl & BlockRegistry.F_SOLID) != 0 else 0
+		_famt[st] = 0
+		if st > 0 and (fl & BlockRegistry.F_LIQUID) != 0:
+			var lv2: int = b.st_level[st]
+			_famt[st] = 8 if lv2 == 0 or lv2 >= 8 else 8 - lv2
+			k |= (FK_L if fl & BlockRegistry.F_LAVA else FK_W) | (FK_SRC if lv2 == 0 else 0)
+		elif st > 0 and (fl & BlockRegistry.F_WATERLOGGED) != 0:
+			_famt[st] = 8
+			k |= FK_W | FK_SRC
+		if st == 0 or (fl & BlockRegistry.F_AIR) != 0:
+			k |= FK_HOLD
+		elif b.has_prop(st, "waterlogged"):
+			k |= FK_HOLD   # LiquidBlockContainer
+			var dbl := b.name_of(st).ends_with("_slab") and b.get_prop(st, "type") == "double"   # (SlabBlock.canPlaceLiquid)
+			k |= FK_TAKES if b.get_prop(st, "waterlogged") == "false" and not dbl else FK_FULL
+		elif fl & BlockRegistry.F_WATERLOGGED:
+			# kelp / seagrass (KelpBlock, SeagrassBlock.canPlaceLiquid: false - lava doesn't flow into them); bubble columns
+			# hold no fluid at all (canHoldAnyFluid)
+			k |= FK_FULL | (0 if b.name_of(st) == "bubble_column" else FK_HOLD)
+		elif fl & BlockRegistry.F_LIQUID:
+			k |= FK_HOLD
+		else:
+			# not BlockState.blocksMotion = isSolid (the collision-bounds rule, F_SOLID), never for cobwebs / bamboo
+			# saplings. The wiki's fluid notes override it: banners and pressure plates keep water and lava out (Banner:
+			# "water and lava flow around banners"; Pressure Plate: "cannot be broken by water and lava"), snow layers and
+			# end rods wash away (Water: plants, snow, torches, carpets, redstone dust / components, cobweb, end rods,
+			# heads and flower pots); every other solid-or-not answer is the bounds rule (the wiki lists no more)
+			var nm := b.name_of(st)
+			var solid := (fl & BlockRegistry.F_SOLID) != 0
+			if nm == "cobweb" or nm == "bamboo_sapling" or nm == "snow" or nm == "end_rod":
+				solid = false
+			elif nm.ends_with("_banner") or nm.ends_with("pressure_plate"):
+				solid = true
+			if not solid and not (nm.ends_with("_door") or nm == "ladder" or nm.ends_with("_sign") or nm == "sugar_cane" or nm == "nether_portal" or nm == "end_portal" or nm == "end_gateway" or nm == "structure_void"):
+				k |= FK_HOLD
+		_fk[st] = k
+		var si: int = b.st_shape[st]
+		var f = by_shape.get(si)
+		if f == null:
+			var bits := 0
+			for face in 6:
+				var m := _face_mask(st, face)
+				if m[0] == -1 and m[1] == -1 and m[2] == -1 and m[3] == -1:
+					bits |= 1 << face
+				if m[0] != 0 or m[1] != 0 or m[2] != 0 or m[3] != 0:
+					bits |= 1 << (6 + face)
+			f = bits
+			by_shape[si] = bits
+		_ffaces[st] = 0 if st == 0 else int(f)
+
+
+## FlowingFluid.canHoldAnyFluid: liquid containers (waterloggable blocks) and non-motion-blocking (not solid) blocks
+## except doors, signs, ladders, sugar cane, bubble columns, portals, gateways, structure voids - a flow into one of
+## those destroys it (water drops it, lava fizzes: _spread_to).
+static func _can_hold(st: int, _lava: bool) -> bool:
+	if _fk.is_empty():
+		_fluid_tables()
+	return st >= 0 and (_fk[st] & FK_HOLD) != 0
 
 
 ## FlowingFluid.canHoldSpecificFluid for the fluid about to go there: a waterloggable block takes only a water SOURCE
 ## (SimpleWaterloggedBlock.canPlaceLiquid: fluid == Fluids.WATER) - flowing water passes stairs / fences / slabs by.
 static func _can_hold_specific(st: int, lava: bool, source: bool) -> bool:
-	if st > 0 and Res.blocks.has_prop(st, "waterlogged"):
-		return not lava and source and Res.blocks.get_prop(st, "waterlogged") == "false"
-	return _can_hold(st, lava)
+	if st < 0:
+		return false
+	var k := _fk[st]
+	if k & FK_TAKES:
+		return source and not lava
+	if k & FK_FULL:
+		return false
+	return (k & FK_HOLD) != 0
 
 
-## FlowingFluid.canPassThroughWall, simplified: a full collision cube on either side blocks the face.
-static func _wall_ok(st: int) -> bool:
-	return st <= 0 or (Res.blocks.st_flags[st] & (BlockRegistry.F_FULL_SHAPE | BlockRegistry.F_COLLIDE)) != (BlockRegistry.F_FULL_SHAPE | BlockRegistry.F_COLLIDE)
+## Faces: 0 down, 1 up, 2 north, 3 south, 4 west, 5 east. HDIRS order N, E, S, W -> faces 2, 5, 3, 4; the opposite
+## horizontal index is k ^ 2.
+const HFACE := [2, 5, 3, 4]
+static var _fmask: Dictionary = {}   # collision shape index * 6 + face -> PackedInt64Array(4): 16 x 16 face coverage
+static var _no_mask := PackedInt64Array([0, 0, 0, 0])
+
+
+## The 1/16 cells of one face plane of a state's collision shape covered by its boxes touching that face
+## (VoxelShape.getFaceShape), as 4 x 64 bits (4 rows of 16 per word).
+static func _face_mask(st: int, face: int) -> PackedInt64Array:
+	if st <= 0:
+		return _no_mask
+	var si: int = Res.blocks.st_shape[st]
+	var key := si * 6 + face
+	var m = _fmask.get(key)
+	if m != null:
+		return m
+	var out := PackedInt64Array([0, 0, 0, 0])
+	var boxes: PackedFloat32Array = Res.blocks.shapes[si]
+	var ai: int = [1, 2, 0][face >> 1]   # component of the face normal (y, z, x)
+	var ui: int = [0, 0, 2][face >> 1]
+	var vi: int = [2, 1, 1][face >> 1]
+	var pos := (face & 1) == 1
+	for i in range(0, boxes.size(), 6):
+		var mn := Vector3(boxes[i], boxes[i + 1], boxes[i + 2])
+		var mx := Vector3(boxes[i + 3], boxes[i + 4], boxes[i + 5])
+		if (pos and mx[ai] < 1.0 - 1e-5) or (not pos and mn[ai] > 1e-5):
+			continue
+		var u0 := clampi(int(floor(mn[ui] * 16.0 + 0.001)), 0, 16)
+		var u1 := clampi(int(ceil(mx[ui] * 16.0 - 0.001)), 0, 16)
+		var v0 := clampi(int(floor(mn[vi] * 16.0 + 0.001)), 0, 16)
+		var v1 := clampi(int(ceil(mx[vi] * 16.0 - 0.001)), 0, 16)
+		if u1 <= u0 or v1 <= v0:
+			continue
+		var row := ((1 << (u1 - u0)) - 1) << u0
+		for v in range(v0, v1):
+			out[v >> 2] |= row << ((v & 3) * 16)
+	_fmask[key] = out
+	return out
+
+
+## FlowingFluid.canPassThroughWall: fluid crosses from `src` to `dst` (face = side of src toward dst) unless the two
+## collision faces together cover the whole shared face (Shapes.mergedFaceOccludes; a full cube on either side always
+## does). Waterlogged stairs / slabs keep water in on their solid sides.
+static func _pass_wall(src: int, dst: int, face: int) -> bool:
+	var fa: int = _ffaces[src] if src > 0 else 0
+	var fb: int = _ffaces[dst] if dst > 0 else 0
+	var of := face ^ 1
+	if ((fa >> face) & 1) != 0 or ((fb >> of) & 1) != 0:
+		return false   # a full face on either side
+	if ((fa >> (6 + face)) & 1) == 0 or ((fb >> (6 + of)) & 1) == 0:
+		return true    # at most one side has a (partial) face there
+	var a := _face_mask(src, face)
+	var b := _face_mask(dst, of)
+	for i in 4:
+		if (a[i] | b[i]) != -1:
+			return true
+	return false
 
 
 static func _flowing_state(lava: bool, amount: int, falling: bool) -> int:
-	var src := Res.blocks.LAVA if lava else Res.blocks.WATER
-	return Res.blocks.with_prop(src, "level", str(8 if falling else 8 - amount))
+	if _flowst.is_empty():
+		_fluid_tables()
+	return _flowst[(9 if lava else 0) + (8 if falling else amount - 1)]
 
 
 static func _drop_off(world, lava: bool) -> int:
 	return (1 if lava_delay(world) == 10 else 2) if lava else 1
 
 
-## FlowingFluid.getNewLiquid: the fluid state this position should hold (0 = empty).
-static func _new_liquid(world, p: Vector3i, lava: bool) -> int:
+## FlowingFluid.getNewLiquid: the fluid state position p (holding pst) should hold (0 = empty).
+static func _new_liquid(world, p: Vector3i, lava: bool, pst: int = -2, _cached := false) -> int:
+	_gbegin(world, p, lava)
+	if pst == -2:
+		pst = _gget(0, 0, 0)
+	return _gnew(0, 0, pst)
+
+
+# ---- FlowingFluid.SpreadContext: the states around the spreading cell, read once per spread into a flat grid
+# (dx, dz within SR of it, dy -1 / 0 / +1) straight from the chunk sections; holes and slope distances cached the same
+# way (Java memoises states and holes per spread, keyed by relative position). Packed arrays filled per spread: no
+# Dictionary / Vector3i per visited cell (the slope search visits up to ~160 cells per spread).
+const SR := 5            # neighbour (1) + slope find distance (4)
+const SW := 11
+const SL := 121          # SW * SW
+const HDX := [0, 1, 0, -1]
+const HDZ := [-1, 0, 1, 0]
+static var _g := PackedInt32Array()    # 3 layers of SW x SW: state, -2 = not read yet
+static var _gh := PackedByteArray()    # holes (layer dy 0): 0 unknown, 1 no, 2 yes
+static var _gm := PackedInt32Array()   # slope memo: ((cell * 4 + came-from side) * 5 + depth) -> distance + 1, 0 unknown
+static var _gm_stale := true   # (the memo is only used by the reference DFS: cleared on its first call of a spread)
+static var _gp := Vector3i.ZERO
+static var _gw = null
+static var _gcm: ChunkManager = null
+static var _gck := 1 << 62
+static var _gch: Chunk = null
+static var _glava := false
+static var _gfind := 4
+static var _gdrop := 1
+static var _gconv := true
+
+
+static func _gbegin(world, p: Vector3i, lava: bool) -> void:
+	if _fk.is_empty():
+		_fluid_tables()
+	if _g.size() != 3 * SL:
+		_g.resize(3 * SL)
+		_gh.resize(SL)
+		_gm.resize(SL * 20)
+	_g.fill(-2)
+	_gh.fill(0)
+	_gm_stale = true
+	_gp = p
+	_gw = world
+	var cmv = world.get("cm")
+	_gcm = cmv if cmv is ChunkManager else null
+	_gck = 1 << 62
+	_gch = null
+	_glava = lava
+	var fast := lava_delay(world) == 10
+	_gfind = (4 if fast else 2) if lava else 4
+	_gdrop = (1 if fast else 2) if lava else 1
+	_gconv = bool(world.gamerule("lavaSourceConversion", false) if lava else world.gamerule("waterSourceConversion", true))
+
+
+## State at (dx, dy, dz) from the spread origin (WorldManager.state_at: -1 where the chunk isn't loaded).
+static func _gget(dx: int, dy: int, dz: int) -> int:
+	var i := (dy + 1) * SL + (dz + SR) * SW + dx + SR
+	var v := _g[i]
+	if v != -2:
+		return v
+	var x := _gp.x + dx
+	var y := _gp.y + dy
+	var z := _gp.z + dz
+	if _gcm != null:
+		var ck := ((x >> 4) << 32) | ((z >> 4) & 0xFFFFFFFF)
+		if ck != _gck:
+			_gck = ck
+			_gch = _gcm.chunks.get(ck)
+			if _gch != null and _gch.state < Chunk.DATA_READY:
+				_gch = null
+		if _gch == null:
+			v = -1
+		elif y < Coords.MIN_Y or y >= Coords.MAX_Y:
+			v = 0
+		else:
+			var sec: Chunk.Section = _gch.sections[(y - Coords.MIN_Y) >> 4]
+			if sec.pal.size() == 1:
+				v = sec.pal[0]
+			else:
+				var si := ((y & 15) << 8) | ((z & 15) << 4) | (x & 15)
+				v = sec.pal[sec.wide[si]] if sec.wide.size() > 0 else sec.pal[sec.idx[si]]
+	else:
+		v = _gw.state_at(x, y, z)
+	_g[i] = v
+	return v
+
+
+## getNewLiquid for the cell (dx, 0, dz) holding pst.
+static func _gnew(dx: int, dz: int, pst: int) -> int:
+	var tb := FK_L if _glava else FK_W
 	var maxa := 0
 	var sources := 0
-	for d in HDIRS:
+	for k in 4:
+		var ns := _gget(dx + HDX[k], 0, dz + HDZ[k])
+		if ns > 0 and (_fk[ns] & tb) != 0 and _pass_wall(pst, ns, HFACE[k]):
+			if _fk[ns] & FK_SRC:
+				sources += 1
+			maxa = maxi(maxa, _famt[ns])
+	if sources >= 2 and _gconv:
+		var below := _gget(dx, -1, dz)
+		if below > 0 and (_fsolid[below] != 0 or (_fk[below] & (tb | FK_SRC)) == (tb | FK_SRC)):
+			return Res.blocks.LAVA if _glava else Res.blocks.WATER
+	var above := _gget(dx, 1, dz)
+	if above > 0 and (_fk[above] & tb) != 0 and _pass_wall(pst, above, 1):
+		return _flowst[(9 if _glava else 0) + 8]
+	var k2 := maxa - _gdrop
+	return 0 if k2 <= 0 else _flowst[(9 if _glava else 0) + k2 - 1]
+
+
+## SpreadContext.isHole / FlowingFluid.isWaterHole for the cell (dx, 0, dz) holding qst: the fluid can go down there.
+static func _ghole(dx: int, dz: int, qst: int) -> bool:
+	var hi := (dz + SR) * SW + dx + SR
+	var h := _gh[hi]
+	if h != 0:
+		return h == 2
+	var b := _g[hi]   # (layer dy -1)
+	if b == -2:
+		b = _gget(dx, -1, dz)
+	var r := false
+	if b >= 0 and ((_ffaces[qst] | _ffaces[b]) == 0 or _pass_wall(qst, b, 0)):
+		var kb := _fk[b]
+		r = (kb & (FK_L if _glava else FK_W)) != 0 or (kb & (FK_HOLD | FK_TAKES | FK_FULL)) == FK_HOLD
+	_gh[hi] = 2 if r else 1
+	return r
+
+
+## FlowingFluid.getSlopeDistance from the cell (dx, 0, dz) holding pst, reached from side from_k at depth `depth`:
+## steps to the nearest hole (up to the slope find distance: water 4, lava 2 / 4 where lava is fast), 1000 = none.
+## canPassThrough includes canHoldSpecificFluid of the flowing fluid (waterloggable blocks take only sources, so they
+## are walls for the search). Memoised by (cell, side, depth): pure within one spread. (Grid reads, hole and wall
+## checks inlined on their fast paths: it runs for up to ~120 cells per side.)
+const HDC := [-SW, 1, SW, -1]   # cell index step of HDIRS in the grid
+static func _gslope(dx: int, dz: int, pst: int, depth: int, from_k: int) -> int:
+	if _gm_stale:
+		_gm.fill(0)
+		_gm_stale = false
+	var cell := (dz + SR) * SW + dx + SR
+	var mi := (cell * 4 + from_k) * 5 + depth
+	var mv := _gm[mi]
+	if mv != 0:
+		return mv - 1
+	var best := 1000
+	var sb := (FK_L if _glava else FK_W) | FK_SRC
+	var fa := _ffaces[pst]
+	for k in 4:
+		if k == from_k:
+			continue
+		var nc: int = cell + HDC[k]
+		var ns := _g[SL + nc]
+		if ns == -2:
+			ns = _gget(dx + HDX[k], 0, dz + HDZ[k])
+		if ns < 0:
+			continue
+		var kk := _fk[ns]
+		if (kk & sb) == sb or (kk & (FK_HOLD | FK_TAKES | FK_FULL)) != FK_HOLD:
+			continue
+		if (fa | _ffaces[ns]) != 0 and not _pass_wall(pst, ns, HFACE[k]):
+			continue
+		var h := _gh[nc]
+		if h == 0:
+			h = 2 if _ghole(dx + HDX[k], dz + HDZ[k], ns) else 1
+		if h == 2:
+			best = depth
+			break
+		if depth < _gfind:
+			best = mini(best, _gslope(dx + HDX[k], dz + HDZ[k], ns, depth + 1, k ^ 2))
+	_gm[mi] = best + 1
+	return best
+
+
+## getSlopeDistance for the four sides of the spread origin at once (_gsl[k], 1000 = no hole within the slope find
+## distance), equal to the DFS above (kept as the reference: tests compare the two on random terrain). The DFS's
+## minimum over non-backtracking walks of <= find steps is the shortest path over passable cells (a shortest path
+## never backtracks), so one breadth-first pass outward from the holes (cells within find + 1 of the origin, never
+## through the origin) gives every side's distance; walks through the origin itself (possible only when it is a
+## flowing cell, reached at step 3 around a corner) are checked apart. The DFS visited up to ~120 cells per side:
+## ~85 % of a flat-floor flow update.
+static var _gsl := PackedInt32Array([1000, 1000, 1000, 1000])
+static var _gcells := PackedInt32Array()   # grid cells at distance 1..SR from the origin, nearest first
+static var _gcd := PackedByteArray()       # distance of each grid cell from the origin
+static var _gnb := PackedInt32Array()      # cell * 4 + side -> neighbour cell, -1 outside the distance-SR diamond
+static var _gd := PackedByteArray()        # steps from each cell to the nearest hole (255 unknown)
+static var _gpass := PackedByteArray()     # 1: canPassThrough(flowing) cell
+static var _gq := PackedInt32Array()
+
+
+static func _side_slopes(st: int) -> void:
+	if _gcells.is_empty():
+		_gcd.resize(SL)
+		_gnb.resize(SL * 4)
+		_gd.resize(SL)
+		_gpass.resize(SL)
+		_gq.resize(SL)
+		for d in range(1, SR + 1):
+			for dz in range(-SR, SR + 1):
+				for dx in range(-SR, SR + 1):
+					if absi(dx) + absi(dz) == d:
+						_gcells.append((dz + SR) * SW + dx + SR)
+		for c in SL:
+			var cx := c % SW - SR
+			var cz := c / SW - SR
+			_gcd[c] = absi(cx) + absi(cz)
+			for k in 4:
+				var nx: int = cx + HDX[k]
+				var nz: int = cz + HDZ[k]
+				_gnb[c * 4 + k] = (nz + SR) * SW + nx + SR if absi(nx) + absi(nz) <= SR else -1
+	var find := _gfind
+	var sb := (FK_L if _glava else FK_W) | FK_SRC
+	var origin := SR * SW + SR
+	_gd.fill(255)
+	_gpass.fill(0)
+	# passable cells and holes within find + 1 of the origin
+	var qn := 0
+	for c in _gcells:
+		if _gcd[c] > find + 1:
+			break
+		var s := _g[SL + c]
+		if s == -2:
+			s = _gget(c % SW - SR, 0, c / SW - SR)
+		if s < 0:
+			continue
+		var kk := _fk[s]
+		if (kk & sb) == sb or (kk & (FK_HOLD | FK_TAKES | FK_FULL)) != FK_HOLD:
+			continue
+		_gpass[c] = 1
+		if _ghole(c % SW - SR, c / SW - SR, s):
+			_gd[c] = 0
+			_gq[qn] = c
+			qn += 1
+	var opass := (_fk[st] & sb) != sb and (_fk[st] & (FK_HOLD | FK_TAKES | FK_FULL)) == FK_HOLD
+	var ohole := opass and find >= 3 and _ghole(0, 0, st)
+	if qn == 0 and not ohole:
+		_gsl.fill(1000)
+		return
+	# breadth-first outward from the holes, at most find - 1 steps (a side adds its own step)
+	var qi := 0
+	while qi < qn:
+		var c := _gq[qi]
+		qi += 1
+		var dc := _gd[c]
+		if dc >= find - 1:
+			continue
+		var sc := _g[SL + c]
+		for k in 4:
+			var a := _gnb[c * 4 + k]
+			if a < 0 or a == origin or _gpass[a] == 0 or _gd[a] != 255:
+				continue
+			var sa := _g[SL + a]
+			if (_ffaces[sa] | _ffaces[sc]) != 0 and not _pass_wall(sc, sa, HFACE[k]):
+				continue
+			_gd[a] = dc + 1
+			_gq[qn] = a
+			qn += 1
+	for k in 4:
+		var q := _gnb[origin * 4 + k]
+		var sq := _g[SL + q]
+		var best := 1000
+		if sq >= 0:
+			for k2 in 4:
+				if k2 == (k ^ 2):
+					continue   # (not straight back to the origin)
+				var b := _gnb[q * 4 + k2]
+				if b < 0 or _gpass[b] == 0 or _gd[b] == 255 or _gd[b] + 1 >= best:
+					continue
+				var sbb := _g[SL + b]
+				if (_ffaces[sq] | _ffaces[sbb]) != 0 and not _pass_wall(sq, sbb, HFACE[k2]):
+					continue
+				best = _gd[b] + 1
+			# walks through a flowing origin: q -> q+s -> origin+s -> origin (step 3; a hole there), then one more step
+			if opass and find >= 3 and best > 3:
+				for s in [(k + 1) & 3, (k + 3) & 3]:
+					var a2 := _gnb[q * 4 + s]
+					var b2 := _gnb[origin * 4 + s]
+					if a2 < 0 or b2 < 0 or _gpass[a2] == 0 or _gpass[b2] == 0:
+						continue
+					var sa2 := _g[SL + a2]
+					var sb2 := _g[SL + b2]
+					if not _pass_wall(sq, sa2, HFACE[s]) or not _pass_wall(sa2, sb2, HFACE[k ^ 2]) or not _pass_wall(sb2, st, HFACE[s ^ 2]):
+						continue
+					if ohole:
+						best = 3
+						break
+					if find >= 4:
+						for k3 in 4:
+							if k3 == s or k3 == k:
+								continue
+							var h3 := _gnb[origin * 4 + k3]
+							if _gd[h3] == 0 and _pass_wall(st, _g[SL + h3], HFACE[k3]):
+								best = 4
+		_gsl[k] = best if best <= find else 1000
+
+
+## FluidState.canBeReplacedWith: what holds `st` now taking the spreading fluid (down: from above). Air / no fluid:
+## always; water: only by lava from above (WaterFluid); lava: by water when at least 4/9 high (LavaFluid).
+static func _replaceable_by(st: int, lava: bool, down: bool) -> bool:
+	var a := _fluid_amount(st)
+	if a == 0:
+		return true
+	if _same_fluid(st, true):
+		return not lava and a >= 4
+	return down and lava
+
+
+## Java LevelEvent 1501 (LAVA_FIZZ): extinguish sound (0.5, 2.6 +- 0.8) and 8 large smoke particles 1.2 above.
+static func _fizz(world, p: Vector3i) -> void:
+	Audio.play("block.lava.extinguish", Vector3(p) + Vector3(0.5, 0.5, 0.5), "Blocks", 0.5, 2.6 + (_rt_rng.randf() - _rt_rng.randf()) * 0.8)
+	for i in 8:
+		Particles.emit("large_smoke", Vector3(p) + Vector3(_rt_rng.randf(), 1.2, _rt_rng.randf()))
+
+
+## LiquidBlock.shouldSpreadLiquid on lava: water above or beside (water / waterlogged blocks) turns it to obsidian
+## (source) or cobblestone; over soul soil, blue ice beside turns it to basalt. Java runs this when the lava is placed
+## and whenever a neighbour changes - at once, not on the lava's 30-tick flow tick. True when the lava was converted.
+static func lava_react(world, p: Vector3i, st: int) -> bool:
+	var soul := false
+	var bs: int = world.state_at(p.x, p.y - 1, p.z)
+	if bs > 0 and Res.blocks.name_of(bs) == "soul_soil":
+		soul = true
+	for d in [Vector3i(0, 1, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(1, 0, 0)]:
 		var q: Vector3i = p + d
 		var ns: int = world.state_at(q.x, q.y, q.z)
-		if _is_this(ns, lava) and _wall_ok(ns):
-			if _is_source_this(ns, lava):
-				sources += 1
-			maxa = maxi(maxa, _fluid_amount(ns))
-	if sources >= 2 and not lava and world.gamerule("waterSourceConversion", true):
-		var below: int = world.state_at(p.x, p.y - 1, p.z)
-		if (below > 0 and (Res.blocks.st_flags[below] & BlockRegistry.F_SOLID) != 0) or _is_source_this(below, lava):
-			return Res.blocks.WATER
-	if sources >= 2 and lava and world.gamerule("lavaSourceConversion", false):
-		var below2: int = world.state_at(p.x, p.y - 1, p.z)
-		if (below2 > 0 and (Res.blocks.st_flags[below2] & BlockRegistry.F_SOLID) != 0) or _is_source_this(below2, lava):
-			return Res.blocks.LAVA
-	var above: int = world.state_at(p.x, p.y + 1, p.z)
-	if _is_this(above, lava) and _wall_ok(above):
-		return _flowing_state(lava, 8, true)
-	var k := maxa - _drop_off(world, lava)
-	return 0 if k <= 0 else _flowing_state(lava, k, false)
+		if ns <= 0:
+			continue
+		if _same_fluid(ns, false):
+			world.set_block(p.x, p.y, p.z, Res.blocks.default_state("obsidian" if Res.blocks.st_level[st] == 0 else "cobblestone"))
+			_fizz(world, p)
+			return true
+		if soul and Res.blocks.name_of(ns) == "blue_ice":
+			world.set_block(p.x, p.y, p.z, Res.blocks.default_state("basalt"))
+			_fizz(world, p)
+			return true
+	return false
+
+
+## Java Level.setBlock neighbour updates for fluids (LiquidBlock.onPlace / neighborChanged / updateShape): the block
+## at p and its 6 neighbours that hold a fluid get their fluid tick (water 5, lava 30 / 10); lava touching water reacts
+## right away. Called by WorldManager.set_block for every notified change.
+static var _react_q: Array = []
+static var _reacting := false
+const _NB7 := [Vector3i.ZERO, Vector3i(0, -1, 0), Vector3i(0, 1, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(1, 0, 0)]
+static var _sponge_q: Array = []   # [position, placed] of sponges / wet sponges to update (Sponges.on_update)
+static var _sponging := false
+static var _sp_dry := -2
+static var _sp_wet := -2
+
+
+static func fluids_changed(world, p: Vector3i) -> void:
+	if _sp_dry == -2:
+		_sp_dry = Res.blocks.block_id("sponge")
+		_sp_wet = Res.blocks.block_id("wet_sponge")
+	for d in _NB7:
+		var q: Vector3i = p + d
+		var st: int = world.state_at(q.x, q.y, q.z)
+		if st <= 0:
+			continue
+		var fl := Res.blocks.st_flags[st]
+		if fl & BlockRegistry.F_LIQUID:
+			if fl & BlockRegistry.F_LAVA:
+				_react_q.append(q)
+			else:
+				schedule(world, q, 5)
+		elif fl & BlockRegistry.F_WATERLOGGED:
+			schedule(world, q, 5)
+		else:
+			var sb := Res.blocks.st_block[st]
+			if sb == _sp_dry or (sb == _sp_wet and d == Vector3i.ZERO):
+				_sponge_q.append([q, d == Vector3i.ZERO])   # SpongeBlock.onPlace / neighborChanged, WetSpongeBlock.onPlace
+		if fl & BlockRegistry.F_GRAVITY:
+			# Java FallingBlock.onPlace / updateShape: any change next to (or of) a gravity block schedules its fall check
+			# in 2 ticks - a falling block's removal reaches the one above, so columns and floating clumps come down
+			schedule(world, q, 2)
+	if not _sponge_q.is_empty() and not _sponging:
+		_sponging = true   # (absorbing changes neighbours of other sponges: queued, run here in order)
+		var si := 0
+		while si < _sponge_q.size():
+			var e: Array = _sponge_q[si]
+			si += 1
+			var sq: Vector3i = e[0]
+			var sst: int = world.state_at(sq.x, sq.y, sq.z)
+			if sst > 0:
+				Sponges.on_update(world, sq, sst, e[1])
+		_sponge_q.clear()
+		_sponging = false
+	if _reacting or _react_q.is_empty():
+		return
+	# conversions update their own neighbours (a lava lake under poured water converts cell by cell): a queue, not
+	# recursion (Java CollectingNeighborUpdater)
+	_reacting = true
+	var i := 0
+	while i < _react_q.size():
+		var r: Vector3i = _react_q[i]
+		i += 1
+		var rs: int = world.state_at(r.x, r.y, r.z)
+		if rs > 0 and (Res.blocks.st_flags[rs] & (BlockRegistry.F_LIQUID | BlockRegistry.F_LAVA)) == (BlockRegistry.F_LIQUID | BlockRegistry.F_LAVA):
+			if not lava_react(world, r, rs):
+				schedule(world, r, lava_delay(world))
+	_react_q.clear()
+	_reacting = false
 
 
 static func _fluid(world, p: Vector3i, st: int) -> void:
 	var blocks := Res.blocks
 	var lava := (blocks.st_flags[st] & BlockRegistry.F_LAVA) != 0
-	var is_source := blocks.st_level[st] == 0
-	# lava / water reactions (LiquidBlock.shouldSpreadLiquid on lava: obsidian from a source, else cobblestone)
-	if lava:
-		for d in [Vector3i(0, 1, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(1, 0, 0)]:
-			var q: Vector3i = p + d
-			if _same_fluid(world.state_at(q.x, q.y, q.z), false):
-				world.set_block(p.x, p.y, p.z, blocks.default_state("obsidian" if is_source else "cobblestone"))
-				Audio.play("block.lava.extinguish", Vector3(p), "Blocks")
-				return
-	if not is_source:
-		var nl := _new_liquid(world, p, lava)
+	if lava and lava_react(world, p, st):
+		return
+	if blocks.st_level[st] != 0:
+		# FlowingFluid.tick: a flowing state recomputes itself (empty -> air; changed -> set and ticks again)
+		var nl := _new_liquid(world, p, lava, st)
 		var delay := _spread_delay(world, lava, st, nl)
 		if nl == 0:
 			world.set_block(p.x, p.y, p.z, 0)
@@ -332,114 +1392,112 @@ static func _spread_delay(world, lava: bool, cur: int, nl: int) -> int:
 	return i
 
 
-## FlowingFluid.spread: down first, then sideways (sources, or flows not standing over a hole).
+static func _source_neighbors(world, p: Vector3i, lava: bool) -> int:
+	var n := 0
+	for d in HDIRS:
+		var q: Vector3i = p + d
+		if _is_source_this(world.state_at(q.x, q.y, q.z), lava):
+			n += 1
+	return n
+
+
+## FlowingFluid.spread: down first (canMaybePassThrough, canBeReplacedWith, canHoldSpecificFluid; LavaFluid.spreadTo
+## turns water below into stone), then sideways (sources, or flows not standing over a hole).
 static func _spread_java(world, p: Vector3i, st: int, lava: bool) -> void:
-	var below_p := p + Vector3i(0, -1, 0)
-	var below: int = world.state_at(below_p.x, below_p.y, below_p.z)
-	if below >= 0 and not _is_source_this(below, lava) and _can_hold(below, lava) and _wall_ok(below):
-		var nb := _new_liquid(world, below_p, lava)
-		# FluidState.canBeReplacedWith(.., DOWN) of what is below: empty / non-fluid yes; the same fluid never (it
-		# updates itself on its own tick); water under falling lava turns to stone (LavaFluid.spreadTo); lava under
-		# water when at least 0.444 high (LavaFluid.canBeReplacedWith)
-		var replaceable := true
-		if below > 0 and _fluid_amount(below) > 0:
-			if _same_fluid(below, lava):
-				replaceable = false
-			elif lava:
-				world.set_block(below_p.x, below_p.y, below_p.z, Res.blocks.default_state("stone"))
-				Audio.play("block.lava.extinguish", Vector3(below_p), "Blocks")
-				return
+	_gbegin(world, p, lava)
+	var below := _gget(0, -1, 0)
+	var sb := (FK_L if lava else FK_W) | FK_SRC
+	if below >= 0 and (_fk[below] & sb) != sb and (_fk[below] & FK_HOLD) != 0 and _pass_wall(st, below, 0):
+		var below_p := p + Vector3i(0, -1, 0)
+		var nb := _new_liquid(world, below_p, lava, below)
+		if nb != 0 and _replaceable_by(below, lava, true) and _can_hold_specific(below, lava, (_fk[nb] & FK_SRC) != 0):
+			if lava and _fluid_amount(below) > 0:
+				# LavaFluid.spreadTo(DOWN) into water: a water block becomes stone, a waterlogged block only fizzes
+				if Res.blocks.st_flags[below] & BlockRegistry.F_LIQUID:
+					world.set_block(below_p.x, below_p.y, below_p.z, Res.blocks.default_state("stone"))
+				_fizz(world, below_p)
 			else:
-				replaceable = _fluid_amount(below) >= 4
-		if replaceable and nb != 0 and _can_hold_specific(below, lava, Res.blocks.st_level[nb] == 0):
-			_spread_to(world, below_p, below, nb, lava)
-			var srcn := 0
-			for d in HDIRS:
-				var q: Vector3i = p + d
-				if _is_source_this(world.state_at(q.x, q.y, q.z), lava):
-					srcn += 1
-			if srcn >= 3:
+				_spread_to(world, below_p, below, nb, lava)
+			if _source_neighbors(world, p, lava) >= 3:
 				_spread_sides(world, p, st, lava)
 			return
-	if _is_source_this(st, lava) or not _is_hole(world, p, lava, {}):
+	# (nothing was written: `below` is current) isWaterHole(p)
+	var hole := below >= 0 and _pass_wall(st, below, 0) and ((_fk[below] & (FK_L if lava else FK_W)) != 0 or (_fk[below] & (FK_HOLD | FK_TAKES | FK_FULL)) == FK_HOLD)
+	if (_fk[st] & sb) == sb or not hole:
 		_spread_sides(world, p, st, lava)
 
 
+## FlowingFluid.spreadToSides / getSpread: the neighbours at the smallest slope distance (0 = a hole next to it) that
+## can take the new flow (all reads through the spread's SpreadContext grid, writes after).
 static func _spread_sides(world, p: Vector3i, st: int, lava: bool) -> void:
 	var i := _fluid_amount(st) - _drop_off(world, lava)
 	if _falling(st):
 		i = 7
 	if i <= 0:
 		return
+	_gbegin(world, p, lava)
+	var sb := (FK_L if lava else FK_W) | FK_SRC
 	var best := 1000
-	var targets: Array = []
-	var holes := {}
-	for d in HDIRS:
-		var q: Vector3i = p + d
-		var ns: int = world.state_at(q.x, q.y, q.z)
-		if ns < 0 or _is_source_this(ns, lava) or not _can_hold(ns, lava) or not _wall_ok(ns):
+	var tn := 0
+	var tk := PackedInt32Array([0, 0, 0, 0])
+	var ts := PackedInt32Array([0, 0, 0, 0])
+	var tf := PackedInt32Array([0, 0, 0, 0])
+	# the sides that can take the flow, with their new liquid; slope distances only matter between two or more of them
+	var nfs := PackedInt32Array([-1, -1, -1, -1])
+	var ne := 0
+	var nh := 0
+	for k in 4:
+		var dx: int = HDX[k]
+		var dz: int = HDZ[k]
+		var ns := _gget(dx, 0, dz)
+		if ns < 0:
 			continue
-		var nf := _new_liquid(world, q, lava)
-		if not _can_hold_specific(ns, lava, nf > 0 and Res.blocks.st_level[nf] == 0):
+		var kk := _fk[ns]
+		if (kk & sb) == sb or (kk & FK_HOLD) == 0 or not _pass_wall(st, ns, HFACE[k]):
 			continue
-		var j := 0 if _is_hole(world, q, lava, holes) else _slope_java(world, q, 1, -d, lava, holes)
+		var nf := _gnew(dx, dz, ns)
+		if not _can_hold_specific(ns, lava, nf > 0 and (_fk[nf] & FK_SRC) != 0):
+			continue
+		nfs[k] = nf
+		ne += 1
+		if _ghole(dx, dz, ns):
+			nh += 1
+	# (one side alone, or a hole next to the origin - holes win at distance 0: the other sides' distances don't matter)
+	var slopes := ne >= 2 and nh == 0
+	if slopes:
+		_side_slopes(st)
+	for k in 4:
+		var nf: int = nfs[k]
+		if nf < 0:
+			continue
+		var dx: int = HDX[k]
+		var dz: int = HDZ[k]
+		var ns := _gget(dx, 0, dz)
+		var j := 0 if _ghole(dx, dz, ns) else (_gsl[k] if slopes else 1000)
 		if j < best:
-			targets.clear()
+			tn = 0
 		if j <= best:
-			# FluidState.canBeReplacedWith of what is there now
-			var ok := true
-			if ns > 0 and _fluid_amount(ns) > 0:
-				if _same_fluid(ns, lava):
-					ok = false   # the same fluid is never replaced sideways (it recomputes itself)
-				else:
-					ok = not lava and _fluid_amount(ns) >= 4   # water into lava >= 0.444 high; lava never into water
-			if ok and nf != 0:
-				targets.append([q, ns, nf])
+			if nf != 0 and _replaceable_by(ns, lava, false):
+				tk[tn] = k
+				ts[tn] = ns
+				tf[tn] = nf
+				tn += 1
 			best = j
-	for tg in targets:
-		_spread_to(world, tg[0], tg[1], tg[2], lava)
-
-
-## SpreadContext.isHole: the fluid can go down from q.
-static func _is_hole(world, q: Vector3i, lava: bool, cache: Dictionary) -> bool:
-	if cache.has(q):
-		return cache[q]
-	var b: int = world.state_at(q.x, q.y - 1, q.z)
-	var r := b >= 0 and _wall_ok(b) and (_is_this(b, lava) or (_can_hold(b, lava) and _can_hold_specific(b, lava, false)))
-	cache[q] = r
-	return r
-
-
-## FlowingFluid.getSlopeDistance (distance to the nearest hole, up to the slope find distance; 1000 = none).
-static func _slope_java(world, p: Vector3i, distance: int, from_dir: Vector3i, lava: bool, holes: Dictionary) -> int:
-	var best := 1000
-	var find := (4 if lava_delay(world) == 10 else 2) if lava else 4
-	for d in HDIRS:
-		if d == from_dir:
-			continue
-		var q: Vector3i = p + d
-		var ns: int = world.state_at(q.x, q.y, q.z)
-		if ns < 0 or _is_source_this(ns, lava) or not _can_hold(ns, lava) or not _wall_ok(ns):
-			continue
-		if _is_hole(world, q, lava, holes):
-			return distance
-		if distance < find:
-			best = mini(best, _slope_java(world, q, distance + 1, -d, lava, holes))
-	return best
+	for t in tn:
+		_spread_to(world, p + HDIRS[tk[t]], ts[t], tf[t], lava)
 
 
 ## FlowingFluid.spreadTo: waterloggable blocks take water as waterlogging; others are destroyed (drops; lava fizzes)
-## and replaced; the new fluid schedules its tick (LiquidBlock.onPlace).
+## and replaced; the new fluid's tick comes from the neighbour update (LiquidBlock.onPlace via set_block).
 static func _spread_to(world, q: Vector3i, cur: int, nf: int, lava: bool) -> void:
 	var b := Res.blocks
 	if cur > 0 and b.has_prop(cur, "waterlogged"):
 		if not lava:
-			world.set_block(q.x, q.y, q.z, b.with_prop(cur, "waterlogged", "true"))
-			schedule(world, q, 5)
+			Interaction.waterlog(world, q, cur)   # LiquidBlockContainer.placeLiquid (lit campfires / candles go out)
 		return
 	if cur > 0 and (b.st_flags[cur] & BlockRegistry.F_LIQUID) == 0:
 		if lava:
-			Audio.play("block.lava.extinguish", Vector3(q) + Vector3(0.5, 0.5, 0.5), "Blocks", 0.5, 2.6)
+			_fizz(world, q)
 		elif world.gamerule("doTileDrops", true):
 			for s in Loot.block_drops(cur, null, world, q):
 				world.entities.spawn_item(Vector3(q) + Vector3(0.5, 0.3, 0.5), s)
@@ -622,7 +1680,10 @@ static func _random_ticks_native(world) -> void:
 	_rts_speed = speed
 	_rts_pos = 0
 	_rts_active = true
-	_rt_sample_slice(RT_SLICE if Native.inst.has_method("rt_sample_range") else 1 << 30)
+	# the first slice is this frame's share of the frames until the next tick (a fixed 220 chunks was 1-2 ms on x86)
+	var fpt := 0.05 / maxf(float(world._last_delta), 0.0005)
+	var n0 := clampi(ceili(float(_rts_lst.size()) / maxf(1.0, fpt - 2.0)), 60, RT_SLICE)
+	_rt_sample_slice(n0 if Native.inst.has_method("rt_sample_range") else 1 << 30)
 
 
 const RT_SLICE := 220   # chunks sampled per frame (a 25x25 area takes 3 frames of the ~10-20 per tick at high FPS)
@@ -686,6 +1747,7 @@ static func _rt_build_start(k: Vector4i) -> void:
 	_rtb_active = true
 	_rtb_key = k
 	_rtb_row = 0
+	_rtb_col = 0
 	_rtb_lst = []
 	_rtb_chs = []
 	_rtb_crd = PackedInt32Array()
@@ -701,6 +1763,9 @@ const BUILD_BUDGET_US := 250   # incremental list rebuild: minimum time per fram
 ## Advances the list rebuild by up to `rows` rows (and at most BUILD_BUDGET_US per frame): first the leaf-filter grid
 ## (area + 1 ring of section references), then the list itself (dz-major, same order as before); swaps it in when
 ## complete.
+static var _rtb_col := 0   # chunk column inside the current list row (resumable rebuild)
+
+
 static func _rt_build_steps(world, rows: int) -> void:
 	if not _rtb_active or world.cm == null:
 		return
@@ -726,8 +1791,11 @@ static func _rt_build_steps(world, rows: int) -> void:
 						_rtb_grid[r * gw + gx] = c3.sec_refs()
 		else:
 			var cz := k.y + (r - gw - sim)
-			for dx in range(-sim, sim + 1):
-				var cx := k.x + dx
+			# resumable within the row: chunks needing a rebuild cost up to ~0.5 ms each on x86 (a whole row in one go was
+			# a 1.4-3.7 ms frame there)
+			while _rtb_col <= 2 * sim:
+				var cx := k.x - sim + _rtb_col
+				_rtb_col += 1
 				var c: Chunk = chunks.get((cx << 32) | (cz & 0xFFFFFFFF))
 				if c == null or c.state < Chunk.DECORATED:
 					continue
@@ -739,6 +1807,9 @@ static func _rt_build_steps(world, rows: int) -> void:
 				_rtb_chs.append(c)
 				_rtb_crd.append(c.cx)
 				_rtb_crd.append(c.cz)
+				if rows < (1 << 20) and Time.get_ticks_usec() >= t_end:
+					return
+			_rtb_col = 0
 		_rtb_row += 1
 		rows -= 1
 		if _rtb_row >= gw + 2 * sim + 1:
@@ -765,6 +1836,8 @@ static func rt_chunk_dirty(c: Chunk) -> void:
 
 ## A chunk became decorated (generated or loaded): refresh the random-tick list if it lies in the current area.
 static func on_chunk_ready(cx: int, cz: int) -> void:
+	if not _gen_wait.is_empty():
+		_gen_wake(cx, cz)
 	var sim := int(Settings.get_v("simulation_distance"))
 	if maxi(absi(cx - _rtl_key.x), absi(cz - _rtl_key.y)) <= sim:
 		rtl_dirty = true
@@ -778,6 +1851,16 @@ static var _rt_hi := 0
 
 
 static func step_hits(world, frames_left: int) -> void:
+	if _release_pending:
+		_release_pending = false
+		if world.get("cm") is ChunkManager:
+			world.cm.release_held()
+	var drem := due_count()
+	if drem > 0:
+		# a share of the collected updates per frame (spread over the frames until the next tick), at most ~2 ms
+		_run_due(world, maxi(2, ceili(float(drem) / maxi(1, frames_left - 1))), 2000)
+	if not _gen_q.is_empty():
+		_gen_step(world)
 	var tr: bool = world.cm.tracing
 	var ta := Time.get_ticks_usec()
 	if _rtb_active:
@@ -797,14 +1880,22 @@ static func step_hits(world, frames_left: int) -> void:
 		return
 	var t := Time.get_ticks_usec()
 	var n0 := _rt_hi
-	# per-frame cap scales with the frame time (10 %, 0.15 .. 1.5 ms): a fixed 1.5 ms was 60 % of a 400 FPS frame
+	# per-frame cap: 10 % of the frame time (0.15 .. 1.5 ms), raised to what this frame's share of the pass needs at
+	# the measured cost per handler (otherwise a slow build fell behind and the next pass finished the rest at once:
+	# 5-6 ms frames on x86)
+	var need := ceili(float(rem) / maxi(1, frames_left))
 	var cap := clampi(int(float(world._last_delta) * 100000.0), 150, STEP_BUDGET_US)
-	_rt_process(world, _rt_hi + ceili(float(rem) / maxi(1, frames_left)) * 4, t + cap)
+	cap = clampi(maxi(cap, int(_hit_us_avg * float(need) * 1.25)), 150, 4000)
+	_rt_process(world, _rt_hi + need * 4, t + cap)
+	var done := (_rt_hi - n0) / 4
+	if done > 0:
+		_hit_us_avg = lerpf(_hit_us_avg, float(Time.get_ticks_usec() - t) / float(done), 0.2)
 	last_random_us += Time.get_ticks_usec() - t
 	if tr and Time.get_ticks_usec() - t > 300:
 		world.frame_tparts["rt:handlers (%d)" % ((_rt_hi - n0) / 4)] = Time.get_ticks_usec() - t
 
 
+static var _hit_us_avg := 20.0   # measured cost per random-tick handler (us)
 const STEP_BUDGET_US := 1500   # per-frame cap for spread random-tick handlers (the rest waits for later frames)
 
 
@@ -946,28 +2037,7 @@ static func _section_ticks(sec: Chunk.Section, _blocks: BlockRegistry) -> bool:
 
 
 static func bonemeal(world, p: Vector3i, st: int) -> bool:
-	var blocks := Res.blocks
-	var name := blocks.name_of(st)
-	if blocks.has_prop(st, "age") and (name in ["wheat", "carrots", "potatoes", "beetroots", "melon_stem", "pumpkin_stem", "sweet_berry_bush", "cocoa", "torchflower_crop", "pitcher_crop"]):
-		var vals := 0
-		for pr in blocks.block_props[blocks.st_block[st]]:
-			if pr[0] == "age":
-				vals = (pr[1] as PackedStringArray).size() - 1
-		var a := mini(vals, int(blocks.get_prop(st, "age")) + world.rng.randi_range(2, 5))
-		world.set_block(p.x, p.y, p.z, blocks.with_prop(st, "age", str(a)))
-		return true
-	if name.ends_with("_sapling"):
-		if world.rng.randf() < 0.45:
-			RandomTickable.grow_tree(world, p, name.trim_suffix("_sapling"))
-		return true
-	if name == "grass_block":
-		var grass := blocks.default_state("short_grass")
-		for i in 24:
-			var q := p + Vector3i(world.rng.randi_range(-3, 3), 1, world.rng.randi_range(-3, 3))
-			if world.state_at(q.x, q.y, q.z) == 0 and blocks.name_of(maxi(0, world.state_at(q.x, q.y - 1, q.z))) == "grass_block":
-				world.set_block(q.x, q.y, q.z, grass if world.rng.randi_range(0, 7) > 0 else blocks.default_state("poppy" if world.rng.randf() < 0.5 else "dandelion"))
-		return true
-	return false
+	return Bonemeal.apply(world, p, st)   # (targets, chances, particles + sound: Bonemeal)
 
 # ------------------------------------------------------------------ fire (Java FireBlock)
 
@@ -991,12 +2061,13 @@ static func _fire_table() -> PackedInt32Array:
 		var id := b.block_id(nm)
 		if id >= 0:
 			t[id] = (ig << 8) | bu
-	for w in ["oak", "spruce", "birch", "jungle", "acacia", "cherry", "dark_oak", "pale_oak", "mangrove", "bamboo"]:
+	# wiki Fire, flammable blocks table: [ignite (encouragement), burn (flammability)]
+	for w in ["oak", "spruce", "birch", "jungle", "acacia", "cherry", "dark_oak", "pale_oak", "mangrove", "bamboo", "poplar"]:
 		for suf in ["_planks", "_slab", "_fence_gate", "_fence", "_stairs"]:
 			put.call(w + suf, 5, 20)
 	for nm in ["bamboo_mosaic", "bamboo_mosaic_slab", "bamboo_mosaic_stairs", "mangrove_roots", "composter", "beehive"]:
 		put.call(nm, 5, 20)
-	for w2 in ["oak", "spruce", "birch", "jungle", "acacia", "cherry", "dark_oak", "pale_oak", "mangrove"]:
+	for w2 in ["oak", "spruce", "birch", "jungle", "acacia", "cherry", "dark_oak", "pale_oak", "mangrove", "poplar"]:
 		for pre in ["", "stripped_"]:
 			put.call(pre + w2 + "_log", 5, 5)
 			put.call(pre + w2 + "_wood", 5, 5)
@@ -1004,21 +2075,23 @@ static func _fire_table() -> PackedInt32Array:
 		put.call(nm2, 5, 5)
 	for nm3 in Tags.blocks("#minecraft:leaves"):
 		put.call(nm3, 30, 60)
-	for nm4 in Tags.blocks("#minecraft:wool"):
-		put.call(nm4, 30, 60)
+	for wt in ["#minecraft:wool", "#minecraft:wool_slabs", "#minecraft:wool_stairs"]:   # wiki: wool (and slabs / stairs)
+		for nm4 in Tags.blocks(wt):
+			put.call(nm4, 30, 60)
 	for nm5 in Tags.blocks("#minecraft:wool_carpets"):
 		put.call(nm5, 60, 20)
 	for nm6 in ["short_grass", "fern", "dead_bush", "sunflower", "lilac", "rose_bush", "peony", "tall_grass", "large_fern", "dandelion",
 			"poppy", "blue_orchid", "allium", "azure_bluet", "red_tulip", "orange_tulip", "white_tulip", "pink_tulip", "oxeye_daisy",
 			"cornflower", "lily_of_the_valley", "torchflower", "pitcher_plant", "wither_rose", "pink_petals", "wildflowers",
 			"open_eyeblossom", "closed_eyeblossom", "sweet_berry_bush", "spore_blossom", "leaf_litter", "short_dry_grass",
-			"tall_dry_grass", "bush", "firefly_bush", "cactus_flower", "golden_dandelion"]:
+			"tall_dry_grass", "bush", "firefly_bush", "cactus_flower", "golden_dandelion", "red_shrub", "big_dripleaf", "big_dripleaf_stem",
+			"small_dripleaf"]:
 		put.call(nm6, 60, 100)
-	for nm7 in [["bookshelf", 30, 20], ["chiseled_bookshelf", 30, 20], ["lectern", 30, 20], ["bee_nest", 30, 20], ["tnt", 15, 100],
-			["vine", 15, 100], ["hay_block", 60, 20], ["target", 15, 20], ["moss_carpet", 5, 100], ["pale_moss_carpet", 5, 100],
+	# (moss block / moss carpet / chiseled bookshelf: not flammable per the wiki - Moss Carpet "not flammable", infoboxes "No")
+	for nm7 in [["bookshelf", 30, 20], ["lectern", 30, 20], ["bee_nest", 30, 20], ["tnt", 15, 100],
+			["vine", 15, 100], ["hay_block", 60, 20], ["target", 15, 20], ["pale_moss_carpet", 5, 100],
 			["dried_kelp_block", 30, 60], ["bamboo", 60, 60], ["scaffolding", 60, 60], ["azalea", 30, 60], ["flowering_azalea", 30, 60],
-			["cave_vines", 15, 60], ["cave_vines_plant", 15, 60], ["moss_block", 5, 100], ["big_dripleaf", 15, 100],
-			["big_dripleaf_stem", 15, 100], ["small_dripleaf", 15, 100], ["hanging_roots", 30, 60], ["glow_lichen", 15, 100],
+			["cave_vines", 15, 60], ["cave_vines_plant", 15, 60], ["hanging_roots", 30, 60], ["glow_lichen", 15, 100],
 			["pale_hanging_moss", 5, 100], ["pale_moss_block", 5, 100]]:
 		put.call(str(nm7[0]), int(nm7[1]), int(nm7[2]))
 	_fire_odds = t

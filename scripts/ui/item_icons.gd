@@ -137,6 +137,64 @@ static func _base_ref(m) -> String:
 ## Flat item layers (layer0..2 of a generated model) composited at their native resolution (the GUI icon is
 ## resized from this; held / dropped items extrude it). Cached per model.
 static var _flat: Dictionary = {}
+static var _tint_cache: Dictionary = {}
+
+
+## 26.3 items/<name>.json tint sources, one colour per tintindex (layer0 = 0, layer1 = 1): constant, grass (colormap
+## at the given temperature / downfall), dye / potion / firework / map colour / team defaults. Flat icons multiplied
+## their layers by none of these (short grass, ferns, vines, lily pads, potions came out grey).
+static func layer_tints(item_name: String) -> Array:
+	if _tint_cache.has(item_name):
+		return _tint_cache[item_name]
+	var out: Array = []
+	if Res.mode == "vanilla":
+		var j = Res.read_json("assets/minecraft/items/%s.json" % item_name)
+		for t in _find_tints(j.get("model") if j is Dictionary else null):
+			out.append(_tint_color(t))
+	_tint_cache[item_name] = out
+	return out
+
+
+static func _find_tints(m) -> Array:
+	if not (m is Dictionary):
+		return []
+	if m.get("tints") is Array:
+		return m["tints"]
+	for k in ["fallback", "on_false", "on_true", "model"]:
+		var r := _find_tints(m.get(k))
+		if not r.is_empty():
+			return r
+	for c in m.get("cases", []):
+		var r2 := _find_tints((c as Dictionary).get("model") if c is Dictionary else null)
+		if not r2.is_empty():
+			return r2
+	return []
+
+
+static func _argb(v: int) -> Color:
+	return Color8((v >> 16) & 255, (v >> 8) & 255, v & 255)
+
+
+static func _tint_color(t) -> Color:
+	if not (t is Dictionary):
+		return Color(1, 1, 1)
+	match str(t.get("type", "")).trim_prefix("minecraft:"):
+		"constant":
+			return _argb(int(t.get("value", -1)))
+		"grass":
+			return Res.colormap(Res.grass_colormap, float(t.get("temperature", 0.5)), float(t.get("downfall", 1.0)), Color8(0x91, 0xBD, 0x59))
+		"dye", "potion", "firework", "map_color", "team":
+			return _argb(int(t.get("default", -1)))
+	return Color(1, 1, 1)
+
+
+static func _tint_layer(im: Image, c: Color) -> void:
+	if c == Color(1, 1, 1):
+		return
+	for y in im.get_height():
+		for x in im.get_width():
+			var px := im.get_pixel(x, y)
+			im.set_pixel(x, y, Color(px.r * c.r, px.g * c.g, px.b * c.b, px.a))
 
 
 static func flat_image(ref: String) -> Image:
@@ -145,7 +203,9 @@ static func flat_image(ref: String) -> Image:
 	var out: Image = null
 	if Res.mode == "vanilla" and ref != "":
 		var tex: Dictionary = Res.baker.resolve(ref)["textures"]
-		for k in ["layer0", "layer1", "layer2"]:
+		var tints := layer_tints(ref.get_file())
+		for li in 3:
+			var k := "layer%d" % li
 			if not tex.has(k):
 				continue
 			var im := Res.load_image(Res.baker.resolve_tex(tex, "#" + k))
@@ -154,6 +214,8 @@ static func flat_image(ref: String) -> Image:
 			im.convert(Image.FORMAT_RGBA8)
 			if im.get_height() > im.get_width():
 				im = im.get_region(Rect2i(0, 0, im.get_width(), im.get_width()))   # animated strip: first frame
+			if li < tints.size():
+				_tint_layer(im, tints[li])
 			if out == null:
 				out = im
 			else:
@@ -203,7 +265,9 @@ static func _make(item: int) -> Image:
 		if m["elements"] is Array and pb > 0:
 			return _render_block(pb, model)
 		var out: Image = null
-		for k in ["layer0", "layer1", "layer2"]:
+		var tints2 := layer_tints(Res.items.names[item])
+		for li in 3:
+			var k := "layer%d" % li
 			if not tex.has(k):
 				continue
 			var im := Res.load_image(Res.baker.resolve_tex(tex, "#" + k))
@@ -212,6 +276,8 @@ static func _make(item: int) -> Image:
 			im.convert(Image.FORMAT_RGBA8)
 			if im.get_height() > im.get_width():
 				im = im.get_region(Rect2i(0, 0, im.get_width(), im.get_width()))
+			if li < tints2.size():
+				_tint_layer(im, tints2[li])
 			if out == null:
 				out = im
 			else:
@@ -260,7 +326,8 @@ static func block_tint(st: int) -> Color:
 	var blocks := Res.blocks
 	var fl := blocks.st_flags[st]
 	if fl & BlockRegistry.F_TINT_GRASS:
-		return Color8(0x91, 0xBD, 0x59)
+		# items/grass_block.json: minecraft:grass at temperature 0.5, downfall 1.0 (the colormap there, #7cbd6b)
+		return Res.colormap(Res.grass_colormap, 0.5, 1.0, Color8(0x7C, 0xBD, 0x6B))
 	if fl & BlockRegistry.F_TINT_FOLIAGE:
 		return Color8(0x48, 0xB5, 0x18)
 	if fl & BlockRegistry.F_TINT_CONST:

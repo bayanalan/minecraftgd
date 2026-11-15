@@ -6,12 +6,15 @@
 ## - Skulls / heads (SkullBlockRenderer: SkullModel 8x8x8 (+hat for players), PiglinHeadModel, DragonHeadModel;
 ##   floor rotation 0-15, wall heads 4 px off the wall at y 4 px).
 ## - Banners (BannerRenderer: flag 20x40x1 / pole / bar at 2/3 scale, flag sway by position + game time).
-## - Bell body (BellModel), decorated pot (DecoratedPotRenderer neck/top/bottom/4 sides), conduit shell.
+## - Bell body (BellModel; swings per BellRenderer while Bells.swing has it), decorated pot (DecoratedPotRenderer
+##   neck/top/bottom/4 sides), conduit (ConduitRenderer: shell while inactive; active: cage turning -0.0375 rad per
+##   tick about (0.5, 1, 0.5) and bobbing 0.3 + g x 0.2, two wind shells (16 and 14 px, orientation every 66 ticks,
+##   22-frame animated texture at 3 ticks a frame), camera-facing eye (open while it hunts) at half size).
+## - Monster spawner / trial spawner mob previews (SpawnerRenderer).
 ## Instances are Node3Ds outside the chunk meshes, kept in sync by scanning loaded chunk palettes incrementally
 ## (3 chunks per frame within RADIUS; block changes of tracked blocks rescan their chunk immediately).
 ## APPROXIMATE: banner flag base is the dye-tinted banner_base texture, pattern layers are offset 0.04 px each instead of
-## Java's draw order, pots show plain sides (no sherds),
-## conduit is the inactive shell only, no christmas chests, no bell swing.
+## Java's draw order, no christmas chests.
 class_name BERender
 extends RefCounted
 
@@ -38,7 +41,16 @@ static var _synced_origin := Vector3i(1 << 30, 0, 0)
 static var _last_pc := Vector2i(1 << 30, 0)
 static var _frame := 0
 static var _anim: Array = []           # [pos, node, lid, flag, is_chest]
+static var _spinners: Array = []       # [pos, spin node] - monster spawner mob previews
+static var _books: Array = []          # [pos, parts dict, state dict] - enchanting table books
+static var _conduits: Array = []       # [pos, parts dict] - conduits (active parts posed while Conduits.active has them)
+static var _wind_mats: Array = []      # [horizontal ShaderMaterial, vertical ShaderMaterial, frames h, frames v]
+static var _wind_frame := -1
+static var _book_acc := 0.0
+static var _book_rng := RandomNumberGenerator.new()
+static var golem_open: Dictionary = {}  # chest pos -> game time until which a copper golem holds it open
 static var _light_slot := -1
+static var _portal_mats: Dictionary = {}   # "end_portal" / "end_gateway" -> ShaderMaterial
 static var _trk := PackedByteArray()   # per state: 1 = drawn by this renderer
 
 
@@ -69,8 +81,28 @@ static func ensure_ids() -> void:
 			kind = "pot"
 		elif n == "conduit":
 			kind = "conduit"
+		elif Shelf.is_shelf(n):
+			kind = "shelf"
+		elif n == "end_portal" or n == "end_gateway":
+			kind = n
+		elif n == "spawner" or n == "trial_spawner":
+			kind = n
+		elif n == "enchanting_table":
+			kind = "enchanting_table"
+		elif n == "campfire" or n == "soul_campfire":
+			kind = "campfire"
 		if kind != "":
 			_ids[i] = kind
+
+
+## Contents changed (shelf items): rebuild that block's node on the next sync.
+static func refresh(p: Vector3i) -> void:
+	if _nodes.has(p):
+		var nd: Node3D = _nodes[p]
+		if is_instance_valid(nd):
+			nd.queue_free()
+		_nodes.erase(p)
+		_ver += 1
 
 
 static func clear() -> void:
@@ -84,6 +116,9 @@ static func clear() -> void:
 	_scanned.clear()
 	_qset.clear()
 	_anim.clear()
+	_spinners.clear()
+	_books.clear()
+	_conduits.clear()
 	_ver += 1
 	_trk = PackedByteArray()
 
@@ -205,6 +240,19 @@ static func update(world) -> void:
 			var nd: Node3D = _nodes[p]
 			if is_instance_valid(nd):
 				nd.position = world.vis(Vector3(p))
+	if not _portal_mats.is_empty():
+		# Java GameTime uniform: ((game time % 24000) + partial tick) / 24000
+		var gtu := fposmod(float(world.game_time), 24000.0) / 24000.0
+		for k in _portal_mats:
+			(_portal_mats[k] as ShaderMaterial).set_shader_parameter("game_time", gtu)
+	if not _spinners.is_empty():
+		_spin_tick(world, dt)
+	if not _books.is_empty():
+		_book_update(world, dt)
+	if not Bells.swing.is_empty():
+		_bell_update(world)
+	if not _conduits.is_empty():
+		_conduit_update(world)
 	if not _anim.is_empty():
 		var open_a := NONE
 		var open_b := NONE
@@ -221,7 +269,7 @@ static func update(world) -> void:
 				continue
 			var lid = e[2]
 			if lid != null:
-				var target := 1.0 if (p == open_a or p == open_b) else 0.0
+				var target := 1.0 if (p == open_a or p == open_b or int(golem_open.get(p, -1)) >= int(gt)) else 0.0
 				var prev := float(nd2.get_meta("open", 0.0))
 				if prev != target:
 					var cur := move_toward(prev, target, 2.0 * dt)
@@ -275,8 +323,18 @@ static func _sync_nodes(world) -> void:
 		_nodes[p] = nd2
 		_relight(world, p, nd2)
 	_anim.clear()
+	_spinners.clear()
+	_books.clear()
+	_conduits.clear()
 	for p in _nodes:
 		var nd3: Node3D = _nodes[p]
+		if nd3.has_meta("conduit"):
+			_conduits.append([p, nd3.get_meta("conduit")])
+		if nd3.has_meta("book"):
+			_books.append([p, nd3.get_meta("book"), {"open": 0.0, "o_open": 0.0, "rot": 0.0, "o_rot": 0.0, "t_rot": 0.0,
+				"flip": 0.0, "o_flip": 0.0, "flip_t": 0.0, "flip_a": 0.0, "time": float(_book_rng.randi_range(0, 1000))}])
+		if nd3.has_meta("spin"):
+			_spinners.append([p, nd3.get_meta("spin")])
 		var lid = nd3.get_meta("lid") if nd3.has_meta("lid") else null
 		var flag = nd3.get_meta("flag") if nd3.has_meta("flag") else null
 		if lid != null or flag != null:
@@ -337,7 +395,326 @@ static func _quad(parent: Node3D, c: Array, uv: Rect2, ts: Vector2, tex: String,
 	parent.add_child(mi)
 
 
+## Java TheEndPortalRenderer.renderCube: end portals draw only their top (y 0.75) and bottom (y 0.375) faces
+## (TheEndPortalBlockEntity.shouldRenderFace: Y axis), end gateways all six faces of the full cube (offsets 1 / 0;
+## faces against opaque neighbours are hidden by the depth test).
+static func _portal_faces(model: Node3D, kind: String) -> void:
+	var up := 0.75 if kind == "end_portal" else 1.0
+	var dn := 0.375 if kind == "end_portal" else 0.0
+	var faces := [[Vector3(0, up, 1), Vector3(1, up, 1), Vector3(1, up, 0), Vector3(0, up, 0)],
+		[Vector3(0, dn, 0), Vector3(1, dn, 0), Vector3(1, dn, 1), Vector3(0, dn, 1)]]
+	if kind == "end_gateway":
+		faces.append_array([[Vector3(0, 0, 1), Vector3(1, 0, 1), Vector3(1, 1, 1), Vector3(0, 1, 1)],
+			[Vector3(1, 0, 0), Vector3(0, 0, 0), Vector3(0, 1, 0), Vector3(1, 1, 0)],
+			[Vector3(1, 0, 1), Vector3(1, 0, 0), Vector3(1, 1, 0), Vector3(1, 1, 1)],
+			[Vector3(0, 0, 0), Vector3(0, 0, 1), Vector3(0, 1, 1), Vector3(0, 1, 0)]])
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for f in faces:
+		for idx in [0, 2, 1, 0, 3, 2]:
+			st.add_vertex(f[idx])
+	var mi := MeshInstance3D.new()
+	mi.mesh = st.commit()
+	mi.material_override = portal_material(kind)
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	model.add_child(mi)
+
+
+## Java BookModel (entity/enchanting_table_book, 64 x 32) under EnchantTableRenderer's translate(0.5, 0.75, 0.5):
+## lids 6 x 10 px at z -1 / +1, seam, page blocks 5 x 8 x 1 and two flipping pages; the renderer adds a bob
+## 0.1 + sin(time * 0.1) * 0.01, turns the book by -rot about Y and tilts it 80 degrees about Z.
+static func _book_parts(inner: Node3D) -> Dictionary:
+	var tex := "entity/enchanting_table_book"
+	var ts := Vector2(64, 32)
+	var yaw := Node3D.new()
+	yaw.position = Vector3(0, 0.85, 0)
+	inner.add_child(yaw)
+	var tilt := Node3D.new()
+	tilt.rotation.z = deg_to_rad(80.0)
+	yaw.add_child(tilt)
+	var d := {"yaw": yaw}
+	d["left_lid"] = _part(tilt, Vector3(0, 0, -1), Vector3(-6, -5, -0.005), Vector3(6, 10, 0.005), Vector2(0, 0), ts, tex)
+	d["right_lid"] = _part(tilt, Vector3(0, 0, 1), Vector3(0, -5, -0.005), Vector3(6, 10, 0.005), Vector2(16, 0), ts, tex)
+	var seam := _part(tilt, Vector3.ZERO, Vector3(-1, -5, 0), Vector3(2, 10, 0.005), Vector2(12, 0), ts, tex)
+	seam.rotation.y = PI / 2.0
+	d["left_pages"] = _part(tilt, Vector3.ZERO, Vector3(0, -4, -0.99), Vector3(5, 8, 1), Vector2(0, 10), ts, tex)
+	d["right_pages"] = _part(tilt, Vector3.ZERO, Vector3(0, -4, -0.01), Vector3(5, 8, 1), Vector2(12, 10), ts, tex)
+	d["flip1"] = _part(tilt, Vector3.ZERO, Vector3(0, -4, 0), Vector3(5, 8, 0.005), Vector2(24, 10), ts, tex)
+	d["flip2"] = _part(tilt, Vector3.ZERO, Vector3(0, -4, 0), Vector3(5, 8, 0.005), Vector2(24, 10), ts, tex)
+	return d
+
+
+static func _wrap_pi(a: float) -> float:
+	return fposmod(a + PI, TAU) - PI
+
+
+## Java EnchantingTableBlockEntity.bookAnimationTick (20 per second): opens and turns toward the nearest player
+## within 3 blocks, idles with tRot += 0.02 otherwise, random page flips.
+static func _book_tick(b: Dictionary, p: Vector3i, pp: Vector3) -> void:
+	b["o_open"] = b["open"]
+	b["o_rot"] = b["rot"]
+	var c := Vector3(p) + Vector3(0.5, 0.5, 0.5)
+	if pp.distance_squared_to(c) < 9.0:   # Level.getNearestPlayer(..., 3.0): d^2 < 3^2
+		b["t_rot"] = atan2(pp.z - c.z, pp.x - c.x)
+		b["open"] = float(b["open"]) + 0.1
+		if float(b["open"]) < 0.5 or _book_rng.randi_range(0, 39) == 0:
+			var f0: float = b["flip_t"]
+			while f0 == float(b["flip_t"]):
+				b["flip_t"] = float(b["flip_t"]) + float(_book_rng.randi_range(0, 3) - _book_rng.randi_range(0, 3))
+	else:
+		b["t_rot"] = float(b["t_rot"]) + 0.02
+		b["open"] = float(b["open"]) - 0.1
+	b["rot"] = _wrap_pi(b["rot"])
+	b["t_rot"] = _wrap_pi(b["t_rot"])
+	b["rot"] = float(b["rot"]) + _wrap_pi(float(b["t_rot"]) - float(b["rot"])) * 0.4
+	b["open"] = clampf(b["open"], 0.0, 1.0)
+	b["time"] = float(b["time"]) + 1.0
+	b["o_flip"] = b["flip"]
+	var h := clampf((float(b["flip_t"]) - float(b["flip"])) * 0.4, -0.2, 0.2)
+	b["flip_a"] = float(b["flip_a"]) + (h - float(b["flip_a"])) * 0.9
+	b["flip"] = float(b["flip"]) + float(b["flip_a"])
+
+
+## Ticks the books at 20 / s and poses them with the partial tick (Java EnchantTableRenderer + BookModel.setupAnim).
+static func _book_update(world, dt: float) -> void:
+	_book_acc += dt
+	var ticks := mini(int(_book_acc * 20.0), 5)
+	_book_acc = minf(_book_acc - ticks / 20.0, 0.05)
+	var pp: Vector3 = world.player.pos + Vector3(0, 0.0, 0)
+	var pt := clampf(_book_acc * 20.0, 0.0, 1.0)
+	for e in _books:
+		var p: Vector3i = e[0]
+		var d: Dictionary = e[1]
+		var b: Dictionary = e[2]
+		if not is_instance_valid(d["yaw"]):
+			continue
+		for t in ticks:
+			_book_tick(b, p, pp)
+		var tf := float(b["time"]) + pt
+		(d["yaw"] as Node3D).position.y = 0.75 + 0.1 + sin(tf * 0.1) * 0.01
+		(d["yaw"] as Node3D).rotation.y = -(float(b["o_rot"]) + _wrap_pi(float(b["rot"]) - float(b["o_rot"])) * pt)
+		var fl := lerpf(b["o_flip"], b["flip"], pt)
+		var j := clampf((fl + 0.25 - floorf(fl + 0.25)) * 1.6 - 0.3, 0.0, 1.0)
+		var k := clampf((fl + 0.75 - floorf(fl + 0.75)) * 1.6 - 0.3, 0.0, 1.0)
+		var f := (sin(tf * 0.02) * 0.1 + 1.25) * lerpf(b["o_open"], b["open"], pt)
+		(d["left_lid"] as Node3D).rotation.y = PI + f
+		(d["right_lid"] as Node3D).rotation.y = -f
+		(d["left_pages"] as Node3D).rotation.y = f
+		(d["right_pages"] as Node3D).rotation.y = -f
+		(d["flip1"] as Node3D).rotation.y = f - f * 2.0 * j
+		(d["flip2"] as Node3D).rotation.y = f - f * 2.0 * k
+		var sx := sin(f) / 16.0
+		for nm in ["left_pages", "right_pages", "flip1", "flip2"]:
+			(d[nm] as Node3D).position.x = sx
+
+
+## Java SpawnerRenderer.renderEntityInSpawner: the spawner's mob at translate(0.5, 0.4, 0.5), turned by spin x 10
+## degrees, then down 0.2, tilted -30 degrees about X and scaled 0.53125 (divided by max(width, height) when that is
+## over 1).
+static func _spawner_mob(inner: Node3D, mob: String) -> bool:
+	if mob == "":
+		return false
+	var def: Dictionary = MobRegistry.get_def(mob)
+	if def.is_empty():
+		return false
+	var rig := EntityRenderer.build_rig(def)
+	EntityRenderer.group_head(rig)
+	var f := 0.53125
+	var g := maxf(float(def.get("w", 0.6)), float(def.get("h", 1.8)))
+	if g > 1.0:
+		f /= g
+	var spin := Node3D.new()
+	spin.position = Vector3(0, 0.4, 0)
+	var tilt := Node3D.new()
+	tilt.position = Vector3(0, -0.2, 0)
+	tilt.rotation.x = deg_to_rad(-30.0)
+	tilt.scale = Vector3.ONE * f
+	tilt.add_child(rig)
+	spin.add_child(tilt)
+	inner.add_child(spin)
+	return true
+
+
+## Java BaseSpawner.clientTick: while a player is within 16 blocks, spin += 1000 / (spawnDelay + 200) degrees per
+## tick (shown x 10).
+static func _spin_tick(world, dt: float) -> void:
+	var pp: Vector3 = world.player.pos
+	for e in _spinners:
+		var p: Vector3i = e[0]
+		var sn = e[1]
+		if not is_instance_valid(sn) or (Vector3(p) + Vector3(0.5, 0.5, 0.5)).distance_to(pp) > 16.0:
+			continue
+		var delay := _spin_delay(world, p)
+		(sn as Node3D).rotation.y = fposmod((sn as Node3D).rotation.y + deg_to_rad(dt * 20.0 * 1000.0 / (delay + 200.0) * 10.0), TAU)
+
+
+## Trial spawners spin like spawners with the time to their next spawn as the delay (20 while waiting).
+static func _spin_delay(world, p: Vector3i) -> int:
+	var d := BlockEntities.get_data(world, p)
+	if str(d.get("id", "")) == "trial_spawner":
+		return maxi(0, int(d.get("next", 0)) - int(world.game_time)) if str(d.get("state", "")) == "active" else 20
+	return maxi(0, int(d.get("delay", 20)))
+
+
+## Partial tick (0..1) of the world's 20 / s clock.
+static func _partial(world) -> float:
+	var acc = world.get("tick_accum")
+	return clampf(float(acc) / 0.05, 0.0, 1.0) if acc != null else 0.0
+
+
+## Java BellRenderer: while shaking, bell_body.xRot / zRot follow Bells.swing_angles (50 ticks), then rest.
+static func _bell_update(world) -> void:
+	var now := int(world.game_time)
+	var pt := _partial(world)
+	for p in Bells.swing.keys():
+		var e: Array = Bells.swing[p]
+		var t := float(now - int(e[0])) + pt
+		var nd = _nodes.get(p)
+		var body = nd.get_meta("bell_body") if nd != null and is_instance_valid(nd) and (nd as Node3D).has_meta("bell_body") else null
+		var ang := Bells.swing_angles(t, e[1])
+		if body != null and is_instance_valid(body):
+			(body as Node3D).rotation = Vector3(ang.x, 0.0, ang.y)
+		if t >= Bells.SHAKE_TICKS:
+			Bells.swing.erase(p)
+
+
+## Java ConduitRenderer active parts (hidden until Conduits.active lists the conduit).
+static func _conduit_parts(inner: Node3D, shell: Node3D) -> Dictionary:
+	var d := {"shell": shell}
+	var act := Node3D.new()
+	act.visible = false
+	inner.add_child(act)
+	d["act"] = act
+	var cage_pos := Node3D.new()
+	act.add_child(cage_pos)
+	var cage_rot := Node3D.new()
+	cage_pos.add_child(cage_rot)
+	_epart(cage_rot, Vector3.ZERO, Vector3(-4, -4, -4), Vector3(8, 8, 8), Vector2(0, 0), Vector2(32, 16), "entity/conduit/cage")
+	d["cage_pos"] = cage_pos
+	d["cage_rot"] = cage_rot
+	var wind := Node3D.new()
+	wind.position = Vector3(0, 0.5, 0)
+	act.add_child(wind)
+	var inner_wind := Node3D.new()
+	inner_wind.scale = Vector3.ONE * 0.875
+	inner_wind.rotation = Vector3(PI, 0.0, PI)
+	wind.add_child(inner_wind)
+	d["wind"] = wind
+	d["wind_meshes"] = [_wind_box(wind), _wind_box(inner_wind)]
+	var eye_pos := Node3D.new()
+	act.add_child(eye_pos)
+	var eye_bb := Node3D.new()
+	eye_pos.add_child(eye_bb)
+	var eye_z := Node3D.new()
+	eye_z.rotation.z = PI
+	eye_bb.add_child(eye_z)
+	d["eye_pos"] = eye_pos
+	d["eye_bb"] = eye_bb
+	d["eye_open"] = _epart(eye_z, Vector3.ZERO, Vector3(-4, -4, 0), Vector3(8, 8, 0), Vector2(0, 0), Vector2(16, 16), "entity/conduit/open_eye", 0.01)
+	d["eye_closed"] = _epart(eye_z, Vector3.ZERO, Vector3(-4, -4, 0), Vector3(8, 8, 0), Vector2(0, 0), Vector2(16, 16), "entity/conduit/closed_eye", 0.01)
+	return d
+
+
+static func _wind_box(parent: Node3D) -> MeshInstance3D:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	EntityRenderer.box_arrays(Vector3(-8, -8, -8), Vector3(16, 16, 16), Vector2(0, 0), Vector2(64, 32), st)
+	var mi := MeshInstance3D.new()
+	mi.mesh = st.commit()
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var wm := _wind_materials()
+	if not wm.is_empty():
+		mi.material_override = wm[0]
+	parent.add_child(mi)
+	return mi
+
+
+## The wind / wind_vertical textures are 22-frame strips (64 x 32 frames, 3 ticks each: .mcmeta): one material each,
+## its texture swapped to the current frame (shared by every conduit, like Java's animated atlas sprites).
+static func _wind_materials() -> Array:
+	if not _wind_mats.is_empty():
+		return _wind_mats
+	var out: Array = []
+	for nm in ["entity/conduit/wind", "entity/conduit/wind_vertical"]:
+		var m := (EntityRenderer.material(nm) as ShaderMaterial).duplicate() as ShaderMaterial
+		var frames: Array = []
+		var im: Image = Res.load_image(nm) if Res.mode == "vanilla" else null
+		if im != null:
+			im.convert(Image.FORMAT_RGBA8)
+			for i in im.get_height() / 32:
+				frames.append(ImageTexture.create_from_image(im.get_region(Rect2i(0, i * 32, 64, 32))))
+		if not frames.is_empty():
+			m.set_shader_parameter("tex", frames[0])
+			m.set_shader_parameter("has_tex", true)
+		out.append([m, frames])
+	_wind_mats = out
+	return out
+
+
+static func _conduit_update(world) -> void:
+	var now := int(world.game_time)
+	var pt := _partial(world)
+	var gt := float(now) + pt
+	var wm := _wind_materials()
+	var wf := (now / 3)
+	if wf != _wind_frame and wm.size() == 2:
+		_wind_frame = wf
+		for e in wm:
+			var frames: Array = e[1]
+			if not frames.is_empty():
+				(e[0] as ShaderMaterial).set_shader_parameter("tex", frames[wf % frames.size()])
+	var cam = world.get("camera")
+	var axis := Vector3(0.5, 1.0, 0.5).normalized()
+	for e in _conduits:
+		var p: Vector3i = e[0]
+		var d: Dictionary = e[1]
+		var act = d.get("act")
+		if act == null or not is_instance_valid(act):
+			continue
+		var a = Conduits.active.get(p)
+		var on: bool = a != null
+		if (act as Node3D).visible != on:
+			(act as Node3D).visible = on
+			(d["shell"] as Node3D).visible = not on
+		if not on:
+			continue
+		# ConduitBlockEntity: activeRotation counts the ticks it has been active (x -0.0375 rad); the bob uses tickCount
+		var f := -0.0375 * (gt - float(a.get("since", now)))
+		var g := sin(gt * 0.1) / 2.0 + 0.5
+		g = g * g + g
+		(d["cage_pos"] as Node3D).position = Vector3(0, 0.3 + g * 0.2, 0)
+		(d["cage_rot"] as Node3D).basis = Basis(axis, f)
+		var i := (now / 66) % 3
+		(d["wind"] as Node3D).rotation = Vector3(PI / 2.0, 0, 0) if i == 1 else (Vector3(0, 0, PI / 2.0) if i == 2 else Vector3.ZERO)
+		if wm.size() == 2:
+			for mi in d["wind_meshes"]:
+				(mi as MeshInstance3D).material_override = wm[1 if i == 1 else 0][0]
+		(d["eye_pos"] as Node3D).position = Vector3(0, 0.3 + g * 0.2, 0)
+		var hunt: bool = bool(a.get("hunt", false))
+		(d["eye_open"] as Node3D).visible = hunt
+		(d["eye_closed"] as Node3D).visible = not hunt
+		if cam != null and is_instance_valid(cam):
+			var bb: Node3D = d["eye_bb"]
+			var tr := bb.global_transform
+			tr.basis = (cam as Node3D).global_transform.basis.orthonormalized().scaled(Vector3.ONE * 0.5)
+			bb.global_transform = tr
+
+
+static func portal_material(kind: String) -> ShaderMaterial:
+	if _portal_mats.has(kind):
+		return _portal_mats[kind]
+	var m := ShaderMaterial.new()
+	m.shader = load("res://shaders/end_portal.gdshader")
+	m.set_shader_parameter("sky_tex", UiKit.sprite("environment/end_sky"))
+	m.set_shader_parameter("portal_tex", UiKit.sprite("entity/end_portal/end_portal"))
+	m.set_shader_parameter("layers", 15 if kind == "end_portal" else 16)
+	_portal_mats[kind] = m
+	return m
+
+
 static func _make(world, p: Vector3i, st: int) -> Node3D:
+	if _ids.get(Res.blocks.st_block[st], "") == "conduit" and BlockEntities.get_data(world, p).is_empty():
+		BlockEntities.set_data(world, p, {"id": "conduit"})   # (conduits placed before they had block entity data)
 	var r := build(st, BlockEntities.get_data(world, p))
 	if r != null:
 		world.add_child(r)
@@ -359,6 +736,9 @@ static func build(st: int, be: Dictionary) -> Node3D:
 	inner.add_child(model)
 	var face := b.get_prop(st, "facing") if b.has_prop(st, "facing") else ""
 	match kind:
+		"shelf":
+			inner.rotation.y = {"north": 0.0, "east": -PI / 2.0, "south": PI, "west": PI / 2.0}.get(face, 0.0)
+			Shelf.build_items(model, be)
 		"chest":
 			var type := b.get_prop(st, "type") if b.has_prop(st, "type") else "single"
 			var base := "ender" if nm == "ender_chest" else ("trapped" if nm == "trapped_chest" else "normal")
@@ -513,9 +893,49 @@ static func build(st: int, be: Dictionary) -> Node3D:
 				_epart(sc, Vector3.ZERO, Vector3(-1, -30, -1), Vector3(2, 42, 2), Vector2(44, 0), ts4, tb)
 			_epart(sc, Vector3.ZERO, Vector3(-10, -32, -1), Vector3(20, 2, 2), Vector2(0, 42), ts4, tb)
 			model.queue_free()
+		"end_portal", "end_gateway":
+			_portal_faces(model, kind)
+		"enchanting_table":
+			root.set_meta("book", _book_parts(inner))
+			model.queue_free()
+		"campfire":
+			# Java CampfireRenderer: slot l at (0.5, 0.44921875, 0.5), turned -toYRot of the direction (l + facing 2D) % 4,
+			# laid flat (X 90), shifted (-0.3125, -0.3125, 0) and scaled 0.375 (FIXED display)
+			var its: Array = be.get("items", [])
+			var f2d: int = {"south": 0, "west": 1, "north": 2, "east": 3}.get(face, 0)
+			var any := false
+			for l in mini(4, its.size()):
+				var cs := ItemStack.from_dict(its[l])
+				if cs.is_empty():
+					continue
+				var nd := HeldItems.item_node(cs, "fixed", false)
+				if nd == null:
+					continue
+				var yr: float = [0.0, 90.0, 180.0, 270.0][(l + f2d) % 4]
+				var hold := Node3D.new()
+				hold.transform = Transform3D(Basis(), Vector3(0.5, 0.44921875, 0.5)) * Transform3D(Basis(Vector3.UP, deg_to_rad(-yr)), Vector3.ZERO) * Transform3D(Basis(Vector3.RIGHT, deg_to_rad(90.0)), Vector3.ZERO) * Transform3D(Basis(), Vector3(-0.3125, -0.3125, 0.0)) * Transform3D(Basis.from_scale(Vector3.ONE * 0.375), Vector3.ZERO)
+				hold.add_child(nd)
+				model.add_child(hold)
+				any = true
+			if not any:
+				root.queue_free()
+				return null
+		"spawner", "trial_spawner":
+			# trial spawners (TrialSpawnerRenderer) show the mob they spawn next while waiting for players / active
+			var smob := str(be.get("mob", ""))
+			if kind == "trial_spawner":
+				var tss := b.get_prop(st, "trial_spawner_state")
+				smob = Trials.display_mob(be) if str(be.get("id", "")) == "trial_spawner" and (tss == "waiting_for_players" or tss == "active") else ""
+			if not _spawner_mob(inner, smob):
+				root.queue_free()
+				return null
+			root.set_meta("spin", inner.get_child(inner.get_child_count() - 1))
+			model.queue_free()
 		"bell":
-			_part(model, Vector3(8, 12, 8), Vector3(-3, -6, -3), Vector3(6, 7, 6), Vector2(0, 0), Vector2(32, 32), "entity/bell/bell_body")
-			_part(model, Vector3.ZERO, Vector3(4, 4, 4), Vector3(8, 2, 8), Vector2(0, 13), Vector2(32, 32), "entity/bell/bell_body")
+			# Java BellModel: bell_body (pivot 8, 12, 8) with bell_base as its child, so the lip swings with the body
+			var body := _part(model, Vector3(8, 12, 8), Vector3(-3, -6, -3), Vector3(6, 7, 6), Vector2(0, 0), Vector2(32, 32), "entity/bell/bell_body")
+			_part(body, Vector3(-8, -12, -8), Vector3(4, 4, 4), Vector3(8, 2, 8), Vector2(0, 13), Vector2(32, 32), "entity/bell/bell_body")
+			root.set_meta("bell_body", body)
 		"pot":
 			inner.rotation.y = deg_to_rad(180.0 - float(YROT.get(face, 180.0)))
 			var bt := "entity/decorated_pot/decorated_pot_base"
@@ -531,15 +951,23 @@ static func build(st: int, be: Dictionary) -> Node3D:
 			_quad(model, [Vector3(1, 0, 15), Vector3(1, 0, 1), Vector3(15, 0, 1), Vector3(15, 0, 15)], Rect2(0, 13, 14, 14), t32, bt, 0.5)
 			var s16 := Vector2(16, 16)
 			var sr := Rect2(1, 0, 14, 16)
-			_quad(model, [Vector3(1, 16, 15), Vector3(1, 0, 15), Vector3(15, 0, 15), Vector3(15, 16, 15)], sr, s16, sd, 0.8)
-			_quad(model, [Vector3(15, 16, 1), Vector3(15, 0, 1), Vector3(1, 0, 1), Vector3(1, 16, 1)], sr, s16, sd, 0.8)
-			_quad(model, [Vector3(15, 16, 15), Vector3(15, 0, 15), Vector3(15, 0, 1), Vector3(15, 16, 1)], sr, s16, sd, 0.6)
-			_quad(model, [Vector3(1, 16, 1), Vector3(1, 0, 1), Vector3(1, 0, 15), Vector3(1, 16, 15)], sr, s16, sd, 0.6)
+			# Java PotDecorations (back, left, right, front): a sherd shows its <name>_pottery_pattern, bricks / none
+			# the plain side (model: front = z 1, back = z 15, left = x 15, right = x 1 before the facing turn)
+			var sh: Array = be.get("sherds", []) if be.get("sherds", []) is Array else []
+			var side := func(i: int) -> String:
+				var it := str(sh[i]).trim_prefix("minecraft:") if i < sh.size() else ""
+				return "entity/decorated_pot/" + it.trim_suffix("_sherd") + "_pattern" if it.ends_with("_pottery_sherd") else sd
+			_quad(model, [Vector3(1, 16, 15), Vector3(1, 0, 15), Vector3(15, 0, 15), Vector3(15, 16, 15)], sr, s16, side.call(0), 0.8)
+			_quad(model, [Vector3(15, 16, 1), Vector3(15, 0, 1), Vector3(1, 0, 1), Vector3(1, 16, 1)], sr, s16, side.call(3), 0.8)
+			_quad(model, [Vector3(15, 16, 15), Vector3(15, 0, 15), Vector3(15, 0, 1), Vector3(15, 16, 1)], sr, s16, side.call(1), 0.6)
+			_quad(model, [Vector3(1, 16, 1), Vector3(1, 0, 1), Vector3(1, 0, 15), Vector3(1, 16, 15)], sr, s16, side.call(2), 0.6)
 		"conduit":
 			var cs := Node3D.new()
 			cs.position = Vector3(0, 0.5, 0)
 			inner.add_child(cs)
 			_epart(cs, Vector3.ZERO, Vector3(-3, -3, -3), Vector3(6, 6, 6), Vector2(0, 0), Vector2(32, 16), "entity/conduit/base")
+			if str(be.get("id", "")) == "conduit":
+				root.set_meta("conduit", _conduit_parts(inner, cs))
 			model.queue_free()
 		_:
 			root.queue_free()

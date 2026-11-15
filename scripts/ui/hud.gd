@@ -21,10 +21,33 @@ var _blink_until := 0
 var title_start := 0
 var actionbar_start := 0
 var title_times := [10, 70, 20]   # fade in, stay, fade out (ticks)
+var _vig: Control
+var _ovl: Control
+var _vig_b := 0.0        # Java Gui.vignetteBrightness
+var _vig_tick := -1
+var _scope := 0.5        # Java Gui.scopeScale
+var _frame_dt := 0.0
 
 
 func _ready() -> void:
 	layer = 5
+	add_child(NauseaWarp.new(world))   # nausea / portal world warp (its own layer 4, under the HUD)
+	# Java Gui.renderCameraOverlays (drawn under the rest of the HUD, also with F1): vignette (multiplied), then
+	# spyglass scope / pumpkin blur, powder snow outline, nether portal
+	_vig = Control.new()
+	_vig.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_vig.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# vignette.png.mcmeta: blur (linear). Java blends it as dst x (1 - texture x b); drawn here as black with alpha
+	# texture x b (the same result with plain alpha blending), only the border bands around its fully clear centre
+	_vig.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR
+	_vig_prepare()
+	_vig.draw.connect(_draw_vignette)
+	add_child(_vig)
+	_ovl = Control.new()
+	_ovl.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_ovl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_ovl.draw.connect(_draw_overlays)
+	add_child(_ovl)
 	canvas = Control.new()
 	canvas.set_anchors_preset(Control.PRESET_FULL_RECT)
 	canvas.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -157,11 +180,13 @@ func _draw_toasts(font: Font, size: Vector2) -> void:
 
 ## click: a command a click on the message puts in the chat box (Java ClickEvent SUGGEST_COMMAND, e.g. /locate's
 ## green [x, ~, z] teleport coordinates).
-func chat_message(t: String, click: String = "") -> void:
+## hl: colour of the [bracketed] component (advancement names: green task / goal, dark purple challenge); clickable
+## components (click != "") are green.
+func chat_message(t: String, click: String = "", hl: Color = Color(0, 0, 0, 0)) -> void:
 	# Java ChatComponent.addMessage: wrapped to the chat width (320) into separate lines at add time
 	var now := Time.get_ticks_msec()
 	for line in wrap_chat(t, chat_width()):
-		chat.append([line, now, click])
+		chat.append([line, now, click, hl])
 	while chat.size() > 100:
 		chat.pop_front()
 	print("[chat] ", t)
@@ -192,10 +217,154 @@ static func wrap_chat(t: String, w: float) -> Array:
 
 func _process(delta: float) -> void:
 	canvas.queue_redraw()
+	# the camera overlays only redraw while they show something or just stopped (the vignette when its strength moved)
+	if world != null and world.player != null:
+		var vq := int(_vig_b * 255.0)
+		if vq != _vig_drawn:
+			_vig_drawn = vq
+			_vig.queue_redraw()
+		var p0: Player = world.player
+		var ovl_on: bool = p0.ticks_frozen > 0 or float(world.portal_spin) > 0.0 or (UseItem.is_using(p0)) or not p0.inventory.get_slot(Inventory.ARMOR0 + 3).is_empty()
+		if ovl_on or _ovl_was:
+			_ovl.queue_redraw()
+		_ovl_was = ovl_on
+		if world.game_time != _vig_tick:
+			_vig.queue_redraw()   # (the brightness easing runs inside the draw, once per game tick)
+	_frame_dt = delta
 	_dbg_timer -= delta
 	if _dbg_timer <= 0.0 and world.show_debug:
 		_dbg_timer = 0.25
 		_dbg_text = _debug_text()
+
+
+var _vig_tex: Texture2D
+var _vig_drawn := -1
+var _ovl_was := true
+var _vig_inner := Rect2(0.5, 0.5, 0.0, 0.0)
+
+
+## The vignette as black + alpha (= its grey value) and the centred UV rect where it is fully clear.
+func _vig_prepare() -> void:
+	var im: Image = Res.load_image("misc/vignette")
+	if im == null:
+		return
+	im.convert(Image.FORMAT_RGBA8)
+	var w := im.get_width()
+	var hgt := im.get_height()
+	var src := im.get_data()
+	var dst := PackedByteArray()
+	dst.resize(w * hgt * 4)
+	for i in w * hgt:
+		dst[i * 4 + 3] = src[i * 4]
+	_vig_tex = ImageTexture.create_from_image(Image.create_from_data(w, hgt, false, Image.FORMAT_RGBA8, dst))
+	# grow a centred clear box while every pixel inside stays at alpha 0
+	var cx := w / 2
+	var cy := hgt / 2
+	var hw := 0
+	var hh := 0
+	var grow := true
+	while grow and hw < cx - 1 and hh < cy - 1:
+		grow = true
+		for x in range(cx - hw - 1, cx + hw + 1):
+			if dst[((cy - hh - 1) * w + x) * 4 + 3] != 0 or dst[((cy + hh) * w + x) * 4 + 3] != 0:
+				grow = false
+		for y in range(cy - hh - 1, cy + hh + 1):
+			if dst[(y * w + cx - hw - 1) * 4 + 3] != 0 or dst[(y * w + cx + hw) * 4 + 3] != 0:
+				grow = false
+		if grow:
+			hw += 1
+			hh += 1
+	# keep a pixel of margin for the linear filter
+	hw = maxi(0, hw - 1)
+	hh = maxi(0, hh - 1)
+	_vig_inner = Rect2(float(cx - hw) / w, float(cy - hh) / hgt, float(hw * 2) / w, float(hh * 2) / hgt)
+
+
+## Java Gui.renderVignette: misc/vignette.png multiplied into the frame (dst x (1 - texture x b)); b eases 1 % per tick
+## toward 1 - brightness at the eyes (LightTexture.getBrightness of max(sky - darkening, block light)). Fancy graphics.
+func _draw_vignette() -> void:
+	if world == null or world.player == null or not world.spawn_ready:
+		return
+	if not Settings.get_v("vignette") or str(Settings.get_v("graphics")) == "fast":
+		return
+	var p: Player = world.player
+	var gt: int = world.game_time
+	if _vig_tick < 0 or gt < _vig_tick or gt - _vig_tick > 100:
+		_vig_tick = gt
+	while _vig_tick < gt:
+		_vig_tick += 1
+		var l: int = world.cm.get_light(int(floor(p.pos.x)), int(floor(p.pos.y + p.eye_height())), int(floor(p.pos.z)))
+		var raw := maxi((l >> 4) - int(world.sky_darken_level()), l & 15)
+		var f := raw / 15.0
+		var g := f / (4.0 - 3.0 * f)
+		var amb := float(world.dim_type.get("ambient_light", 0.0))
+		var br := g + amb * (1.0 - g)   # Mth.lerp(ambientLight, g, 1)
+		_vig_b += (clampf(1.0 - br, 0.0, 1.0) - _vig_b) * 0.01
+	var h := clampf(_vig_b, 0.0, 1.0)
+	if h * 255.0 < 0.5 or _vig_tex == null:
+		return   # (under half an 8-bit step anywhere: no visible change - bright daylight)
+	var sz := _vig.size
+	var col := Color(1, 1, 1, h)
+	var r := _vig_inner   # (UV) fully clear centre: skipped
+	var ts := Vector2(_vig_tex.get_size())
+	var bands := [Rect2(0, 0, 1, r.position.y), Rect2(0, r.end.y, 1, 1.0 - r.end.y),
+		Rect2(0, r.position.y, r.position.x, r.size.y), Rect2(r.end.x, r.position.y, 1.0 - r.end.x, r.size.y)]
+	for bd in bands:
+		var b2: Rect2 = bd
+		if b2.size.x <= 0.0 or b2.size.y <= 0.0:
+			continue
+		_vig.draw_texture_rect_region(_vig_tex, Rect2(b2.position * sz, b2.size * sz), Rect2(b2.position * ts, b2.size * ts), col)
+
+
+## Java Gui.renderCameraOverlays (first person): spyglass scope (scopeScale eases from 0.5 to 1.125 by half the frame's
+## ticks; black outside the square), otherwise a worn item's camera overlay (carved pumpkin: misc/pumpkinblur);
+## powder snow outline at the frozen fraction; nether portal texture at f^4 x 0.8 + 0.2 of the spin intensity.
+func _draw_overlays() -> void:
+	if world == null or world.player == null or not world.spawn_ready:
+		return
+	var p: Player = world.player
+	var sz := _ovl.size
+	var first: bool = world.third_person == 0
+	var scoping := first and UseItem.is_using(p) and UseItem.anim(UseItem.using_stack(p)) == "spyglass"
+	if scoping:
+		_scope = lerpf(_scope, 1.125, minf(1.0, 0.5 * _frame_dt * 20.0))
+		var f := minf(sz.x, sz.y)
+		var hh := minf(sz.x / f, sz.y / f) * _scope
+		var i := floorf(f * hh)
+		var k := floorf((sz.x - i) / 2.0)
+		var l := floorf((sz.y - i) / 2.0)
+		var st := UiKit.sprite("misc/spyglass_scope")
+		if st != null:
+			_ovl.draw_texture_rect(st, Rect2(k, l, i, i), false)
+		_ovl.draw_rect(Rect2(0, l + i, sz.x, sz.y - l - i), Color.BLACK)
+		_ovl.draw_rect(Rect2(0, 0, sz.x, l), Color.BLACK)
+		_ovl.draw_rect(Rect2(0, l, k, i), Color.BLACK)
+		_ovl.draw_rect(Rect2(k + i, l, sz.x - k - i, i), Color.BLACK)
+	else:
+		_scope = 0.5
+		if first:
+			var helm := p.inventory.get_slot(Inventory.ARMOR0 + 3)
+			if not helm.is_empty() and helm.name() == "carved_pumpkin":
+				var pt := UiKit.sprite("misc/pumpkinblur")
+				if pt != null:
+					_ovl.draw_texture_rect(pt, Rect2(Vector2.ZERO, sz), false)
+	if p.ticks_frozen > 0:
+		var ps := UiKit.sprite("misc/powder_snow_outline")
+		if ps != null:
+			_ovl.draw_texture_rect(ps, Rect2(Vector2.ZERO, sz), false, Color(1, 1, 1, minf(1.0, p.ticks_frozen / 140.0)))
+	var spin := lerpf(float(world.portal_spin_old), float(world.portal_spin), clampf(float(world.tick_accum) / 0.05, 0.0, 1.0))
+	if spin > 0.0 and not p.effects.has("nausea"):
+		var a := spin
+		if a < 1.0:
+			a = a * a
+			a = a * a
+			a = a * 0.8 + 0.2
+		var nt := UiKit.sprite("block/nether_portal")
+		if nt != null:
+			var fw := nt.get_width()
+			var frames := maxi(1, nt.get_height() / fw)
+			var fr: int = int(world.game_time) % frames
+			_ovl.draw_texture_rect_region(nt, Rect2(Vector2.ZERO, sz), Rect2(0, fr * fw, fw, fw), Color(1, 1, 1, a))
 
 
 func _spr(path: String) -> Texture2D:
@@ -203,9 +372,10 @@ func _spr(path: String) -> Texture2D:
 
 
 func _draw_hud() -> void:
+	var s := UiKit.scale()
+	Glint.begin(canvas, s)
 	if world == null or world.player == null:
 		return
-	var s := UiKit.scale()
 	var size := canvas.size / s
 	canvas.draw_set_transform(Vector2.ZERO, 0.0, Vector2(s, s))
 	var p: Player = world.player
@@ -222,9 +392,11 @@ func _draw_hud() -> void:
 	if world.hud_hidden:
 		return
 	if p.effects.has("darkness"):
-		# Java Darkness: pulsing dimming of the view
-		var pulse := 0.45 + 0.25 * sin(float(Time.get_ticks_msec()) / 700.0)
-		canvas.draw_rect(Rect2(Vector2.ZERO, size), Color(0, 0, 0, pulse))
+		# Java Darkness: pulsing dimming of the view (the black 15-block fog is WorldManager._update_sky); wiki: Options -
+		# Darkness Pulsing scales how dark it gets (0 %: no dimming). Pulse shape / period: no wiki value.
+		var pulse := (0.45 + 0.25 * sin(float(Time.get_ticks_msec()) / 700.0)) * float(Settings.get_v("darkness_pulsing"))
+		if pulse > 0.0:
+			canvas.draw_rect(Rect2(Vector2.ZERO, size), Color(0, 0, 0, pulse))
 	_draw_toasts(font, size)
 	_draw_titles(font, size)
 	if Settings.get_v("adv_coords") and not world.show_debug:
@@ -307,31 +479,48 @@ func _draw_hud() -> void:
 	else:
 		canvas.draw_rect(Rect2(sx, by - 23, 24, 24), Color.WHITE, false, 1.0)
 	for i in 9:
-		_draw_stack(p.inventory.get_slot(i), Vector2(cx - 88 + i * 20, by - 19), font)
+		_draw_stack(p.inventory.get_slot(i), Vector2(cx - 88 + i * 20, by - 19), font, float(p.inventory.pop.get(i, 0)))
 	var off := p.inventory.get_slot(Inventory.OFFHAND)
 	if not off.is_empty():
 		var ot := _spr("hotbar_offhand_left")
 		if ot != null:
 			canvas.draw_texture(ot, Vector2(cx - 91 - 29, by - 23))
-		_draw_stack(off, Vector2(cx - 91 - 26, by - 19), font)
+		_draw_stack(off, Vector2(cx - 91 - 26, by - 19), font, float(p.inventory.pop.get(Inventory.OFFHAND, 0)))
 	if p.mode == Player.Mode.SURVIVAL or p.mode == Player.Mode.ADVENTURE:
 		_draw_stats(p, cx, by, font)
+	_draw_selected_name(p, cx, by, font)
 	_draw_chat(font, size)
 	_draw_subtitles(font, size)
 	_draw_debug(font, size)
 
 
-func _draw_stack(st: ItemStack, pos: Vector2, font: Font) -> void:
+func _draw_stack(st: ItemStack, pos: Vector2, font: Font, pop_t: float = 0.0) -> void:
 	if st == null or st.is_empty():
 		return
 	var ic := ItemIcons.icon_for(st)
-	if ic != null:
+	var popf := pop_t - clampf(float(world.tick_accum) / 0.05, 0.0, 1.0) if pop_t > 0.0 else 0.0
+	if ic != null and popf > 0.0:
+		# Java Gui.renderSlot pop: g = 1 + f / 5, the icon scaled (1 / g, (g + 1) / 2) about (x + 8, y + 12)
+		var g := 1.0 + popf / 5.0
+		var s := UiKit.scale()
+		var piv := pos + Vector2(8, 12)
+		canvas.draw_set_transform_matrix(Transform2D(0.0, Vector2(s, s), 0.0, Vector2.ZERO) * Transform2D(0.0, piv) * Transform2D(0.0, Vector2(1.0 / g, (g + 1.0) / 2.0), 0.0, Vector2.ZERO) * Transform2D(0.0, -piv))
 		canvas.draw_texture_rect(ic, Rect2(pos, Vector2(16, 16)), false)
+		canvas.draw_set_transform(Vector2.ZERO, 0.0, Vector2(s, s))
+	elif ic != null:
+		canvas.draw_texture_rect(ic, Rect2(pos, Vector2(16, 16)), false)
+		if Glint.has_glint(st):
+			Glint.add(canvas, ic, Rect2(pos, Vector2(16, 16)), st, UiKit.scale())
+	if world != null and world.player != null and world.player.on_cooldown(st.name()):
+		# Java GuiGraphics.renderItemCooldown: white 50 % covering the remaining fraction, from the top
+		var cf: float = world.player.cooldown_percent(st.name(), clampf(float(world.tick_accum) / 0.05, 0.0, 1.0))
+		var top := pos.y + floorf(16.0 * (1.0 - cf))
+		canvas.draw_rect(Rect2(pos.x, top, 16, ceilf(16.0 * cf)), Color(1, 1, 1, 127.0 / 255.0))
 	if st.count > 1:
 		var t := str(st.count)
 		var w := font.get_string_size(t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
-		canvas.draw_string(font, pos + Vector2(17 - w + 1, 17 + 1), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color(0.25, 0.25, 0.25))
-		canvas.draw_string(font, pos + Vector2(17 - w, 17), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color.WHITE)
+		canvas.draw_string(font, pos + Vector2(17 - w + 1, 16 + 1), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color(0.25, 0.25, 0.25))
+		canvas.draw_string(font, pos + Vector2(17 - w, 16), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color.WHITE)
 	var md: int = Res.items.max_damage[st.item]
 	if md > 0 and st.damage > 0:
 		var f := 1.0 - float(st.damage) / md
@@ -339,12 +528,65 @@ func _draw_stack(st: ItemStack, pos: Vector2, font: Font) -> void:
 		canvas.draw_rect(Rect2(pos + Vector2(2, 13), Vector2(roundf(13 * f), 1)), Color.from_hsv(f / 3.0, 1, 1))
 
 
+## Java Gui.tick / renderSelectedItemName: switching to a different item (or name) shows its name (rarity colour) for
+## 40 ticks x Notification Time (1.0) above the hotbar at guiHeight - 59 (+14 when the player can't be hurt), alpha
+## timer * 256 / 10 (fades over the last 10 ticks); no backdrop with the default "chat only" text background.
+var _hl_timer := 0
+var _hl_last: ItemStack = null
+var _hl_tick := -1
+var _hl_text := ""
+var _hl_color := Color.WHITE
+
+
+func _draw_selected_name(p: Player, cx: float, by: float, font: Font) -> void:
+	var gt: int = world.game_time
+	if _hl_tick < 0 or gt < _hl_tick or gt - _hl_tick > 40:
+		_hl_tick = gt
+	while _hl_tick < gt:
+		_hl_tick += 1
+		var cur := p.inventory.held()
+		if cur.is_empty():
+			_hl_timer = 0
+			_hl_last = null
+			continue
+		# (the hover name only changes with the item or its components: rebuilt only then)
+		var same_stack := _hl_last != null and cur.item == _hl_last.item and cur.components == _hl_last.components
+		var nm := _hl_text if same_stack else str(ContainerUI.item_tooltip(cur)[0][0])
+		if _hl_last != null and not _hl_last.is_empty() and cur.item == _hl_last.item and nm == _hl_text:
+			if _hl_timer > 0:
+				_hl_timer -= 1
+		else:
+			_hl_timer = 40
+			var tip: Array = ContainerUI.item_tooltip(cur)[0]
+			_hl_text = str(tip[0])
+			_hl_color = tip[1]
+		if not same_stack:
+			_hl_last = cur.copy()
+	if _hl_timer <= 0 or _hl_text == "" or world.screen != null:
+		return
+	var a := mini(255, int(_hl_timer * 256.0 / 10.0))
+	if a <= 0:
+		return
+	var w := font.get_string_size(_hl_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
+	var x := floorf((cx * 2.0 - w) / 2.0)
+	var y := by - 59.0 + (14.0 if (p.is_creative() or p.is_spectator()) else 0.0)
+	var col := Color(_hl_color.r, _hl_color.g, _hl_color.b, a / 255.0)
+	var shadow := Color(col.r * 0.25, col.g * 0.25, col.b * 0.25, col.a)
+	canvas.draw_string(font, Vector2(x + 1, y + 7 + 1), _hl_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, shadow)
+	canvas.draw_string(font, Vector2(x, y + 7), _hl_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, col)
+
+
+var _jit_rng := RandomSources.LegacyRandom.new(0)
+var _last_bubbles := 10   # full air bubbles shown last frame (bubble pop sound)
+
+
 func _draw_stats(p: Player, cx: float, by: float, font: Font) -> void:
 	var hc: bool = world.hardcore
 	var pre := "hardcore_" if hc else ""
 	var poison := p.effects.has("poison")
 	var wither := p.effects.has("wither")
-	var kind := "poisoned_" if poison else ("withered_" if wither else "")
+	# Java Gui.HeartType.forPlayer: poisoned, withered, then frozen (fully frozen in powder snow)
+	var kind := "poisoned_" if poison else ("withered_" if wither else ("frozen_" if p.ticks_frozen >= 140 else ""))
 	# Java Gui.renderPlayerHealth: health down -> blink 20 ticks, up -> 10 ticks (switching every 3); the hearts lost
 	# since the display health (which lags 1 s) show white while blinking, under the current red ones
 	var hp := int(ceil(p.health))
@@ -364,48 +606,64 @@ func _draw_stats(p: Player, cx: float, by: float, font: Font) -> void:
 	var cont := _spr(("heart/container_hardcore" if hc else "heart/container") + ("_blinking" if blink else ""))
 	if cont == null:
 		cont = _spr("heart/container_hardcore" if hc else "heart/container")
+	# Java Gui.renderPlayerHealth: one java.util.Random seeded tickCount * 312871 per frame (the jitter stays put for a
+	# whole tick); renderHearts draws nextInt(2) per heart from the last (absorption) heart down to the first while
+	# health + absorption <= 4, then renderFood nextInt(3) - 1 per icon on ticks where tickCount % (food * 3 + 1) == 0
+	# with no saturation
+	# Java Gui.renderPlayerHealth: hearts for max(max health, shown health) plus absorption in rows of 10 (row height
+	# max(10 - (rows - 2), 3)), drawn from the last heart to the first (the low-health jitter nextInt(2) per heart in that
+	# order); absorption hearts follow the health hearts; the armour row sits above all heart rows
 	var shake := p.health + p.absorption <= 4.0
-	var shake_rng := RandomNumberGenerator.new()
-	shake_rng.seed = tick * 312871
+	_jit_rng.set_seed(tick * 312871)
+	var max_h: float = maxf(p.max_health, float(maxi(_display_health, hp)))
+	var hearts := ceili(max_h / 2.0)
+	var ab := ceili(p.absorption)
+	var abh := ceili(ab / 2.0)
+	var rows := ceili((max_h + float(ab)) / 2.0 / 10.0)
+	var rh := maxi(10 - (rows - 2), 3)
+	var y0 := by - 39
 	var regen_heart := -1
 	if p.effects.has("regeneration"):
-		regen_heart = tick % int(ceil(20.0 + 5.0))
-	for i in 10:
-		var x := cx - 91 + i * 8
-		var y := by - 39
+		regen_heart = tick % int(ceil(max_h + 5.0))
+	# wiki: Health - poison overrides wither, which overrides absorption: poisoned / withered bars show the absorption
+	# hearts in that texture too; hardcore has its own absorbing sprites
+	var akind := kind if kind != "" else "absorbing_"
+	for l in range(hearts + abh - 1, -1, -1):
+		var x := cx - 91 + (l % 10) * 8
+		var y := y0 - (l / 10) * rh
 		if shake:
-			y += shake_rng.randi_range(0, 1)
-		if i == regen_heart:
+			y += _jit_rng.next_int_bound(2)
+		if l < hearts and l == regen_heart:
 			y -= 2
 		if cont != null:
 			canvas.draw_texture(cont, Vector2(x, y))
-		var u := i * 2
+		if l >= hearts:
+			var q := (l - hearts) * 2
+			if q < ab:
+				_icon("heart/%s%s%s" % [akind, pre, "half" if q + 1 == ab else "full"], Vector2(x, y), Color(1, 0.85, 0.1))
+			continue
+		var u := l * 2
 		if blink and u < _display_health:
 			var half_b := u + 1 == _display_health
 			_icon("heart/%s%s%s_blinking" % [kind, pre, "half" if half_b else "full"], Vector2(x, y), Color(1, 1, 1), 0.5 if half_b else 1.0)
 		if u < hp:
 			var half_n := u + 1 == hp
 			_icon("heart/%s%s%s" % [kind, pre, "half" if half_n else "full"], Vector2(x, y), Color(0.9, 0.1, 0.1), 0.5 if half_n else 1.0)
-	if p.absorption > 0:
-		var ab := int(ceil(p.absorption))
-		for i in ceili(ab / 2.0):
-			var x2 := cx - 91 + (i % 10) * 8
-			var y2 := by - 49 - (i / 10) * 10
-			_icon("heart/absorbing_full" if ab - i * 2 >= 2 else "heart/absorbing_half", Vector2(x2, y2), Color(1, 0.85, 0.1))
-	# armor
+	# armor (Java renderArmor: y - (rows - 1) x row height - 10)
 	var ar := p.inventory.armor_points()
 	if ar > 0:
+		var ay := y0 - (rows - 1) * rh - 10
 		for i in 10:
 			var x3 := cx - 91 + i * 8
 			var v3 := ar - i * 2
-			_icon("armor_full" if v3 >= 2 else ("armor_half" if v3 == 1 else "armor_empty"), Vector2(x3, by - 49), Color(0.8, 0.8, 0.8), 1.0 if v3 >= 2 else (0.5 if v3 == 1 else 0.15))
+			_icon("armor_full" if v3 >= 2 else ("armor_half" if v3 == 1 else "armor_empty"), Vector2(x3, ay), Color(0.8, 0.8, 0.8), 1.0 if v3 >= 2 else (0.5 if v3 == 1 else 0.15))
 	# food
 	var hunger := p.effects.has("hunger")
 	for i in 10:
 		var x4 := cx + 91 - 9 - i * 8
 		var y4 := by - 39
-		if p.saturation <= 0.0 and world.game_time % (p.food * 3 + 1) == 0:
-			y4 += randi_range(-1, 1)
+		if p.saturation <= 0.0 and tick % (p.food * 3 + 1) == 0:
+			y4 += _jit_rng.next_int_bound(3) - 1
 		_icon("food_empty" + ("_hunger" if hunger else ""), Vector2(x4, y4), Color(0.3, 0.2, 0.1))
 		var v4 := p.food - i * 2
 		if v4 >= 2:
@@ -414,14 +672,37 @@ func _draw_stats(p: Player, cx: float, by: float, font: Font) -> void:
 			_icon("food_half" + ("_hunger" if hunger else ""), Vector2(x4, y4), Color(0.75, 0.45, 0.2), 0.5)
 	# air
 	if p.eyes_in_water or p.air < 300:
-		var bubbles := int(ceil(float(maxi(p.air, 0) - 2) * 10.0 / 300.0))
+		var bubbles := maxi(0, int(ceil(float(maxi(p.air, 0) - 2) * 10.0 / 300.0)))
 		var pops := int(ceil(float(maxi(p.air, 0)) * 10.0 / 300.0)) - bubbles
-		for i in bubbles + pops:
-			_icon("air" if i < bubbles else "air_bursting", Vector2(cx + 91 - 9 - i * 8, by - 49), Color(0.6, 0.8, 1.0))
-	# xp
-	var bg := _spr("experience_bar_background")
+		# wiki: Heads-up display - empty air bubbles (Java 1.21.2) and a pop sound when a bubble pops (ui.hud.bubble_pop:
+		# volume 0.5 for the first three bubbles, then +0.1 per bubble; pitch 1.0 for the first five, then +0.1)
+		for i in 10:
+			var ap := "air" if i < bubbles else ("air_bursting" if i < bubbles + pops else "air_empty")
+			if ap != "air_empty" or _spr(ap) != null:
+				_icon(ap, Vector2(cx + 91 - 9 - i * 8, by - 49), Color(0.6, 0.8, 1.0))
+		if bubbles < _last_bubbles and p.eyes_in_water:
+			var popped := 10 - bubbles
+			Audio.play("ui.hud.bubble_pop", p.pos, "Players", 0.5 + 0.1 * maxi(0, popped - 3), 1.0 + 0.1 * maxi(0, popped - 5))
+		_last_bubbles = bubbles
+	else:
+		_last_bubbles = 10
+	# xp (riding a nautilus: its dash bar instead - Java JumpableVehicleBarRenderer: background, the cooldown sprite while
+	# it cools down, else the charge)
+	var dash := Taming.dash_bar(p)
+	var bg := _spr("jump_bar_background" if not dash.is_empty() else "experience_bar_background")
 	var pr := _spr("experience_bar_progress")
-	if bg != null:
+	if not dash.is_empty() and bg != null:
+		canvas.draw_texture(bg, Vector2(cx - 91, by - 29))
+		if bool(dash[1]):
+			var cdt := _spr("jump_bar_cooldown")
+			if cdt != null:
+				canvas.draw_texture(cdt, Vector2(cx - 91, by - 29))
+		else:
+			var jp := _spr("jump_bar_progress")
+			var jw := int(float(dash[0]) * 183.0)
+			if jp != null and jw > 0:
+				canvas.draw_texture_rect_region(jp, Rect2(cx - 91, by - 29, jw, 5), Rect2(0, 0, jw, 5))
+	elif bg != null:
 		canvas.draw_texture(bg, Vector2(cx - 91, by - 29))
 		if pr != null:
 			canvas.draw_texture_rect_region(pr, Rect2(cx - 91, by - 29, int(182 * p.xp_progress), 5), Rect2(0, 0, int(182 * p.xp_progress), 5))
@@ -502,11 +783,16 @@ func _draw_chat(font: Font, size: Vector2) -> void:
 		canvas.draw_rect(Rect2(0, top, w + 8, lh), Color(0, 0, 0, b_op * a))
 		var ty := top + (lh - 9.0) / 2.0 + 1.0 + 7.0
 		var click := str(chat[i][2]) if (chat[i] as Array).size() > 2 else ""
-		if click != "" and line.contains("[") and line.contains("]"):
-			# the bracketed part is the green clickable component
+		var hl: Color = chat[i][3] if (chat[i] as Array).size() > 3 else Color(0, 0, 0, 0)
+		if (click != "" or hl.a > 0.0) and (line.contains("[") or line.contains("]")):
+			# the bracketed part is the coloured component (wrapped lines: up to / from the bracket on their line)
+			var hc := hl if hl.a > 0.0 else Color8(0x55, 0xFF, 0x55)
 			var i0 := line.find("[")
-			var i1 := line.find("]", i0) + 1
-			var parts := [[line.substr(0, i0), Color(1, 1, 1)], [line.substr(i0, i1 - i0), Color8(0x55, 0xFF, 0x55)], [line.substr(i1), Color(1, 1, 1)]]
+			var i1 := line.find("]", maxi(i0, 0))
+			if i0 < 0:
+				i0 = 0
+			i1 = line.length() if i1 < 0 else i1 + 1
+			var parts := [[line.substr(0, i0), Color(1, 1, 1)], [line.substr(i0, i1 - i0), hc], [line.substr(i1), Color(1, 1, 1)]]
 			var x := 4.0
 			for pt in parts:
 				var col: Color = pt[1]

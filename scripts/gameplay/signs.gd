@@ -10,6 +10,13 @@ const DYES := {"white": Color(1, 1, 1), "orange": Color(1.0, 0.5, 0.1), "magenta
 	"yellow": Color(1.0, 1.0, 0.2), "lime": Color(0.5, 0.9, 0.2), "pink": Color(1.0, 0.6, 0.75), "gray": Color(0.3, 0.3, 0.3),
 	"light_gray": Color(0.6, 0.6, 0.6), "cyan": Color(0.1, 0.6, 0.6), "purple": Color(0.5, 0.2, 0.7), "blue": Color(0.2, 0.3, 0.9),
 	"brown": Color(0.5, 0.3, 0.15), "green": Color(0.35, 0.5, 0.1), "red": Color(0.75, 0.15, 0.15), "black": Color(0, 0, 0)}
+## wiki: Sign - glow ink colors: [main (text), outline] per dye
+const GLOW := {"black": [Color("#000000"), Color("#F0EBCC")], "red": [Color("#FF0000"), Color("#660000")],
+	"green": [Color("#00FF00"), Color("#006600")], "brown": [Color("#8B4513"), Color("#371B07")], "blue": [Color("#0000FF"), Color("#000066")],
+	"purple": [Color("#A020F0"), Color("#400C60")], "cyan": [Color("#00FFFF"), Color("#006666")], "light_gray": [Color("#D3D3D3"), Color("#545454")],
+	"gray": [Color("#808080"), Color("#333333")], "pink": [Color("#FF69B4"), Color("#662A48")], "lime": [Color("#BFFF00"), Color("#4C6600")],
+	"yellow": [Color("#FFFF00"), Color("#666600")], "light_blue": [Color("#9AC0CD"), Color("#3D4C52")], "magenta": [Color("#FF00FF"), Color("#660066")],
+	"orange": [Color("#FF681F"), Color("#66290C")], "white": [Color("#FFFFFF"), Color("#666666")]}
 
 static var _labels: Dictionary = {}   # Vector3i -> Node3D (main thread)
 static var _dirty := true
@@ -195,12 +202,14 @@ static func _fill(node: Node3D, d: Dictionary) -> void:
 		for i in 4:
 			txt += (str(lines[i]) if i < lines.size() else "") + ("\n" if i < 3 else "")
 		lab.text = txt
-		var col: Color = DYES.get(str(d.get(side + "_color", "black")), Color.BLACK)
+		var cname := str(d.get(side + "_color", "black"))
+		var col: Color = DYES.get(cname, Color.BLACK)
 		var glow: bool = d.get(side + "_glow", false)
-		lab.set_meta("base", col if not (glow and str(d.get(side + "_color", "black")) == "black") else Color(0.94, 0.94, 0.86))
+		var gc: Array = GLOW.get(cname, GLOW["black"])
+		lab.set_meta("base", gc[0] if glow else col)
 		lab.set_meta("glow", glow)
 		lab.outline_size = 2 if glow else 0
-		lab.outline_modulate = col.darkened(0.6) if glow else Color(0, 0, 0, 0)
+		lab.outline_modulate = gc[1] if glow else Color(0, 0, 0, 0)
 
 
 static func clear() -> void:

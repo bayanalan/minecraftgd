@@ -412,6 +412,7 @@ static func tick_dragon(em: EntityManager, e: EntityManager.Ent, p: Player, gs: 
 			if e.pos.distance_squared_to(pod) < 1.0:
 				_set_phase(e, Ph.SITTING_SCANNING)
 				e.rt["flames"] = 0
+				e.rt["perch_dmg"] = 0.0
 		Ph.SITTING_SCANNING:
 			sitting = true
 			var near := _nearest_player(em, e.pos, 20.0, p)
@@ -444,7 +445,7 @@ static func tick_dragon(em: EntityManager, e: EntityManager.Ent, p: Player, gs: 
 			if t == 10:
 				# Java SittingFlamingPhase: a dragon breath cloud in front of the head
 				var cp := head + _forward(yr) * 2.0
-				em.spawn_cloud(Vector3(cp.x, pod.y, cp.z))
+				em.spawn_cloud(Vector3(cp.x, pod.y, cp.z), "breath")
 			if t >= 200:
 				_set_phase(e, Ph.TAKEOFF if int(e.rt.get("flames", 0)) >= 4 else Ph.SITTING_SCANNING)
 		Ph.TAKEOFF:
@@ -515,14 +516,15 @@ static func tick_dragon(em: EntityManager, e: EntityManager.Ent, p: Player, gs: 
 	var vulnerable := not p.dead and (p.mode == Player.Mode.SURVIVAL or p.mode == Player.Mode.ADVENTURE)
 	# Java EnderDragon: wings knock entities back, the head hurts them (not while perched)
 	if vulnerable and not sitting and e.attack_cd <= 0:
+		# wiki Ender Dragon: head 6 / 10 / 15, wings 3.5 / 5 / 7.5 (Easy / Normal / Hard)
 		if p.pos.distance_to(head) < 3.0:
-			p.hurt(10.0, "mob")
+			p.hurt(MobAI.diff_dmg(em.world.difficulty, 10.0), "mob")
 			e.attack_cd = 10
 		elif p.pos.distance_to(e.pos) < 5.0:
 			var kb := Vector3(p.pos.x - e.pos.x, 0, p.pos.z - e.pos.z)
 			var kd := maxf(kb.length_squared(), 0.1)
 			p.vel += Vector3(kb.x / kd * 4.0, 0.2, kb.z / kd * 4.0)
-			p.hurt(5.0, "mob")
+			p.hurt(MobAI.diff_dmg(em.world.difficulty, 5.0), "mob")
 			e.attack_cd = 10
 	_check_crystals(em, e)
 

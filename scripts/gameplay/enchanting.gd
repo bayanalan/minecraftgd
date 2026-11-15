@@ -13,17 +13,19 @@ static var table_order: Array = []   # enchantments in #minecraft:in_enchanting_
 static var smithing: Array = []      # [{template, base, addition, result}]
 static var _loaded := false
 
-const ENCHANTABILITY := {"wooden": 15, "stone": 5, "iron": 14, "golden": 22, "diamond": 10, "netherite": 15, "copper": 13,
-	"leather": 15, "chainmail": 12, "turtle": 9, "book": 1, "bow": 1, "crossbow": 1, "trident": 1, "fishing_rod": 1, "mace": 15,
-	"shears": 1, "flint_and_steel": 1, "shield": 1, "elytra": 1, "carrot_on_a_stick": 1, "warped_fungus_on_a_stick": 1, "brush": 1}
+# wiki: Enchantability (Java). Only these items carry the enchantable component, so only they can use the table.
+const ENCHANTABILITY := {"book": 1, "bow": 1, "crossbow": 1, "trident": 1, "fishing_rod": 1, "mace": 15}
+const TOOL_ENCH := {"wooden": 15, "stone": 5, "copper": 13, "iron": 14, "golden": 22, "diamond": 10, "netherite": 15}
+const TOOL_KINDS := ["sword", "pickaxe", "axe", "shovel", "hoe", "spear"]
+const ARMOR_KINDS := ["helmet", "chestplate", "leggings", "boots"]
 ## Java items with provides_trim_material.
 const TRIM_MATERIALS := {"amethyst_shard": "amethyst", "copper_ingot": "copper", "diamond": "diamond", "emerald": "emerald",
 	"gold_ingot": "gold", "iron_ingot": "iron", "lapis_lazuli": "lapis", "netherite_ingot": "netherite", "quartz": "quartz",
 	"redstone": "redstone", "resin_brick": "resin"}
-const ARMOR_ENCH := {"iron": 9, "golden": 25, "diamond": 10, "netherite": 15, "copper": 8}
-const REPAIR := {"wooden": "#planks", "stone": "#stone_tool_materials", "iron": "iron_ingot", "golden": "gold_ingot", "diamond": "diamond",
+const ARMOR_ENCH := {"leather": 15, "chainmail": 12, "copper": 8, "iron": 9, "golden": 25, "diamond": 10, "netherite": 15, "turtle": 9}
+const REPAIR := {"wooden": "#wooden_tool_materials", "stone": "#stone_tool_materials", "iron": "iron_ingot", "golden": "gold_ingot", "diamond": "diamond",
 	"netherite": "netherite_ingot", "copper": "copper_ingot", "leather": "leather", "chainmail": "iron_ingot", "turtle": "turtle_scute",
-	"elytra": "phantom_membrane", "mace": "breeze_rod", "shield": "#planks"}
+	"elytra": "phantom_membrane", "mace": "breeze_rod", "shield": "#wooden_tool_materials", "wolf_armor": "armadillo_scute"}
 
 
 static func load_all() -> void:
@@ -66,15 +68,18 @@ static func roman(n: int) -> String:
 
 
 static func enchantability(item_name: String) -> int:
-	if item_name == "book":
-		return 1
-	var mat := item_name.split("_")[0]
-	var armor := item_name.ends_with("_helmet") or item_name.ends_with("_chestplate") or item_name.ends_with("_leggings") or item_name.ends_with("_boots")
-	if armor and ARMOR_ENCH.has(mat):
-		return ARMOR_ENCH[mat]
-	if ENCHANTABILITY.has(mat):
-		return ENCHANTABILITY[mat]
-	return ENCHANTABILITY.get(item_name, 0)
+	if ENCHANTABILITY.has(item_name):
+		return ENCHANTABILITY[item_name]
+	var cut := item_name.find("_")
+	if cut < 0:
+		return 0
+	var mat := item_name.substr(0, cut)
+	var kind := item_name.substr(cut + 1)
+	if ARMOR_KINDS.has(kind):
+		return int(ARMOR_ENCH.get(mat, 0))
+	if TOOL_KINDS.has(kind):
+		return int(TOOL_ENCH.get(mat, 0))
+	return 0
 
 
 static func get_enchants(s: ItemStack) -> Dictionary:
@@ -95,9 +100,11 @@ static func _cost(base: int, per: int, lvl: int) -> int:
 	return base + per * (lvl - 1)
 
 
-## Bookshelves (#enchantment_power_provider) in the Java 5x5x2 ring with a clear block in between.
+## Bookshelves (#enchantment_power_provider) in the Java 5x5x2 ring with an #enchantment_power_transmitter block
+## in between (wiki: Enchanting mechanics).
 static func bookshelves(world, p: Vector3i) -> int:
 	var prov := Tags.blocks("enchantment_power_provider")
+	var trans := Tags.blocks("enchantment_power_transmitter")
 	var n := 0
 	for dz in range(-2, 3):
 		for dx in range(-2, 3):
@@ -108,7 +115,8 @@ static func bookshelves(world, p: Vector3i) -> int:
 				var mid := p + Vector3i(dx / 2, dy, dz / 2)
 				var st: int = world.state_at(q.x, q.y, q.z)
 				var ms: int = world.state_at(mid.x, mid.y, mid.z)
-				if st > 0 and prov.has(Res.blocks.name_of(st)) and (ms == 0 or (ms > 0 and (Res.blocks.st_flags[ms] & BlockRegistry.F_REPLACEABLE) != 0)):
+				var clear := ms == 0 or (ms > 0 and (trans.has(Res.blocks.name_of(ms)) if not trans.is_empty() else (Res.blocks.st_flags[ms] & BlockRegistry.F_REPLACEABLE) != 0))
+				if st > 0 and prov.has(Res.blocks.name_of(st)) and clear:
 					n += 1
 	return mini(n, 15)
 
@@ -147,12 +155,24 @@ static func _compatible(a: String, b: String) -> bool:
 	if a == b:
 		return false
 	var da: Dictionary = defs.get(a, {})
-	return not (da.get("exclusive", {}) as Dictionary).has(b.trim_prefix("minecraft:"))
+	var db: Dictionary = defs.get(b, {})
+	return not (da.get("exclusive", {}) as Dictionary).has(b.trim_prefix("minecraft:")) and not (db.get("exclusive", {}) as Dictionary).has(a.trim_prefix("minecraft:"))
 
 
 ## EnchantmentHelper.selectEnchantment (+ book removal) -> [[id, level], ...].
 static func select(seed: int, slot: int, item_name: String, level: int) -> Array:
 	var r := RandomSources.LegacyRandom.new(seed + slot)
+	var out := select_from(r, item_name, level, table_order)
+	if item_name == "book" and out.size() > 1:
+		out.remove_at(r.next_int_bound(out.size()))
+	return out
+
+
+## EnchantmentHelper.selectEnchantment over the given enchantment ids (the table's #in_enchanting_table, or a trade's
+## enchant_with_levels options): eCost = round((level + 1 + randInt(ench/4) + randInt(ench/4)) * (1 + randTri(0.15)))
+## (wiki: Enchanting mechanics).
+static func select_from(r: RandomSources.LegacyRandom, item_name: String, level: int, options: Array) -> Array:
+	load_all()
 	var out: Array = []
 	var ench := enchantability(item_name)
 	if ench <= 0:
@@ -161,10 +181,12 @@ static func select(seed: int, slot: int, item_name: String, level: int) -> Array
 	var f := (r.next_float() + r.next_float() - 1.0) * 0.15
 	level = maxi(roundi(level + level * f), 1)
 	var avail: Array = []
-	for id in table_order:
+	for id in options:
 		if not _applies(id, item_name, true):
 			continue
 		var d: Dictionary = defs.get(id, {})
+		if d.is_empty():
+			continue
 		for lv in range(int(d["max"]), 0, -1):
 			if level >= _cost(d["min_b"], d["min_p"], lv) and level <= _cost(d["max_b"], d["max_p"], lv):
 				avail.append([id, lv, int(d["weight"])])
@@ -183,8 +205,6 @@ static func select(seed: int, slot: int, item_name: String, level: int) -> Array
 			break
 		out.append(_weighted(r, avail))
 		level /= 2
-	if item_name == "book" and out.size() > 1:
-		out.remove_at(r.next_int_bound(out.size()))
 	return out
 
 
@@ -215,7 +235,11 @@ static func _matches(s: ItemStack, spec: String) -> bool:
 	return s.name() == spec
 
 
-## AnvilMenu.createResult (simplified, source D): returns {result: ItemStack, cost: int, use_right: int}.
+## AnvilMenu.createResult (wiki: Anvil mechanics): unit repair 25 % of max durability per material (1 level each),
+## combining two items = sum of both + 12 % (2 levels), enchantment cost = final level x anvil_cost (halved from
+## books, min 1), +1 per incompatible enchantment on the target (sacrifice enchantments that cannot apply are
+## ignored), rename 1, both prior-work penalties added; the result's penalty is 2 x max(left, right) + 1 (renaming
+## alone keeps it); rename-only cost is capped at 39. Returns {result: ItemStack, cost: int, use_right: int}.
 static func anvil(left: ItemStack, right: ItemStack, new_name: String) -> Dictionary:
 	if left.is_empty():
 		return {}
@@ -223,7 +247,9 @@ static func anvil(left: ItemStack, right: ItemStack, new_name: String) -> Dictio
 	var cost := 0
 	var use_right := 0
 	var md: int = Res.items.max_damage[left.item]
-	var prior := int(left.components.get("minecraft:repair_cost", 0)) + (int(right.components.get("minecraft:repair_cost", 0)) if not right.is_empty() else 0)
+	var lrc := int(left.components.get("minecraft:repair_cost", 0))
+	var rrc := int(right.components.get("minecraft:repair_cost", 0)) if not right.is_empty() else 0
+	var prior := lrc + rrc
 	if not right.is_empty():
 		var book := right.name() == "enchanted_book"
 		if md > 0 and _matches(right, repair_material(left.name())):
@@ -248,17 +274,17 @@ static func anvil(left: ItemStack, right: ItemStack, new_name: String) -> Dictio
 					cost += 2
 			var le := get_enchants(res)
 			var any := false
-			for id in get_enchants(right):
-				var rl := int(get_enchants(right)[id])
+			var re := get_enchants(right)
+			for id in re:
+				var rl := int(re[id])
 				if not _applies(id, left.name(), false) and left.name() != "enchanted_book":
-					cost += 1
 					continue
-				var ok := true
+				var bad := 0
 				for ex in le:
 					if ex != id and not _compatible(id, ex):
-						ok = false
-				if not ok:
-					cost += 1
+						bad += 1
+				if bad > 0:
+					cost += bad
 					continue
 				var ll := int(le.get(id, 0))
 				var nl := mini(ll + 1, int(defs.get(id, {}).get("max", 1))) if ll == rl else maxi(ll, rl)
@@ -272,13 +298,17 @@ static func anvil(left: ItemStack, right: ItemStack, new_name: String) -> Dictio
 				return {}
 			set_enchants(res, le)
 			use_right = 1
+	var renamed := false
 	if new_name != "" and new_name != str(left.components.get("minecraft:custom_name", "")):
 		res.components["minecraft:custom_name"] = new_name
 		cost += 1
+		renamed = true
 	if cost <= 0:
 		return {}
 	cost += prior
-	res.components["minecraft:repair_cost"] = prior * 2 + 1 if not right.is_empty() else int(left.components.get("minecraft:repair_cost", 0))
+	if renamed and use_right == 0 and cost >= 40:
+		cost = 39
+	res.components["minecraft:repair_cost"] = maxi(lrc, rrc) * 2 + 1 if use_right > 0 else lrc
 	return {"result": res, "cost": cost, "use_right": use_right}
 
 

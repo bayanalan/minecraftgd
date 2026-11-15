@@ -6,7 +6,9 @@
 class_name VoxelRaycast
 
 
-static func cast(origin: Vector3, dir: Vector3, max_dist: float, get_state: Callable, blocks: BlockRegistry, include_fluids: bool = false) -> Dictionary:
+## sources_only (with include_fluids; Java ClipContext.Fluid.SOURCE_ONLY, the empty bucket): flowing fluid is passed
+## through, waterlogged blocks are also hit on their water (FluidState shape) besides their outline.
+static func cast(origin: Vector3, dir: Vector3, max_dist: float, get_state: Callable, blocks: BlockRegistry, include_fluids: bool = false, sources_only: bool = false) -> Dictionary:
 	dir = dir.normalized()
 	var x := int(floor(origin.x))
 	var y := int(floor(origin.y))
@@ -26,11 +28,13 @@ static func cast(origin: Vector3, dir: Vector3, max_dist: float, get_state: Call
 		var st: int = get_state.call(x, y, z)
 		if st > 0:
 			var fl := blocks.st_flags[st]
-			var solidish := (fl & BlockRegistry.F_AIR) == 0 and ((fl & BlockRegistry.F_LIQUID) == 0 or include_fluids)
+			var solidish := (fl & BlockRegistry.F_AIR) == 0 and ((fl & BlockRegistry.F_LIQUID) == 0 or (include_fluids and not (sources_only and blocks.st_level[st] != 0)))
 			if solidish:
 				var boxes := blocks.get_outline(st)
 				if include_fluids and (fl & BlockRegistry.F_LIQUID):
 					boxes = PackedFloat32Array([0, 0, 0, 1, 0.875, 1])
+				elif sources_only and include_fluids and (fl & BlockRegistry.F_WATERLOGGED):
+					boxes = boxes + PackedFloat32Array([0, 0, 0, 1, 0.875, 1])
 				var best := INF
 				var bn := normal
 				for b in range(0, boxes.size(), 6):

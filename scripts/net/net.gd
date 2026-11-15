@@ -555,9 +555,16 @@ func _send_entities() -> void:
 				e.uid = _uid
 				_uid += 1
 			var flags := (1 if e.hurt_time > 0 else 0) | (2 if e.baby_age < 0 else 0) | (4 if e.sheared else 0) | (8 if e.target_player else 0) | (16 if e.fire > 0 else 0)
+			if e.kind == "mob":
+				# 32 + bed direction << 6: a villager asleep (Villagers.FACINGS index); 256: a charging vex
+				var sd = e.rt.get("sleep_dir")
+				if sd != null:
+					flags |= 32 | ((int(sd) & 3) << 6)
+				if bool(e.rt.get("vex_charge", false)):
+					flags |= 256
 			var extra = null
 			match e.kind:
-				"item":
+				"item", "ominous_item":
 					extra = e.stack.to_dict()
 				"falling":
 					extra = e.state
@@ -610,6 +617,13 @@ func _ents(list: Array) -> void:
 		e.sheared = (fl & 4) != 0
 		e.target_player = (fl & 8) != 0
 		e.fire = 1 if fl & 16 else 0
+		if e.kind == "mob":
+			if fl & 32:
+				e.rt["sleep_dir"] = (fl >> 6) & 3
+			else:
+				e.rt.erase("sleep_dir")
+			if e.id == "vex":
+				e.rt["vex_charge"] = (fl & 256) != 0
 	applying = false
 	for uid in puppets.keys():
 		if not seen.has(uid):
@@ -680,8 +694,12 @@ func _remote_interact(id: int, uid: int, held: ItemStack) -> void:
 	var e = _ent_by_uid(uid)
 	if e == null or e.kind != "mob":
 		return
-	if e.def.get("trader", false) and e.baby_age >= 0 and str(e.data.get("prof", "")) != "nitwit":
+	if e.def.get("trader", false) and e.baby_age >= 0 and str(e.data.get("prof", "")) != "nitwit" and not (e.data.get("offers", []) as Array).is_empty():
 		rpc_id(id, "_open_trade", uid, e.data)
+		return
+	if e.id == "villager":
+		e.rt["unhappy"] = 40   # (unemployed / nitwit / baby: no trading, head shake)
+		Audio.play("entity.villager.no", e.pos, "Neutral", 1.0, randf_range(1.3, 1.7) if e.baby_age < 0 else randf_range(0.8, 1.2))
 		return
 	if held.is_empty():
 		return
@@ -728,8 +746,8 @@ func _held(action: String) -> void:
 
 @rpc("authority", "call_remote", "reliable")
 func _hurt(amount: float, source: String, bypass: bool) -> void:
-	if world != null and world.player.hurt(amount, source, bypass):
-		Audio.play("entity.player.hurt", world.player.pos, "Players")
+	if world != null:
+		world.player.hurt(amount, source, bypass)   # (hurt plays the hurt sound)
 
 
 @rpc("authority", "call_remote", "reliable")

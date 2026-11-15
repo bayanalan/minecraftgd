@@ -44,17 +44,24 @@ func held() -> ItemStack:
 
 
 ## Adds as much as possible (merge first, hotbar then main); returns leftover count.
+## Java Inventory.add: stacks onto the selected slot first, then the offhand, then any slot with room, then the first
+## free slot; every slot that receives items gets popTime 5 (the hotbar "pop" squash, Gui.renderSlot).
 func add(s: ItemStack) -> int:
 	if s.is_empty():
 		return 0
 	var left := s.count
 	var maxs := s.max_stack()
+	var order: Array = [selected, OFFHAND]
 	for i in 36:
+		if i != selected:
+			order.append(i)
+	for i in order:
 		var t: ItemStack = slots[i]
 		if t.can_merge(s) and t.count < maxs:
 			var mv := mini(maxs - t.count, left)
 			t.count += mv
 			left -= mv
+			pop[i] = 5
 			if left == 0:
 				changed.emit()
 				return 0
@@ -65,11 +72,24 @@ func add(s: ItemStack) -> int:
 			n.count = mini(maxs, left)
 			slots[i] = n
 			left -= n.count
+			pop[i] = 5
 			if left == 0:
 				changed.emit()
 				return 0
 	changed.emit()
 	return left
+
+
+var pop: Dictionary = {}   # slot -> Java ItemStack.popTime (5 after a pickup, -1 per tick)
+
+
+func tick_pop() -> void:
+	if pop.is_empty():
+		return
+	for k in pop.keys():
+		pop[k] = int(pop[k]) - 1
+		if int(pop[k]) <= 0:
+			pop.erase(k)
 
 
 func count_item(item: int) -> int:
@@ -119,6 +139,16 @@ func armor_toughness() -> float:
 		if not s.is_empty():
 			p += Res.items.armor_tough[s.item]
 	return p
+
+
+## Knockback resistance from worn armor (netherite 0.1 per piece, wiki: Armor materials), capped at 1.
+func knockback_resistance() -> float:
+	var k := 0.0
+	for i in range(ARMOR0, ARMOR0 + 4):
+		var s: ItemStack = slots[i]
+		if not s.is_empty():
+			k += Res.items.armor_kb[s.item]
+	return minf(k, 1.0)
 
 
 func clear_all() -> void:

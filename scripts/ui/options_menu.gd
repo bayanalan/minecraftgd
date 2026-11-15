@@ -21,6 +21,7 @@ func _ready() -> void:
 	set_anchors_preset(Control.PRESET_FULL_RECT)
 	theme = UiKit.theme()
 	UiKit.background(self)
+	Settings.changed.connect(_on_setting_changed)
 	_title = McW.text(Res.tr_key("options.title", "Options"), Color(1, 1, 1), HORIZONTAL_ALIGNMENT_CENTER)
 	add_child(_title)
 	_fov = OptionsSub.sld("fov", 30, 110, 1, func(v): return Res.tr_key("options.fov", "FOV") + ": " + (Res.tr_key("options.fov.min", "Normal") if int(v) == 70 else (Res.tr_key("options.fov.max", "Quake Pro") if int(v) == 110 else str(int(v)))))
@@ -156,7 +157,7 @@ func _video() -> Control:
 	var preset := OptionsSub.cyc(T.call("options.graphics.preset", "Preset"), "preset", ["low", "fast", "balanced", "fancy", "ultra", "custom"],
 		["Low", T.call("options.graphics.fast", "Fast"), "Balanced", T.call("options.graphics.fancy", "Fancy"), T.call("options.graphics.fabulous", "Fabulous!"), T.call("options.graphics.custom", "Custom")])
 	var rd := OptionsSub.sld("render_distance", 2, 32, 1, func(v): return T.call("options.renderDistance", "Render Distance") + ": " + T.call("options.chunks", "%s Chunks").replace("%s", str(int(v))))
-	var sd := OptionsSub.sld("simulation_distance", 5, 16, 1, func(v): return T.call("options.simulationDistance", "Simulation Distance") + ": " + T.call("options.chunks", "%s Chunks").replace("%s", str(int(v))))
+	var sd := OptionsSub.sld("simulation_distance", 5, 32, 1, func(v): return T.call("options.simulationDistance", "Simulation Distance") + ": " + T.call("options.chunks", "%s Chunks").replace("%s", str(int(v))))
 	var ao := OptionsSub.cyc(T.call("options.ao", "Smooth Lighting"), "smooth_lighting", ["off", "low", "high"], [T.call("options.ao.off", "OFF"), T.call("options.ao.min", "Minimum"), T.call("options.ao.max", "Maximum")])
 	var blend := OptionsSub.sld("biome_blend", 0, 7, 1, func(v): return T.call("options.biomeBlendRadius", "Biome Blend") + ": " + (T.call("options.off", "OFF") if int(v) == 0 else "%dx%d" % [int(v) * 2 + 1, int(v) * 2 + 1]))
 	var clouds := OptionsSub.cyc(T.call("options.renderClouds", "Clouds"), "clouds", ["off", "fast", "fancy"], [T.call("options.off", "OFF"), T.call("options.graphics.fast", "Fast"), T.call("options.graphics.fancy", "Fancy")])
@@ -202,7 +203,35 @@ func _video() -> Control:
 			OptionsSub.tog("Placeholder Assets", "placeholder_mode", "Use Recraft's original placeholder art instead of your Minecraft install (restart)")],
 		[OptionsSub.btn("Advanced...", func(): _open_advanced()), null],
 	]
-	return _sub_screen(T.call("options.videoTitle", "Video Settings"), rows)
+	var vs := _sub_screen(T.call("options.videoTitle", "Video Settings"), rows)
+	vs.set_meta("video", true)
+	_video_preset_btn = preset
+	return vs
+
+
+## Java VideoSettingsScreen: picking a preset updates every option on the screen; changing an option the presets set
+## turns the preset into Custom.
+var _video_preset_btn: Button
+var _video_rebuild_pending := false
+
+
+func _on_setting_changed(key: String) -> void:
+	if _sub == null or not is_instance_valid(_sub) or not _sub.has_meta("video"):
+		return
+	if key == "preset":
+		if not _video_rebuild_pending:
+			_video_rebuild_pending = true
+			call_deferred("_rebuild_video")
+	elif _video_preset_btn != null and is_instance_valid(_video_preset_btn):
+		var pi := ["low", "fast", "balanced", "fancy", "ultra", "custom"].find(str(Settings.get_v("preset")))
+		if pi >= 0:
+			McW.cycle_set(_video_preset_btn, pi)
+
+
+func _rebuild_video() -> void:
+	_video_rebuild_pending = false
+	if _sub != null and is_instance_valid(_sub) and _sub.has_meta("video"):
+		_open(_video())
 
 
 ## Advanced video: Recraft's optimizations, each one switchable (Done returns to Video Settings).
@@ -220,7 +249,7 @@ func _advanced_video() -> Control:
 		["header", "CPU"],
 		[thr, OptionsSub.tog("Fast-Core Pinning", "adv_pin_main", "Keeps the game thread on the fastest core cluster and chunk generation on the other cores (CPUs with mixed core types: Snapdragon clusters, Intel P/E cores). Fewer stutters while chunks load.")],
 		["header", "Chunk Meshes (rebuilds loaded chunks)"],
-		[OptionsSub.tog("Smart Leaf Culling", "adv_leaf_cull", "Skips leaf faces that sit behind two layers of leaves (cannot be seen through the leaf textures). Fewer quads in forests."),
+		[OptionsSub.tog("Leaf Culling", "adv_leaf_cull", "Off (vanilla): every leaf face is drawn. On: skips leaf faces that sit behind two layers of leaves, where the leaf textures cannot be seen through - forests look the same with far fewer faces (faster in dense forests)."),
 			OptionsSub.tog("Face Merging", "adv_merge_faces", "Merges neighbouring faces with identical texture and lighting into one quad (pixel-identical). OFF = one quad per block face like Java.")],
 		["header", "Rendering"],
 		[OptionsSub.tog("Occlusion Culling", "adv_occlusion", "Skips 16-block sections hidden behind solid terrain (Java's chunk visibility graph)."),
@@ -376,9 +405,11 @@ func _accessibility() -> Control:
 		[OptionsSub.sld("distortion", 0.0, 1.0, 0.01, OptionsSub.pct(T.call("options.screenEffectScale", "Distortion Effects"))),
 			OptionsSub.sld("damage_tilt", 0.0, 1.0, 0.01, OptionsSub.pct(T.call("options.damageTiltStrength", "Damage Tilt")))],
 		[OptionsSub.tog(T.call("options.hideLightningFlashes", "Hide Sky Flashes"), "hide_lightning"), OptionsSub.tog("Text Shadow", "text_shadow")],
-		[OptionsSub.na(T.call("options.fovEffectScale", "FOV Effects"), NA_ENGINE), OptionsSub.na(T.call("options.darknessEffectScale", "Darkness Pulsing"), NA_ENGINE)],
-		[OptionsSub.na(T.call("options.glintSpeed", "Glint Speed"), NA_ENGINE), OptionsSub.na(T.call("options.glintStrength", "Glint Strength"), NA_ENGINE)],
-		[OptionsSub.na(T.call("options.accessibility.text_background_opacity", "Text Background Opacity"), NA_ENGINE), OptionsSub.tog("Pause on Lost Focus", "pause_on_lost_focus")],
+		[OptionsSub.sld("fov_effects", 0.0, 1.0, 0.01, OptionsSub.pct(T.call("options.fovEffectScale", "FOV Effects"))),
+			OptionsSub.sld("darkness_pulsing", 0.0, 1.0, 0.01, OptionsSub.pct(T.call("options.darknessEffectScale", "Darkness Pulsing")))],
+		[OptionsSub.sld("glint_speed", 0.0, 1.0, 0.01, OptionsSub.pct(T.call("options.glintSpeed", "Glint Speed"))),
+			OptionsSub.sld("glint_strength", 0.0, 1.0, 0.01, OptionsSub.pct(T.call("options.glintStrength", "Glint Strength")))],
+		[OptionsSub.sld("text_bg_opacity", 0.0, 1.0, 0.01, OptionsSub.pct(T.call("options.accessibility.text_background_opacity", "Text Background Opacity"))), OptionsSub.tog("Pause on Lost Focus", "pause_on_lost_focus")],
 	]
 	return _sub_screen(T.call("options.accessibility.title", "Accessibility Settings"), rows)
 

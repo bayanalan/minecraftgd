@@ -25,7 +25,8 @@ const SPRITES := ["flame", "soul_fire_flame", "generic_0", "generic_1", "generic
 	"yellow_poplar_4", "lava", "spark_0", "glow", "damage", "flash", "bubble_pop_0",
 	"sweep_0", "sweep_1", "sweep_2", "sweep_3", "sweep_4", "sweep_5", "sweep_6", "sweep_7",
 	"spark_1", "spark_2", "spark_3", "spark_4", "spark_5", "spark_6", "spark_7",
-	"glitter_0", "glitter_1", "glitter_2", "glitter_3", "glitter_4", "glitter_5", "glitter_6", "glitter_7"]
+	"glitter_0", "glitter_1", "glitter_2", "glitter_3", "glitter_4", "glitter_5", "glitter_6", "glitter_7",
+	"soul_0", "soul_1", "soul_2", "soul_3", "soul_4", "soul_5", "soul_6", "soul_7", "soul_8", "soul_9", "soul_10"]
 
 static var instance: Particles
 
@@ -38,15 +39,29 @@ var rng := RandomNumberGenerator.new()
 var _emit_ids: Dictionary = {}   # block id -> true for blocks with an animateTick emitter
 # breaking-block particles (Java TerrainParticle): [pos, prev, vel, age, life, size, color, layer, u, v], own MultiMesh
 const TCAP := 768
-var tparts: Array = []
+var tparts: Array = []   # terrain + item fragments: [pos, prev, vel, age, life, size, tint, layer, u, v]; layer <= -2: item atlas cell -2 - layer
+var imm: MultiMesh       # item fragments (item sprite atlas)
+var _iatlas: Image
+var _iatlas_tex: ImageTexture
+var _icells: Dictionary = {}   # item id -> atlas cell (-1: no flat sprite)
+var _icount := 0
 var tmm: MultiMesh
 var _emit_st := PackedByteArray() # per state: 1 when its block has an emitter (built lazily)
+const RCAP := 2048       # rain splash ring (100 spawns / tick at most, a splash lives <= 41 ticks, mostly < 15)
+var rmm: MultiMesh
+var _rbuf := PackedFloat32Array()
+var _rhead := 0
+var _rlive_until := -1   # game tick after which no splash in the ring can be alive
+var _rdirty := false
+var _rain_left := 0      # tickRainParticles tries left for the coming tick (spread over the frames before it)
+var _rain_last := Vector3i(0, -99999, 0)
+var _built_origin := Vector3i(-999999, 0, 0)
 
 
 func _ready() -> void:
 	instance = self
 	rng.randomize()
-	for bn in ["torch", "soul_torch", "wall_torch", "soul_wall_torch", "campfire", "soul_campfire", "furnace", "smoker", "blast_furnace", "nether_portal", "end_rod", "redstone_torch", "redstone_wall_torch", "redstone_wire", "lava", "cherry_leaves", "fire", "soul_fire"]:
+	for bn in ["torch", "soul_torch", "wall_torch", "soul_wall_torch", "campfire", "soul_campfire", "furnace", "smoker", "blast_furnace", "nether_portal", "end_rod", "redstone_torch", "redstone_wall_torch", "redstone_wire", "lava", "cherry_leaves", "fire", "soul_fire", "wet_sponge"]:
 		var bid := Res.blocks.block_id(bn)
 		if bid >= 0:
 			_emit_ids[bid] = true
@@ -92,7 +107,30 @@ func _ready() -> void:
 	mmi.material_override = mat
 	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	mmi.custom_aabb = AABB(Vector3(-1e5, -1e5, -1e5), Vector3(2e5, 2e5, 2e5))
+	mm.custom_aabb = mmi.custom_aabb   # (no per-upload AABB recomputation over the instances)
 	add_child(mmi)
+	# rain splashes (Java WaterDropParticle from tickRainParticles): one ring of spawn records; the GPU evaluates each
+	# drop's flight in closed form (shaders/rain_splash.gdshader), the CPU never touches a live splash
+	rmm = MultiMesh.new()
+	rmm.transform_format = MultiMesh.TRANSFORM_3D
+	rmm.use_colors = true
+	rmm.use_custom_data = true
+	var rq := QuadMesh.new()
+	rq.size = Vector2.ONE
+	rmm.mesh = rq
+	rmm.instance_count = RCAP
+	rmm.visible_instance_count = 0
+	rmm.custom_aabb = mmi.custom_aabb
+	_rbuf.resize(RCAP * 20)
+	var rmi := MultiMeshInstance3D.new()
+	rmi.multimesh = rmm
+	var rmat := ShaderMaterial.new()
+	rmat.shader = load("res://shaders/rain_splash.gdshader")
+	rmat.set_shader_parameter("atlas", mat.get_shader_parameter("atlas"))
+	rmi.material_override = rmat
+	rmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	rmi.custom_aabb = mmi.custom_aabb
+	add_child(rmi)
 	tmm = MultiMesh.new()
 	tmm.transform_format = MultiMesh.TRANSFORM_3D
 	tmm.use_colors = true
@@ -111,7 +149,29 @@ func _ready() -> void:
 	tmi.material_override = tmat
 	tmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	tmi.custom_aabb = AABB(Vector3(-1e5, -1e5, -1e5), Vector3(2e5, 2e5, 2e5))
+	tmm.custom_aabb = tmi.custom_aabb
 	add_child(tmi)
+	_iatlas = Image.create(256, 256, false, Image.FORMAT_RGBA8)
+	_iatlas_tex = ImageTexture.create_from_image(_iatlas)
+	imm = MultiMesh.new()
+	imm.transform_format = MultiMesh.TRANSFORM_3D
+	imm.use_colors = true
+	imm.use_custom_data = true
+	var iq := QuadMesh.new()
+	iq.size = Vector2.ONE
+	imm.mesh = iq
+	imm.instance_count = TCAP
+	imm.visible_instance_count = 0
+	var imi := MultiMeshInstance3D.new()
+	imi.multimesh = imm
+	var imat := ShaderMaterial.new()
+	imat.shader = load("res://shaders/item_particle.gdshader")
+	imat.set_shader_parameter("items_tex", _iatlas_tex)
+	imi.material_override = imat
+	imi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	imi.custom_aabb = AABB(Vector3(-1e5, -1e5, -1e5), Vector3(2e5, 2e5, 2e5))
+	imm.custom_aabb = imi.custom_aabb
+	add_child(imi)
 
 
 ## Java ParticleEngine.destroy: every box of the block's shape split into max(2, ceil(extent / 0.25)) cells per axis
@@ -159,6 +219,52 @@ func _terrain(p: Vector3i, st: int) -> void:
 					_add_terrain(pos, Vector3(fx - 0.5, fy - 0.5, fz - 0.5), tint, layer)
 
 
+## Java ParticleEngine.crack (each tick a block is being hit / mined): one TerrainParticle at a random point of the
+## hit face of the block's outline (0.1 in from the edges, 0.1 out from the face), power 0.2 (velocity x 0.2, vertical
+## (v - 0.1) x 0.2 + 0.1), scale 0.6.
+static func crack(p: Vector3i, st: int, n: Vector3i) -> void:
+	if instance == null or st <= 0 or str(Settings.get_v("particles")) == "minimal":
+		return
+	instance._crack(p, st, n)
+
+
+func _crack(p: Vector3i, st: int, n: Vector3i) -> void:
+	var b := Res.blocks
+	var layer: int = b.st_particle[st] if st < b.st_particle.size() else -1
+	if layer < 0:
+		return
+	var tint := Color(0.6, 0.6, 0.6)
+	if b.name_of(st) != "grass_block":
+		tint = tint * _tint_at(st, p)
+	var boxes := b.get_outline(st)
+	var mn := Vector3.ZERO
+	var mx := Vector3.ONE
+	if boxes.size() >= 6:
+		mn = Vector3(boxes[0], boxes[1], boxes[2])
+		mx = Vector3(boxes[3], boxes[4], boxes[5])
+		for bi in range(6, boxes.size(), 6):
+			mn = mn.min(Vector3(boxes[bi], boxes[bi + 1], boxes[bi + 2]))
+			mx = mx.max(Vector3(boxes[bi + 3], boxes[bi + 4], boxes[bi + 5]))
+	var pos := Vector3(p) + Vector3(rng.randf() * (mx.x - mn.x - 0.2) + 0.1 + mn.x, rng.randf() * (mx.y - mn.y - 0.2) + 0.1 + mn.y, rng.randf() * (mx.z - mn.z - 0.2) + 0.1 + mn.z)
+	if n.y < 0:
+		pos.y = p.y + mn.y - 0.1
+	elif n.y > 0:
+		pos.y = p.y + mx.y + 0.1
+	elif n.z < 0:
+		pos.z = p.z + mn.z - 0.1
+	elif n.z > 0:
+		pos.z = p.z + mx.z + 0.1
+	elif n.x < 0:
+		pos.x = p.x + mn.x - 0.1
+	elif n.x > 0:
+		pos.x = p.x + mx.x + 0.1
+	_add_terrain(pos, Vector3.ZERO, tint, layer)
+	var tp: Array = tparts[tparts.size() - 1]
+	var v: Vector3 = tp[2]
+	tp[2] = Vector3(v.x * 0.2, (v.y - 0.1) * 0.2 + 0.1, v.z * 0.2)
+	tp[5] = float(tp[5]) * 0.6
+
+
 ## Java Particle(level, x, y, z, xa, ya, za) + TerrainParticle: velocity randomised and rescaled, lifetime
 ## 4 / (r * 0.9 + 0.1), half the default quad size, gravity 1 (0.04 / tick), friction 0.98, random 4x4 texel window.
 func _add_terrain(pos: Vector3, a: Vector3, tint: Color, layer: int) -> void:
@@ -171,6 +277,60 @@ func _add_terrain(pos: Vector3, a: Vector3, tint: Color, layer: int) -> void:
 	var life := int(4.0 / (rng.randf() * 0.9 + 0.1))
 	var size := 0.1 * (rng.randf() * 0.5 + 0.5)
 	tparts.append([pos, pos, v, 0, life, size, tint, layer, rng.randf() * 3.0 / 4.0, rng.randf() * 3.0 / 4.0])
+
+
+## Java ItemParticleOption / BreakingItemParticle (eating, an item breaking, thrown eggs and snowballs): a camera-facing
+## quad showing a random 4x4-texel window of the item's own sprite (block items: the block's particle texture),
+## untinted, half the default size, gravity 1, friction 0.98, lifetime 4 / (r * 0.9 + 0.1); velocity: the randomised
+## spawn velocity x 0.1 plus the given one.
+static func item_fragment(pos: Vector3, vel: Vector3, item: int) -> void:
+	if instance == null or str(Settings.get_v("particles")) == "minimal":
+		return
+	instance._item_fragment(pos, vel, item)
+
+
+func _item_fragment(pos: Vector3, vel: Vector3, item: int) -> void:
+	var layer := -1
+	var cell := _item_cell(item)
+	if cell >= 0:
+		layer = -2 - cell
+	elif item >= 0 and item < Res.items.names.size():
+		var st := Res.blocks.default_state(Res.items.names[item])
+		if st > 0 and st < Res.blocks.st_particle.size():
+			layer = Res.blocks.st_particle[st]
+	if layer == -1:
+		_add("item", pos, vel, Color(1, 1, 1))
+		return
+	if tparts.size() >= TCAP:
+		tparts.pop_front()
+	var v := Vector3(randf() * 2.0 - 1.0, randf() * 2.0 - 1.0, randf() * 2.0 - 1.0) * 0.4
+	var d0 := (randf() + randf() + 1.0) * 0.15
+	var d1 := maxf(v.length(), 1e-6)
+	v = Vector3(v.x / d1 * d0 * 0.4, v.y / d1 * d0 * 0.4 + 0.1, v.z / d1 * d0 * 0.4) * 0.1 + vel
+	var life := int(4.0 / (rng.randf() * 0.9 + 0.1))
+	var size := 0.1 * (rng.randf() * 0.5 + 0.5)
+	tparts.append([pos, pos, v, 0, life, size, Color(1, 1, 1), layer, rng.randf() * 3.0 / 4.0, rng.randf() * 3.0 / 4.0])
+
+
+func _item_cell(item: int) -> int:
+	if _icells.has(item):
+		return _icells[item]
+	var cell := -1
+	var img: Image = null
+	if item >= 0 and item < Res.items.model_ref.size():
+		img = ItemIcons.flat_image(Res.items.model_ref[item])
+	if img != null and _icount < 256:
+		var im: Image = img.duplicate()
+		if im.get_format() != Image.FORMAT_RGBA8:
+			im.convert(Image.FORMAT_RGBA8)
+		if im.get_width() != 16 or im.get_height() != 16:
+			im.resize(16, 16, Image.INTERPOLATE_NEAREST)
+		cell = _icount
+		_icount += 1
+		_iatlas.blit_rect(im, Rect2i(0, 0, 16, 16), Vector2i((cell % 16) * 16, (cell / 16) * 16))
+		_iatlas_tex.update(_iatlas)
+	_icells[item] = cell
+	return cell
 
 
 ## Biome tint for a tinted state at a block position (the chunk's cached colour columns), white otherwise.
@@ -219,6 +379,10 @@ func _add(kind: String, pos: Vector3, vel: Vector3, color: Color) -> void:
 			life = int(8.0 / (rng.randf() * 0.8 + 0.2)) + 4
 			size = 0.1 * (rng.randf() * 0.5 + 0.5)
 			bright = true
+		"soul":
+			# Java SoulParticle (RisingParticle like the flame: friction 0.96), size x 1.5, its 11-frame sprite set
+			life = int(8.0 / (rng.randf() * 0.8 + 0.2)) + 4
+			size = 0.15 * (rng.randf() * 0.5 + 0.5)
 		"smoke", "large_smoke":
 			life = int(8.0 / (rng.randf() * 0.8 + 0.2))
 			size = 0.1 * (2.5 if kind == "large_smoke" else 1.0) * (rng.randf() * 0.5 + 0.5)
@@ -313,6 +477,28 @@ func _add(kind: String, pos: Vector3, vel: Vector3, color: Color) -> void:
 			life = 40
 			size = 0.08
 			grav = 0.0
+		"dripping_water":
+			# Java DripParticle.DripHangParticle (water, colour 0.2 / 0.3 / 1.0): hangs 40 ticks (gravity 0.06 x 0.02, motion x 0.02
+			# a tick), then becomes a falling drop (tick)
+			life = 40
+			size = 0.2 * (rng.randf() * 0.5 + 0.5)
+			grav = 0.06 * 0.02
+			fric = 0.02 * 0.98
+			color = Color(0.2, 0.3, 1.0)
+		"falling_water":
+			# Java DripParticle.FallAndLandParticle: gravity 0.06, friction 0.98, lifetime 64 / (r * 0.8 + 0.2); a splash where it lands
+			life = int(64.0 / (rng.randf() * 0.8 + 0.2))
+			size = 0.2 * (rng.randf() * 0.5 + 0.5)
+			grav = 0.06
+			fric = 0.98
+			color = Color(0.2, 0.3, 1.0)
+		"cloud":
+			# Java PlayerCloudParticle: lifetime int(8 / (r * 0.8 + 0.3)) x 2.5, quad size x 1.875, grey 1 - r * 0.3, friction 0.96
+			life = maxi(int(int(8.0 / (rng.randf() * 0.8 + 0.3)) * 2.5), 1)
+			size = 0.2 * (rng.randf() * 0.5 + 0.5) * 1.875
+			var cg := 1.0 - rng.randf() * 0.3
+			color = Color(cg, cg, cg)
+			vel += Vector3(0, 0.01, 0)
 		"dust":
 			life = int(8.0 / (rng.randf() * 0.8 + 0.2))
 			size = 0.1 * 0.75
@@ -366,6 +552,12 @@ func _sprite(kind: String, age: int, life: int) -> String:
 	match kind:
 		"flame", "soul_fire_flame":
 			return kind
+		"dripping_water":
+			return "drip_hang"
+		"falling_water":
+			return "drip_fall"
+		"cloud":
+			return "generic_%d" % (7 - int(t * 8.0))
 		"smoke", "large_smoke", "dust", "portal":
 			return "generic_%d" % (7 - int(t * 8.0))
 		"poof":
@@ -380,6 +572,8 @@ func _sprite(kind: String, age: int, life: int) -> String:
 			return "spark_%d" % mini(7, int(t * 8.0))
 		"totem_of_undying":
 			return "glitter_%d" % (7 - mini(7, int(t * 8.0)))
+		"soul":
+			return "soul_%d" % mini(10, int(t * 11.0))
 		"crit":
 			return "critical_hit"
 		"enchanted_hit":
@@ -407,29 +601,58 @@ func _sprite(kind: String, age: int, life: int) -> String:
 	return "generic_0"
 
 
-func _draw_terrain(alpha: float) -> void:
+## Terrain / item fragments, once per tick: MODEL_MATRIX[3] = position, [2] = previous - position (the shaders
+## interpolate with the global partial tick), [0].x = quad size.
+func _build_terrain() -> void:
 	var n := tparts.size()
-	tmm.visible_instance_count = n
 	if n == 0:
+		tmm.visible_instance_count = 0
+		imm.visible_instance_count = 0
 		return
 	var buf := PackedFloat32Array()
 	buf.resize(TCAP * 20)
+	var ibuf := PackedFloat32Array()
+	var ik := 0
 	var day := clampf(world.sky_darken(), 0.2, 1.0)
 	var fullbright: bool = Settings.get_v("adv_fullbright")
+	var orgv := Vector3(world.cm.origin)
 	var k := 0
 	for q in tparts:
-		var pos: Vector3 = world.vis((q[1] as Vector3).lerp(q[0], alpha))
+		var pos: Vector3 = (q[0] as Vector3) - orgv
+		var dp: Vector3 = (q[1] as Vector3) - (q[0] as Vector3)
 		var s: float = q[5] * 2.0   # Java quads span +-quadSize
 		var wp: Vector3 = q[0]
 		var l: int = world.cm.get_light(int(floor(wp.x)), int(floor(wp.y)), int(floor(wp.z)))
 		var lv := 1.0 if fullbright else maxf(float(l >> 4) / 15.0 * day, float(l & 15) / 15.0)
 		var m := 0.2 + 0.8 * lv
 		var col: Color = q[6]
+		if int(q[7]) <= -2:
+			if ibuf.is_empty():
+				ibuf.resize(TCAP * 20)
+			var cl := -2 - int(q[7])
+			ibuf[ik] = s
+			ibuf[ik + 2] = dp.x
+			ibuf[ik + 3] = pos.x
+			ibuf[ik + 6] = dp.y
+			ibuf[ik + 7] = pos.y
+			ibuf[ik + 10] = dp.z
+			ibuf[ik + 11] = pos.z
+			ibuf[ik + 12] = col.r * m
+			ibuf[ik + 13] = col.g * m
+			ibuf[ik + 14] = col.b * m
+			ibuf[ik + 15] = 1.0
+			ibuf[ik + 16] = q[8]
+			ibuf[ik + 17] = q[9]
+			ibuf[ik + 18] = float(cl % 16) / 16.0
+			ibuf[ik + 19] = float(cl / 16) / 16.0
+			ik += 20
+			continue
 		buf[k] = s
+		buf[k + 2] = dp.x
 		buf[k + 3] = pos.x
-		buf[k + 5] = s
+		buf[k + 6] = dp.y
 		buf[k + 7] = pos.y
-		buf[k + 10] = s
+		buf[k + 10] = dp.z
 		buf[k + 11] = pos.z
 		buf[k + 12] = col.r * m
 		buf[k + 13] = col.g * m
@@ -439,7 +662,11 @@ func _draw_terrain(alpha: float) -> void:
 		buf[k + 17] = q[9]
 		buf[k + 18] = float(q[7])
 		k += 20
+	tmm.visible_instance_count = k / 20
 	tmm.buffer = buf
+	imm.visible_instance_count = ik / 20
+	if ik > 0:
+		imm.buffer = ibuf
 
 
 ## 20 TPS simulation.
@@ -447,10 +674,13 @@ func tick() -> void:
 	var b := Res.blocks
 	var flags := b.st_flags
 	var chunks: Dictionary = world.cm.chunks
+	var spawn_after: Array = []   # [kind, pos]: drops that fall after hanging, splashes where they land
 	var keep: Array = []
 	for p in parts:
 		p[4] = int(p[4]) + 1
 		if int(p[4]) >= int(p[5]):
+			if p[0] == "dripping_water":
+				spawn_after.append(["falling_water", p[1]])
 			continue
 		p[2] = p[1]
 		var v: Vector3 = p[3]
@@ -485,18 +715,25 @@ func tick() -> void:
 		elif chunks.has(((px >> 4) << 32) | ((pz >> 4) & 0xFFFFFFFF)):
 			st = 0
 		if st > 0 and (flags[st] & BlockRegistry.F_COLLIDE) != 0 and float(p[9]) > 0.0:
+			if p[0] == "falling_water":
+				spawn_after.append(["splash", p[1]])
+				continue
 			if lf != null:
 				continue   # Java: removed on landing or when a horizontal collision zeroes xd / zd
 			v = Vector3(v.x * 0.7, 0.0, v.z * 0.7)
 			np = p[1]
 		if p[0] == "bubble" and (st <= 0 or (flags[st] & BlockRegistry.F_LIQUID) == 0):
 			continue
+		if p[0] == "falling_water" and st > 0 and (flags[st] & (BlockRegistry.F_LIQUID | BlockRegistry.F_LAVA)) == BlockRegistry.F_LIQUID:
+			continue   # (DripParticle: gone inside water of its own kind)
 		p[1] = np
 		p[3] = v * float(p[10])
 		if lf == null:
 			p[8] = _sprite(p[0], p[4], p[5])
 		keep.append(p)
 	parts = keep
+	for sa in spawn_after:
+		_add(sa[0], sa[1], Vector3.ZERO, Color(0.2, 0.3, 1.0) if sa[0] != "splash" else Color.WHITE)
 	var tkeep: Array = []
 	for q in tparts:
 		q[3] = int(q[3]) + 1
@@ -522,6 +759,164 @@ func tick() -> void:
 		tkeep.append(q)
 	tparts = tkeep
 	_animate_blocks()
+	_rain_finish()
+	_build()
+
+
+var _rain_sound_time := 0
+
+
+## Java WeatherEffectRenderer.tickRainParticles: int(100 f^2) tries (f = rain level, halved on Fast graphics; halved
+## again on Decreased particles, none on Minimal) at random columns +-10 around the camera whose top lies within 10
+## blocks of it and where it rains (not snows): a rain splash (WaterDropParticle) on the top of the block's collision
+## shape / fluid surface there, smoke on lava / magma / lit campfires. The last such column sounds weather.rain (0.2,
+## 1.0), or weather.rain.above (0.1, 0.5) when it is more than a block above a camera under a roof, whenever
+## nextInt(3) < rainSoundTime++ (wiki Rain: the same volumes / pitches).
+## Java adds the particles of a tick at the next particle tick, so the tries are spread over the frames before the
+## tick they belong to (_rain_step) and the splashes become visible together at that tick (spawn time = that tick).
+func _rain_tries() -> int:
+	if world.player == null or world.dimension != "overworld":
+		return 0
+	var rf: float = float(world.rain) / (2.0 if str(Settings.get_v("graphics")) == "fast" else 1.0)
+	if rf <= 0.0:
+		return 0
+	return int(100.0 * rf * rf) / (2 if str(Settings.get_v("particles")) == "decreased" else 1)
+
+
+## A share of the coming tick's tries, evenly over the frames left until it.
+func _rain_step(delta: float) -> void:
+	if _rain_left <= 0:
+		return
+	var frames_left := maxi(1, int((0.05 - float(world.tick_accum)) / maxf(delta, 0.0005)))
+	var n := mini(_rain_left, maxi(1, ceili(float(_rain_left) / frames_left)))
+	_rain_left -= n
+	_rain_run(n)
+
+
+func _rain_run(n: int) -> void:
+	var wfx = world.get("weather_fx")
+	if wfx == null or world.player == null:
+		return
+	var cols: Dictionary = wfx._cols
+	var cam: Vector3 = world.player.pos + Vector3(0, world.player.eye_height(), 0)
+	var cb := Vector3i(cam.floor())
+	var b := Res.blocks
+	var minimal := str(Settings.get_v("particles")) == "minimal"
+	var spawn_t := float((int(world.game_time) + 1) & 131071)
+	for i in n:
+		var rx := cb.x + rng.randi_range(0, 20) - 10
+		var rz := cb.z + rng.randi_range(0, 20) - 10
+		var col = cols.get((rx << 32) ^ (rz & 0xFFFFFFFF))
+		if col == null:
+			continue
+		var hy: int = col.k1
+		if hy <= Coords.MIN_Y or hy > cb.y + 10 or hy < cb.y - 10 or col.kind != 1:
+			continue
+		var bs: int = col.top
+		# Java: the top of the collision shape at a random point of the block, or the fluid surface (higher of both)
+		var fx := rng.randf()
+		var fz := rng.randf()
+		var top := 0.0
+		if bs > 0:
+			var fl: int = b.st_flags[bs]
+			if (fl & (BlockRegistry.F_LIQUID | BlockRegistry.F_WATERLOGGED)) != 0:
+				top = float(BlockUpdates._amount(bs)) / 9.0
+			if (fl & BlockRegistry.F_COLLIDE) != 0:
+				var boxes := b.get_shape(bs)
+				for bi in range(0, boxes.size(), 6):
+					if fx >= boxes[bi] and fx <= boxes[bi + 3] and fz >= boxes[bi + 2] and fz <= boxes[bi + 5]:
+						top = maxf(top, boxes[bi + 4])
+		if top <= 0.0:
+			continue
+		_rain_last = Vector3i(rx, hy - 1, rz)
+		if minimal:
+			break
+		var at := Vector3(rx + fx, hy - 1 + top, rz + fz)
+		var bn := b.name_of(bs) if bs > 0 else ""
+		if (bs > 0 and (b.st_flags[bs] & BlockRegistry.F_LAVA) != 0) or bn == "magma_block" or ((bn == "campfire" or bn == "soul_campfire") and b.get_prop(bs, "lit") == "true"):
+			_add("smoke", at, Vector3.ZERO, Color.WHITE)
+			continue
+		_splash(at, spawn_t)
+	_rlive_until = int(world.game_time) + 45
+
+
+## One WaterDropParticle spawn record: Java Particle(x, y, z, 0, 0, 0) velocity (random direction, rescaled), then
+## xd / zd x 0.3, yd = 0.1 + 0.2 r, lifetime 8 / (0.2 + 0.8 r), ground removal 50 % per tick (the number of ground ticks
+## survived is drawn here), quad size 0.1 x (0.5 + 0.5 r) x 2, a random splash sprite, lit at its block.
+func _splash(at: Vector3, spawn_t: float) -> void:
+	var vx := (randf() * 2.0 - 1.0) * 0.4
+	var vy := (randf() * 2.0 - 1.0) * 0.4
+	var vz := (randf() * 2.0 - 1.0) * 0.4
+	var d0 := (randf() + randf() + 1.0) * 0.15
+	var d1 := maxf(sqrt(vx * vx + vy * vy + vz * vz), 1e-6)
+	vx = vx / d1 * d0 * 0.4 * 0.3
+	vz = vz / d1 * d0 * 0.4 * 0.3
+	vy = randf() * 0.2 + 0.1
+	var life := int(8.0 / (randf() * 0.8 + 0.2))
+	var gr := 0
+	while gr < 40 and randf() >= 0.5:
+		gr += 1
+	var size := 0.1 * (rng.randf() * 0.5 + 0.5) * 2.0
+	var l: int = world.cm.get_light(floori(at.x), floori(at.y), floori(at.z))
+	var lv := 1.0 if Settings.get_v("adv_fullbright") else maxf(float(l >> 4) / 15.0 * clampf(world.sky_darken(), 0.2, 1.0), float(l & 15) / 15.0)
+	var m := 0.2 + 0.8 * lv
+	var r: Rect2 = uv.get("splash_%d" % rng.randi_range(0, 3), uv.get("generic_0", Rect2(0, 0, 0.0625, 0.0625)))
+	var pos := at - Vector3(world.cm.origin)
+	var o := _rhead * 20
+	_rhead = (_rhead + 1) % RCAP
+	# MODEL_MATRIX[0] = start velocity, [1] = (spawn tick, lifetime, -), [2] = (ground ticks survived, quad size, -),
+	# [3] = start position
+	_rbuf[o] = vx
+	_rbuf[o + 1] = spawn_t
+	_rbuf[o + 2] = float(gr)
+	_rbuf[o + 3] = pos.x
+	_rbuf[o + 4] = vy
+	_rbuf[o + 5] = float(life)
+	_rbuf[o + 6] = size
+	_rbuf[o + 7] = pos.y
+	_rbuf[o + 8] = vz
+	_rbuf[o + 9] = 0.0
+	_rbuf[o + 10] = 0.0
+	_rbuf[o + 11] = pos.z
+	_rbuf[o + 12] = m
+	_rbuf[o + 13] = m
+	_rbuf[o + 14] = m
+	_rbuf[o + 15] = 1.0
+	_rbuf[o + 16] = r.position.x
+	_rbuf[o + 17] = r.position.y
+	_rbuf[o + 18] = r.size.x
+	_rbuf[o + 19] = r.size.y
+	_rdirty = true
+
+
+## At the tick: the remaining tries, the rain sound, one upload of the splash ring; next tick's tries.
+func _rain_finish() -> void:
+	if _rain_left > 0:
+		_rain_run(_rain_left)
+		_rain_left = 0
+	if _rdirty:
+		_rdirty = false
+		rmm.buffer = _rbuf
+		rmm.visible_instance_count = RCAP
+	elif rmm.visible_instance_count > 0 and int(world.game_time) > _rlive_until:
+		rmm.visible_instance_count = 0
+	var last := _rain_last
+	_rain_last = Vector3i(0, -99999, 0)
+	_rain_left = _rain_tries()
+	if last.y == -99999 or world.player == null:
+		return
+	var cam: Vector3 = world.player.pos + Vector3(0, world.player.eye_height(), 0)
+	var cb := Vector3i(cam.floor())
+	var play := rng.randi_range(0, 2) < _rain_sound_time
+	_rain_sound_time += 1
+	if play:
+		_rain_sound_time = 0
+		var cch: Chunk = world.cm.get_chunk(cb.x >> 4, cb.z >> 4)
+		var roof := cch != null and not cch.heightmap.is_empty() and int(cch.heightmap[(cb.x & 15) + (cb.z & 15) * 16]) > cb.y
+		if last.y > cb.y + 1 and roof:
+			Audio.play("weather.rain.above", Vector3(last) + Vector3(0.5, 0.5, 0.5), "Weather", 0.1, 0.5)
+		else:
+			Audio.play("weather.rain", Vector3(last) + Vector3(0.5, 0.5, 0.5), "Weather", 0.2, 1.0)
 
 
 ## Java ClientLevel.doAnimateTick sampling.
@@ -579,17 +974,6 @@ func _animate_blocks() -> void:
 			if st <= 0 or est[st] == 0:
 				continue
 			_anim_emit(b, x, y, z, st)
-	# rain splashes around the player (Java LevelRenderer.tickRain)
-	if world.rain > 0.2 and world.dimension == "overworld":
-		for i in int(world.rain * 6.0):
-			var rx := int(floor(c.x)) + rng.randi_range(-10, 10)
-			var rz := int(floor(c.z)) + rng.randi_range(-10, 10)
-			var ch: Chunk = world.cm.get_chunk(rx >> 4, rz >> 4)
-			if ch == null or ch.heightmap.is_empty():
-				continue
-			var hy: int = ch.heightmap[(rx & 15) + (rz & 15) * 16]
-			if absf(hy - c.y) < 16.0:
-				_add("rain", Vector3(rx + rng.randf(), hy + 0.05, rz + rng.randf()), Vector3(0, 0.1, 0), Color(0.5, 0.6, 1.0))
 
 
 ## One doAnimateTick hit: the block's ambient particles (torches, campfires, furnaces, portals, ...).
@@ -630,6 +1014,37 @@ func _anim_emit(b: BlockRegistry, x: int, y: int, z: int, st: int) -> void:
 		_add("large_smoke", Vector3(x + rng.randf(), y + rng.randf() * 0.5 + 0.5, z + rng.randf()), Vector3.ZERO, Color.WHITE)
 	elif nm.ends_with("candle") and b.get_prop(st, "lit") == "true" and rng.randf() < 0.3:
 		_add("flame", q + Vector3(0, 0.55, 0), Vector3.ZERO, Color.WHITE)
+	elif nm == "wet_sponge":
+		_wet_sponge_drip(b, x, y, z)
+
+
+## Java WetSpongeBlock.animateTick (wiki: wet sponges drip water from their sides and bottom; it gives no rate): a
+## random direction per hit, none upward, none where that neighbour's face is full; a hanging water drip on that face.
+const _DIR6 := [Vector3i(0, -1, 0), Vector3i(0, 1, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(1, 0, 0)]
+func _wet_sponge_drip(b: BlockRegistry, x: int, y: int, z: int) -> void:
+	var di := rng.randi_range(0, 5)
+	if di == 1:
+		return
+	var dv: Vector3i = _DIR6[di]
+	var ns: int = world.state_at(x + dv.x, y + dv.y, z + dv.z)
+	if ns > 0 and (b.st_flags[ns] & BlockRegistry.F_FULL_SHAPE) != 0:
+		return
+	var px := float(x)
+	var py := float(y)
+	var pz := float(z)
+	if di == 0:
+		py -= 0.05
+		px += rng.randf()
+		pz += rng.randf()
+	else:
+		py += rng.randf() * 0.8
+		if dv.x != 0:
+			pz += rng.randf()
+			px += 1.1 if dv.x > 0 else -0.1
+		else:
+			px += rng.randf()
+			pz += 1.1 if dv.z > 0 else -0.1
+	_add("dripping_water", Vector3(px, py, pz), Vector3.ZERO, Color.WHITE)
 
 
 ## Java LeavesBlock.spawnFallingLeavesParticle: leafParticleChance (cherry 0.1, pale oak 0.02, tinted 0.01), only
@@ -649,6 +1064,12 @@ func _leaf_emit(b: BlockRegistry, x: int, y: int, z: int, st: int) -> void:
 			var lk := LEAF_KINDS.find(n0)
 			_leaf_kind[s0] = 0 if n0.contains("azalea") else (lk if lk >= 2 else 1)
 	var k := _leaf_kind[st]
+	# LeavesBlock.makeDrippingWaterParticles (wiki Leaves: "water now slowly drips through leaves during rain"; the 1 in 15
+	# per hit is Java's, not on the wiki): raining at the block above, the block below without a full top face
+	if world.raining and rng.randi_range(0, 14) == 1 and world.weather_at(Vector3(x, y + 1, z)) == "rain":
+		var bl: int = world.state_at(x, y - 1, z)
+		if bl <= 0 or (b.st_flags[bl] & BlockRegistry.F_FULL_SHAPE) == 0:
+			_add("dripping_water", Vector3(x + rng.randf(), y - 0.05, z + rng.randf()), Vector3.ZERO, Color.WHITE)
 	if k == 0 or rng.randf() >= LEAF_CHANCE[k]:
 		return
 	var below: int = world.state_at(x, y - 1, z)
@@ -672,36 +1093,39 @@ func _anim_native() -> bool:
 
 
 ## Per frame: interpolate and upload the instance buffer.
-func _process(_d: float) -> void:
-	if world == null or world.cm == null:
-		return
-	var alpha := clampf(world.tick_accum / 0.05, 0.0, 1.0)
-	_draw_terrain(alpha)
+## Once per tick (Java renders particles between ticks by interpolating their previous / current positions): the
+## instance buffer holds MODEL_MATRIX[3] = position, [2] = previous - position, [0] = (quad size, age, lifetime),
+## [1] = (previous roll, roll, size curve); shaders/particle.gdshader interpolates with the global partial tick, so
+## no frame touches a particle.
+func _build() -> void:
+	_built_origin = world.cm.origin
+	_build_terrain()
 	var n := parts.size()
 	mm.visible_instance_count = n
 	if n == 0:
 		return
 	var buf := PackedFloat32Array()
-	buf.resize(n * 20)
+	buf.resize(CAP * 20)
 	var day := clampf(world.sky_darken(), 0.2, 1.0)
 	var fullbright: bool = Settings.get_v("adv_fullbright")
+	var orgv := Vector3(world.cm.origin)
 	var k := 0
 	for p in parts:
-		var pos: Vector3 = world.vis((p[2] as Vector3).lerp(p[1], alpha))
+		var cur: Vector3 = (p[1] as Vector3) - orgv
+		var dp: Vector3 = (p[2] as Vector3) - (p[1] as Vector3)
 		var s: float = p[6] * 2.0   # Java quads span +-quadSize
-		var rc := 1.0
-		var rs := 0.0
+		var r0 := 0.0
+		var r1 := 0.0
+		var curve := 1.0   # 0 constant, 1 grows in over the first 1/32 of the life, 2 flame shrink, 3 leaf roll
+		var kind: String = p[0]
 		if p[12] != null:
-			var roll := lerpf(float(p[12][1]), float(p[12][0]), alpha)
-			rc = cos(roll)
-			rs = sin(roll)
-		elif p[0] == "flame" or p[0] == "soul_fire_flame":
-			var t := (float(p[4]) + alpha) / float(p[5])
-			s *= 1.0 - t * t * 0.5
-		elif p[0] == "explosion" or p[0] == "campfire_smoke":
-			s *= 1.0
-		else:
-			s *= clampf((float(p[4]) + alpha) / float(p[5]) * 32.0, 0.0, 1.0)
+			r0 = float(p[12][1])
+			r1 = float(p[12][0])
+			curve = 3.0
+		elif kind == "flame" or kind == "soul_fire_flame":
+			curve = 2.0
+		elif kind == "explosion" or kind == "campfire_smoke":
+			curve = 0.0
 		var col: Color = p[7]
 		if not p[11]:
 			var wp: Vector3 = p[1]
@@ -710,19 +1134,18 @@ func _process(_d: float) -> void:
 			var m := 0.2 + 0.8 * lv
 			col = Color(col.r * m, col.g * m, col.b * m, col.a)
 		var r: Rect2 = uv.get(p[8], uv.get("generic_0", Rect2(0, 0, 0.0625, 0.0625)))
-		# basis x = (s cos roll, s sin roll, 0): the shader takes the size from its length and the roll from its angle
-		buf[k] = s * rc
-		buf[k + 1] = 0.0
-		buf[k + 2] = 0.0
-		buf[k + 3] = pos.x
-		buf[k + 4] = s * rs
-		buf[k + 5] = s
-		buf[k + 6] = 0.0
-		buf[k + 7] = pos.y
-		buf[k + 8] = 0.0
-		buf[k + 9] = 0.0
-		buf[k + 10] = s
-		buf[k + 11] = pos.z
+		buf[k] = s
+		buf[k + 1] = r0
+		buf[k + 2] = dp.x
+		buf[k + 3] = cur.x
+		buf[k + 4] = float(p[4])
+		buf[k + 5] = r1
+		buf[k + 6] = dp.y
+		buf[k + 7] = cur.y
+		buf[k + 8] = float(p[5])
+		buf[k + 9] = curve
+		buf[k + 10] = dp.z
+		buf[k + 11] = cur.z
 		buf[k + 12] = col.r
 		buf[k + 13] = col.g
 		buf[k + 14] = col.b
@@ -732,7 +1155,15 @@ func _process(_d: float) -> void:
 		buf[k + 18] = r.size.x
 		buf[k + 19] = r.size.y
 		k += 20
-	# rows beyond n are hidden by visible_instance_count; the buffer must cover the whole multimesh
-	if n < CAP:
-		buf.resize(CAP * 20)
 	mm.buffer = buf
+
+
+func _process(delta: float) -> void:
+	if world == null or world.cm == null:
+		return
+	if world.cm.origin != _built_origin:
+		# positions are stored relative to the world origin: rebuild now, splashes in flight are dropped
+		_build()
+		rmm.visible_instance_count = 0
+		_rbuf.fill(0.0)
+	_rain_step(delta)

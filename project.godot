@@ -74,6 +74,14 @@ mc_fog_dist={
 "type": "vec4",
 "value": Vector4(1e+06, 1e+06, 230, 256)
 }
+mc_partial={
+"type": "float",
+"value": 0.0
+}
+mc_ticks={
+"type": "float",
+"value": 0.0
+}
 mc_nether_light={
 "type": "float",
 "value": 0.0
@@ -101,6 +109,7 @@ common/physics_ticks_per_second=60
 
 rendering_device/driver.windows="d3d12"
 rendering_device/vsync/frame_queue_size=3
+rendering_device/d3d12/max_sampler_descriptors=2048
 textures/canvas_textures/default_texture_filter=0
 anti_aliasing/quality/msaa_3d=0
 environment/defaults/default_clear_color=Color(0.47, 0.65, 1, 1)

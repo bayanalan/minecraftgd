@@ -11,13 +11,27 @@ static var shapeless: Array = []
 static var smelting: Dictionary = {}   # item name -> [result name, count, xp, time]
 static var blasting: Dictionary = {}
 static var smoking: Dictionary = {}
+static var campfire: Dictionary = {}   # campfire_cooking: item name -> [result, count, xp, time] (was mixed into smoking)
 static var stonecutting: Dictionary = {}  # input name -> Array[[result, count]]
 static var loaded := false
 static var last_keep: Array = []   # grid indices the last special match leaves in place (book/banner copies)
 static var count := 0
 
 const REMAINDERS := {"water_bucket": "bucket", "lava_bucket": "bucket", "milk_bucket": "bucket", "powder_snow_bucket": "bucket", "honey_bottle": "glass_bottle", "dragon_breath": "glass_bottle"}
-const FUEL := {"coal": 1600, "charcoal": 1600, "coal_block": 16000, "lava_bucket": 20000, "blaze_rod": 2400, "stick": 100, "bamboo": 50, "dried_kelp_block": 4001, "scaffolding": 50}
+# Furnace fuel burn times in ticks (wiki: Smelting, fuel table, Java values).
+const FUEL := {"lava_bucket": 20000, "coal_block": 16000, "dried_kelp_block": 4000, "blaze_rod": 2400, "coal": 1600, "charcoal": 1600,
+	"bamboo_mosaic": 300, "bamboo_mosaic_slab": 150, "bamboo_mosaic_stairs": 300, "chiseled_bookshelf": 300, "mangrove_roots": 300,
+	"ladder": 300, "crafting_table": 300, "cartography_table": 300, "fletching_table": 300, "smithing_table": 300, "loom": 300,
+	"bookshelf": 300, "lectern": 300, "composter": 300, "chest": 300, "trapped_chest": 300, "barrel": 300, "daylight_detector": 300,
+	"jukebox": 300, "note_block": 300, "bow": 300, "crossbow": 300, "fishing_rod": 300, "wooden_pickaxe": 200, "wooden_shovel": 200,
+	"wooden_hoe": 200, "wooden_axe": 200, "wooden_sword": 200, "wooden_spear": 200, "bowl": 100, "stick": 100, "dead_bush": 100,
+	"azalea": 100, "leaf_litter": 100, "short_dry_grass": 100, "tall_dry_grass": 100, "bamboo": 50, "scaffolding": 50}
+# Item tags burning as fuel (same wiki table); members of #non_flammable_wood (crimson / warped wood) never burn.
+const FUEL_TAGS := {"boats": 1200, "bamboo_blocks": 300, "logs_that_burn": 300, "planks": 300, "wooden_slabs": 150, "wooden_stairs": 300,
+	"wooden_pressure_plates": 300, "wooden_trapdoors": 300, "fence_gates": 300, "wooden_fences": 300, "wooden_shelves": 300, "banners": 300,
+	"wooden_doors": 200, "signs": 200, "hanging_signs": 200, "wooden_buttons": 100, "saplings": 100, "wool": 100, "wool_stairs": 100,
+	"wool_carpets": 67, "wool_slabs": 50, "cushions": 50}
+static var _fuel: Dictionary = {}   # item name -> ticks, built on first use
 
 
 static func _ingredient(v) -> Dictionary:
@@ -84,7 +98,7 @@ static func load_all() -> void:
 				shapeless.append({"ings": ings, "result": rname, "count": rcount, "id": f.get_file().get_basename(), "category": str(j.get("category", "misc"))})
 			"smelting", "blasting", "smoking", "campfire_cooking":
 				var ing := _ingredient(j.get("ingredient", ""))
-				var target: Dictionary = smelting if tp == "smelting" else (blasting if tp == "blasting" else smoking)
+				var target: Dictionary = smelting if tp == "smelting" else (blasting if tp == "blasting" else (smoking if tp == "smoking" else campfire))
 				for n in ing:
 					target[n] = [rname, rcount, float(j.get("experience", 0.0)), int(j.get("cookingtime", 200))]
 			"crafting_transmute", "crafting_dye", "crafting_imbue", "crafting_decorated_pot", "crafting_special_firework_rocket", "crafting_special_firework_star", "crafting_special_firework_star_fade", "crafting_special_bannerduplicate", "crafting_special_bookcloning", "crafting_special_repairitem", "crafting_special_shielddecoration":
@@ -208,7 +222,7 @@ static func consume(grid: Array) -> void:
 
 static func smelt_result(item: int, kind: String = "smelting") -> ItemStack:
 	load_all()
-	var table: Dictionary = smelting if kind == "smelting" else (blasting if kind == "blasting" else smoking)
+	var table: Dictionary = smelting if kind == "smelting" else (blasting if kind == "blasting" else (campfire if kind == "campfire_cooking" else smoking))
 	var e = table.get(Res.items.names[item])
 	if e == null:
 		return null
@@ -218,22 +232,22 @@ static func smelt_result(item: int, kind: String = "smelting") -> ItemStack:
 
 static func smelt_info(item: int, kind: String = "smelting") -> Array:
 	load_all()
-	var table: Dictionary = smelting if kind == "smelting" else (blasting if kind == "blasting" else smoking)
+	var table: Dictionary = smelting if kind == "smelting" else (blasting if kind == "blasting" else (campfire if kind == "campfire_cooking" else smoking))
 	return table.get(Res.items.names[item], [])
 
 
 static func fuel_time(item: int) -> int:
-	var n: String = Res.items.names[item]
-	if FUEL.has(n):
-		return FUEL[n]
-	if n.ends_with("_planks") or n.ends_with("_log") or n.ends_with("_wood") or n.ends_with("_stem") or n.ends_with("_hyphae") or n.ends_with("_slab") and Tags.items("wooden_slabs").has(n) or n.ends_with("_fence") or n.ends_with("_stairs") and Tags.items("wooden_stairs").has(n) or n == "crafting_table" or n == "bookshelf" or n == "chest" or n.ends_with("_pressure_plate") and n.contains("_") and Tags.items("planks").size() > 0 and false:
-		return 300 if not n.ends_with("_slab") else 150
-	if n.begins_with("wooden_"):
-		return 200
-	if n.ends_with("_wool"):
-		return 100
-	if n.ends_with("_carpet"):
-		return 67
-	if n.ends_with("_sapling"):
-		return 100
-	return 0
+	if _fuel.is_empty():
+		var tbl: Dictionary = FUEL.duplicate()
+		if Res.mode == "vanilla":
+			var nonflam := Tags.items("non_flammable_wood")
+			for t in FUEL_TAGS:
+				for n in Tags.items(t):
+					if not nonflam.has(n) and not tbl.has(n):
+						tbl[n] = FUEL_TAGS[t]
+		else:
+			for n2 in Res.items.names:
+				if n2.ends_with("_planks") or n2.ends_with("_log"):
+					tbl[n2] = 300
+		_fuel = tbl
+	return int(_fuel.get(Res.items.names[item], 0))

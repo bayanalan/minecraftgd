@@ -17,6 +17,14 @@ const STEPS := 11
 const W_FORCE := 0
 const W_REPLACEABLE := 1
 const W_AIR := 2
+# Ore writes: W_ORE | (rule << 2). Java's OreFeature runs its target rule test against the block present when the
+# feature runs; here every origin decides on pristine terrain, so the decorate merge re-tests the cell against the
+# rule (another origin's moss / plant / structure block in that cell keeps it; a neighbour's stone-type blob still
+# takes the ore when the rule accepts it, as in Java). ore_mask: per state, bit r = passes interned ore rule r.
+const W_ORE := 3
+static var ore_rule_index := {}
+static var ore_mask := PackedInt32Array()
+static var _ore_m := Mutex.new()
 
 var gen: VanillaGenerator
 var blocks: BlockRegistry
@@ -36,7 +44,14 @@ var native_engine := true    # run supported placed features in RecraftNative.fx
 var bounds: Array = []       # verification: [name, writes size before it] per placed feature of the last compute
 var _temps := PackedFloat64Array()   # biome temperatures (native decorate)
 var trace_names := false     # diagnostics: print each placed feature / structure step before running it
+# neighbours' surface structures are visible to this origin's later features (Structures.place_neighbour_view);
+# RC_NO_NSTRUCT=1 turns it off for A/B checks
+var neighbour_structures := not OS.has_environment("RC_NO_NSTRUCT")
 var _m := Mutex.new()
+# diagnostics (--structcheck): every structure write of every origin [x, y, z, state]*, checked against the finished world
+static var struct_record := false
+static var struct_writes := PackedInt32Array()
+static var _srm := Mutex.new()
 
 
 class SimplexNoise:
@@ -90,11 +105,32 @@ func _init(g: VanillaGenerator) -> void:
 	blocks = g.blocks
 
 
+## Sets BlockRegistry.F_TREE_REPL on air and #replaceable_by_trees states (water included: swamp / mangrove trees grow
+## in it; snow layers are not in it, so a snow pile blocks a tree). Without the tag (placeholder mode): replaceable or
+## leaves, no liquid (the earlier rule).
+func _mark_tree_replaceable() -> void:
+	var tag := Tags.blocks("#minecraft:replaceable_by_trees") if Res.mode == "vanilla" else {}
+	var fl := blocks.st_flags
+	for st in fl.size():
+		var v := fl[st] & ~BlockRegistry.F_TREE_REPL
+		var ok := false
+		if tag.is_empty():
+			ok = (v & (BlockRegistry.F_REPLACEABLE | BlockRegistry.F_LEAVES)) != 0 and (v & BlockRegistry.F_LIQUID) == 0
+		else:
+			var nm := blocks.name_of(st) if st > 0 else "air"
+			ok = nm == "air" or nm == "cave_air" or nm == "void_air" or tag.has(nm)
+		fl[st] = v | (BlockRegistry.F_TREE_REPL if ok else 0)
+	blocks.st_flags = fl
+
+
 func _json(kind: String, name: String):
 	return gen.source.call("data/minecraft/worldgen/%s/%s.json" % [kind, name.trim_prefix("minecraft:")])
 
 
 func setup() -> void:
+	if OS.get_environment("RC_GD_FEATURES") != "":
+		native_engine = false   # (dev: GDScript feature path only)
+	_mark_tree_replaceable()
 	simplex_info = SimplexNoise.new(RandomSources.LegacyRandom.new(2345))
 	for s in STEPS:
 		step_index.append({})
@@ -116,6 +152,100 @@ func setup() -> void:
 					_placed(nm)
 			steps.append(lst)
 		biome_steps.append(steps)
+	_sort_features(_possible_biomes())
+
+
+## Biomes in the dimension's BiomeSource.possibleBiomes() order (the feature sorter's input order): multi-noise ->
+## first appearance in the parameter list (Climate, Java OverworldBiomeBuilder / nether preset), the End ->
+## TheEndBiomeSource's five, a single biome -> itself; else registry order.
+func _possible_biomes() -> Array:
+	var out: Array = []
+	var seen := {}
+	var src: PackedStringArray = PackedStringArray()
+	if gen.get("single_biome") != null and int(gen.get("single_biome")) >= 0:
+		src = PackedStringArray([gen.biomes.names[int(gen.single_biome)]])
+	elif bool(gen.get("end_biomes")):
+		src = PackedStringArray(["the_end", "end_highlands", "end_midlands", "small_end_islands", "end_barrens"])
+	elif gen.get("climate") != null:
+		src = (gen.climate as Climate).names
+	for nm in src:
+		var bi: int = gen.biomes.id(nm)
+		if bi >= 0 and not seen.has(bi):
+			seen[bi] = true
+			out.append(bi)
+	if out.is_empty():
+		for bi in gen.biomes.names.size():
+			out.append(bi)
+	return out
+
+
+## Java FeatureSorter.buildFeaturesPerStep: every biome's feature list (all steps flattened) adds an edge from each
+## feature to the next; features are numbered by first appearance (biomes in possibleBiomes order); a depth-first
+## search over the nodes in (step, number) order, successors in the same order, gives the reversed post-order. Its
+## per-step positions are the feature indices (setFeatureSeed(decoration seed, index, step)) and the placing order.
+func _sort_features(order: Array) -> void:
+	var num := {}   # feature name -> first-appearance number (shared by all steps)
+	var edges := {}   # node key (step << 20 | number) -> {successor key: true}
+	var names_of := {}   # node key -> feature name
+	for bi in order:
+		if bi >= biome_steps.size():
+			continue
+		var flat: Array = []
+		for s in STEPS:
+			for nm in biome_steps[bi][s]:
+				if not num.has(nm):
+					num[nm] = num.size()
+				var k: int = (s << 20) | int(num[nm])
+				names_of[k] = nm
+				flat.append(k)
+		for i in flat.size():
+			if not edges.has(flat[i]):
+				edges[flat[i]] = {}
+			if i < flat.size() - 1:
+				edges[flat[i]][flat[i + 1]] = true
+	var keys: Array = edges.keys()
+	keys.sort()
+	var visited := {}
+	var post: Array = []
+	for start in keys:
+		if visited.has(start):
+			continue
+		# iterative DFS: stack of [node, sorted successors, next successor index]
+		var in_progress := {start: true}
+		var succ0: Array = (edges[start] as Dictionary).keys()
+		succ0.sort()
+		var stack: Array = [[start, succ0, 0]]
+		while not stack.is_empty():
+			var top: Array = stack[stack.size() - 1]
+			var lst: Array = top[1]
+			if int(top[2]) < lst.size():
+				var nx = lst[int(top[2])]
+				top[2] = int(top[2]) + 1
+				if visited.has(nx) or in_progress.has(nx):
+					continue   # (a cycle: vanilla data has none)
+				in_progress[nx] = true
+				var sn: Array = (edges.get(nx, {}) as Dictionary).keys()
+				sn.sort()
+				stack.append([nx, sn, 0])
+			else:
+				stack.pop_back()
+				in_progress.erase(top[0])
+				visited[top[0]] = true
+				post.append(top[0])
+	post.reverse()
+	var idx: Array = []
+	for s in STEPS:
+		idx.append({})
+	for k in post:
+		var s2: int = int(k) >> 20
+		if s2 < STEPS:
+			idx[s2][names_of[k]] = (idx[s2] as Dictionary).size()
+	# features of biomes outside the biome source (unreachable) keep a number after the sorted ones
+	for s in STEPS:
+		for nm in step_index[s]:
+			if not (idx[s] as Dictionary).has(nm):
+				idx[s][nm] = (idx[s] as Dictionary).size()
+	step_index = idx
 
 
 # ------------------------------------------------------------------ compilation
@@ -157,7 +287,8 @@ func _cf(v) -> Dictionary:
 		"ore", "scattered_ore":
 			var targets: Array = []
 			for tg in c.get("targets", []):
-				targets.append([_rule_test(tg.get("target", {})), _state(tg.get("state", "minecraft:stone"))])
+				var rt0 := _rule_test(tg.get("target", {}))
+				targets.append([rt0, _state(tg.get("state", "minecraft:stone")), _ore_mode(rt0)])
 			out["targets"] = targets
 			out["size"] = int(c.get("size", 8))
 			out["discard"] = float(c.get("discard_chance_on_air_exposure", 0.0))
@@ -229,6 +360,25 @@ func _cf(v) -> Dictionary:
 			out["soil"] = _prov(c.get("below_trunk_provider", c.get("dirt_provider", {"id": "minecraft:dirt"})))
 			out["tp"] = c.get("trunk_placer", {})
 			out["fp"] = c.get("foliage_placer", {})
+			out["ms"] = c.get("minimum_size", {})
+			out["iv"] = bool(c.get("ignore_vines", false))
+			# UpwardsBranchingTrunkPlacer.validTreePos: also through its can_grow_through blocks
+			var cgt = (out["tp"] as Dictionary).get("can_grow_through", null)
+			if cgt != null:
+				out["tgrow"] = _block_set(cgt)
+			# MangroveRootPlacer (the only root placer type in 26.3)
+			var rpl = c.get("root_placer", null)
+			if rpl is Dictionary and str(rpl.get("type", "")).trim_prefix("minecraft:") == "mangrove_root_placer":
+				var mrp: Dictionary = rpl.get("mangrove_root_placement", {})
+				var rp := {"off": rpl.get("trunk_offset_y", 0), "prov": _prov(rpl.get("root_provider", {})),
+					"grow": _block_set(mrp.get("can_grow_through", [])), "muddy_in": _block_set(mrp.get("muddy_roots_in", [])),
+					"muddy": _prov(mrp.get("muddy_roots_provider", {})), "len": int(mrp.get("max_root_length", 15)),
+					"width": int(mrp.get("max_root_width", 8)), "skew": float(mrp.get("random_skew_chance", 0.2)), "above_p": -1.0}
+				var arp = rpl.get("above_root_placement", null)
+				if arp is Dictionary:
+					rp["above_p"] = float(arp.get("above_root_placement_chance", 0.0))
+					rp["above"] = _prov(arp.get("above_root_provider", {}))
+				out["rp"] = rp
 			# decorators: providers / nested features resolved now (worker threads only read them later)
 			var decs: Array = []
 			for d in c.get("decorators", []):
@@ -245,6 +395,17 @@ func _cf(v) -> Dictionary:
 		"fallen_tree":
 			out["trunk"] = _prov(c.get("trunk_provider", {}))
 			out["len"] = c.get("log_length", 4)
+			for dk in ["stump_decorators", "log_decorators"]:
+				var fdecs: Array = []
+				for d2 in c.get(dk, []):
+					if not (d2 is Dictionary):
+						continue
+					var dd2: Dictionary = (d2 as Dictionary).duplicate()
+					for pk2 in ["provider", "block_provider", "block_state_provider"]:
+						if dd2.has(pk2):
+							dd2["_prov"] = _prov(dd2[pk2])
+					fdecs.append(dd2)
+				out[dk] = fdecs
 		"block_pile":
 			out["prov"] = _prov(c.get("state_provider", {}))
 		"vegetation_patch", "waterlogged_vegetation_patch":
@@ -445,6 +606,24 @@ func _tag_blocks(tag: String) -> Dictionary:
 	return r
 
 
+## A block HolderSet ("#tag", one id or a list of ids) -> {block id: true}.
+func _block_set(v) -> Dictionary:
+	var out := {}
+	var names: Array = []
+	if v is String:
+		if (v as String).begins_with("#"):
+			names = _tag_blocks(v).keys()
+		else:
+			names = [v]
+	elif v is Array:
+		names = v
+	for n in names:
+		var bi := blocks.block_id(str(n))
+		if bi >= 0:
+			out[bi] = true
+	return out
+
+
 func _rule_test(v) -> Dictionary:
 	if not (v is Dictionary):
 		return {"t": "true"}
@@ -471,6 +650,94 @@ func _rule_test(v) -> Dictionary:
 		"not":
 			return {"t": "not", "r": _rule_test(v.get("rule", {}))}
 	return {"t": "true"}
+
+
+## Merge mode of an ore target (W_ORE | rule << 2, see W_ORE). Each distinct rule test is interned once (static, shared
+## by every generator, so the indices in saved write lists stay valid) with its per-state table. The position / random
+## parts can't be re-tested at merge time: height_match passes, random_block_match keeps its block test only (vanilla
+## ores use neither). W_FORCE (the old rule) once 29 rules are taken.
+func _ore_mode(rt: Dictionary) -> int:
+	var key := var_to_str(rt)
+	_ore_m.lock()
+	var idx := int(ore_rule_index.get(key, -1))
+	if idx < 0 and ore_rule_index.size() < 29:
+		idx = ore_rule_index.size()
+		var ok := _rule_states(rt)
+		var m := ore_mask.duplicate()
+		var n := ok.size()
+		if m.size() < n:
+			var old := m.size()
+			m.resize(n)
+			for st in range(old, n):
+				m[st] = 0
+		for st in n:
+			if ok[st] != 0:
+				m[st] |= 1 << idx
+		ore_mask = m
+		ore_rule_index[key] = idx
+	_ore_m.unlock()
+	return W_FORCE if idx < 0 else W_ORE | (idx << 2)
+
+
+## Per-state result of a rule test (1 = passes) for the ore merge table.
+func _rule_states(rt: Dictionary) -> PackedByteArray:
+	var n := blocks.st_block.size()
+	var out := PackedByteArray()
+	out.resize(n)
+	out.fill(0)
+	match str(rt["t"]):
+		"true", "height":
+			out.fill(1)
+		"ids", "rand":
+			for b in rt["ids"]:
+				var bi := int(b)
+				if bi >= 0 and bi < blocks.block_first.size():
+					for k in blocks.block_count[bi]:
+						out[blocks.block_first[bi] + k] = 1
+		"state":
+			var s := int(rt["s"])
+			if s >= 0 and s < n:
+				out[s] = 1
+		"any_of", "all_of":
+			var all := str(rt["t"]) == "all_of"
+			if all:
+				out.fill(1)
+			for r in rt["rs"]:
+				var sub := _rule_states(r)
+				for st in n:
+					out[st] = (out[st] & sub[st]) if all else (out[st] | sub[st])
+		"not":
+			var sub2 := _rule_states(rt["r"])
+			for st in n:
+				out[st] = 1 - sub2[st]
+	return out
+
+
+## Snapshot of the ore merge table for one decorate merge.
+static func ore_table() -> PackedInt32Array:
+	_ore_m.lock()
+	var m := ore_mask
+	_ore_m.unlock()
+	return m
+
+
+## Whether a write of `mode` applies over the current state `cur` (Features.apply rules; also /place and tree growth
+## on the live world).
+static func write_ok(mode: int, cur: int, fl: PackedInt32Array, om: PackedInt32Array) -> bool:
+	if mode == W_FORCE:
+		return true
+	if (mode & 3) == W_ORE:
+		if om.is_empty():
+			return true
+		return cur > 0 and cur < om.size() and ((om[cur] >> (mode >> 2)) & 1) != 0
+	if cur == 0:
+		return true
+	var f := fl[cur] if cur < fl.size() else 0
+	if mode == W_AIR:
+		return (f & BlockRegistry.F_REPLACEABLE) != 0
+	if mode == W_REPLACEABLE:
+		return (f & (BlockRegistry.F_REPLACEABLE | BlockRegistry.F_LEAVES)) != 0
+	return true
 
 
 func _mod(m) -> Dictionary:
@@ -1194,10 +1461,34 @@ func place_feature(c: FCtx, cf: Dictionary, p: Vector3i) -> bool:
 		"huge_brown_mushroom", "huge_red_mushroom":
 			return Trees.mushroom(self, c, cf, p, t == "huge_red_mushroom")
 		"block_pile":
-			for k2 in 12:
-				var q := p + Vector3i(c.r.next_int_bound(5) - 2, c.r.next_int_bound(2), c.r.next_int_bound(5) - 2)
-				if get_block(c, q) == 0 and get_block(c, q + Vector3i(0, -1, 0)) > 0:
-					set_block(c, q, provide(c, cf["prov"], q), W_AIR)
+			# Java BlockPileFeature (native twin: featx.cpp case 13)
+			if p.y < gen.gen_min_y + 5:
+				return false
+			var pi := 2 + c.r.next_int_bound(2)
+			var pj := 2 + c.r.next_int_bound(2)
+			var path := blocks.block_id("dirt_path")
+			for qz in range(p.z - pj, p.z + pj + 1):
+				for qy in range(p.y, p.y + 2):
+					for qx in range(p.x - pi, p.x + pi + 1):
+						var k := p.x - qx
+						var l := p.z - qz
+						var fa := c.r.next_float() * 10.0
+						var fb := c.r.next_float() * 6.0
+						var put := float(k * k + l * l) <= MCNoise.f32(MCNoise.f32(fa) - MCNoise.f32(fb))
+						if not put:
+							put = c.r.next_float() < 0.031
+						var q := Vector3i(qx, qy, qz)
+						var cur := get_block(c, q)
+						if not put or (cur != 0 and (blocks.st_flags[cur] & BlockRegistry.F_AIR) == 0):
+							continue
+						var below := get_block(c, q + Vector3i(0, -1, 0))
+						var ok := false
+						if below > 0 and blocks.st_block[below] == path:
+							ok = c.r.next_bool()
+						else:
+							ok = below > 0 and (blocks.st_flags[below] & BlockRegistry.F_COLLIDE) != 0 and (blocks.st_flags[below] & BlockRegistry.F_FULL_SHAPE) != 0
+						if ok:
+							set_block(c, q, provide(c, cf["prov"], q), W_FORCE)
 			return true
 		"vegetation_patch", "waterlogged_vegetation_patch":
 			return _veg_patch(c, cf, p)
@@ -1329,7 +1620,7 @@ func _ore(c: FCtx, cf: Dictionary, o: Vector3i) -> bool:
 					var st := get_block(c, key)
 					for tg in targets:
 						if _can_place_ore(c, tg, st, key, discard):
-							set_block(c, key, tg[1], W_FORCE)
+							set_block(c, key, tg[1], tg[2])
 							placed_any = true
 							break
 	return placed_any
@@ -1349,8 +1640,14 @@ func _ore_native(c: FCtx, cf: Dictionary, p: Vector3i, kind: int) -> int:
 	c.r.lo = res[2]
 	c.r.hi = res[3]
 	var w: PackedInt32Array = res[4]
+	var tgs: Array = cf["targets"]
 	for k in range(0, w.size(), 4):
-		set_block(c, Vector3i(w[k], w[k + 1], w[k + 2]), w[k + 3], W_FORCE)
+		var wm := W_FORCE
+		for tg in tgs:
+			if int(tg[1]) == w[k + 3]:
+				wm = int(tg[2])
+				break
+		set_block(c, Vector3i(w[k], w[k + 1], w[k + 2]), w[k + 3], wm)
 	return int(res[1])
 
 
@@ -1426,7 +1723,7 @@ func _scattered_ore(c: FCtx, cf: Dictionary, o: Vector3i) -> bool:
 		var st := get_block(c, q)
 		for tg in cf["targets"]:
 			if _can_place_ore(c, tg, st, q, float(cf["discard"])):
-				set_block(c, q, tg[1], W_FORCE)
+				set_block(c, q, tg[1], tg[2])
 				break
 	return true
 
@@ -1671,7 +1968,7 @@ func _dungeon(c: FCtx, p: Vector3i) -> bool:
 # ------------------------------------------------------------------ orchestration
 
 static func decoration_seed(world_seed: int, x0: int, z0: int) -> int:
-	var r := RandomSources.Xoroshiro.from_seed(world_seed)
+	var r := RandomSources.WorldgenXoro.seeded(world_seed)
 	var l := r.next_long() | 1
 	var m := r.next_long() | 1
 	return (x0 * l + z0 * m) ^ world_seed
@@ -1688,9 +1985,16 @@ func compute(origin: Chunk, region: ChunkRegion) -> PackedInt32Array:
 	if profiling:
 		profile["<load region>"] = int(profile.get("<load region>", 0)) + Time.get_ticks_usec() - tl0
 	c.origin_chunk = origin
+	# Java applyBiomeDecoration: the features of every biome in the 3x3 chunks around the origin (each placement still
+	# checks the biome at its own position)
 	var present := {}
-	for i in origin.biomes.size():
-		present[int(origin.biomes[i])] = true
+	for nc in (region.chunks if region != null and region.chunks.size() == 9 else [origin]):
+		if nc == null:
+			continue
+		var nb: PackedByteArray = (nc as Chunk).biomes
+		for b0 in biome_steps.size():
+			if not present.has(b0) and nb.has(b0):   # (native scans: no per-byte script loop)
+				present[b0] = true
 	var deco := decoration_seed(gen.seed, origin.cx * 16, origin.cz * 16)
 	var o := Vector3i(origin.cx * 16, Coords.MIN_Y, origin.cz * 16)
 	# native feature engine for fully supported placed features (regions with legacy height data stay in GDScript)
@@ -1722,14 +2026,22 @@ func compute(origin: Chunk, region: ChunkRegion) -> PackedInt32Array:
 			if trace_names:
 				printerr("[feat] structures step %d" % s)
 			var tst := Time.get_ticks_usec() if profiling else 0
+			if neighbour_structures:
+				gen.structures.place_neighbour_view(c, origin, s)
+			var nw0 := c.writes.size()
 			gen.structures.place_step(c, origin, s, deco)
+			if struct_record and c.writes.size() > nw0:
+				_srm.lock()
+				for k in range(nw0, c.writes.size(), 5):
+					struct_writes.append_array([c.writes[k], c.writes[k + 1], c.writes[k + 2], c.writes[k + 3], c.writes[k + 4]])
+				_srm.unlock()
 			if profiling:
 				profile["<structures step %d>" % s] = int(profile.get("<structures step %d>" % s, 0)) + Time.get_ticks_usec() - tst
 		for nm in names:
 			var pf: Dictionary = placed.get(nm, {})
 			if pf.is_empty():
 				continue
-			c.r = RandomSources.Xoroshiro.from_seed(deco + int(step_index[s][nm]) + 10000 * s)
+			c.r = RandomSources.WorldgenXoro.seeded(deco + int(step_index[s][nm]) + 10000 * s)
 			c.placed_name = nm
 			if trace_names:
 				printerr("[feat] %s" % nm)
@@ -1889,6 +2201,7 @@ func apply(center: Chunk, nine: Array) -> bool:
 					continue
 				var lk := Vector3i(lx2, wl2[k2 + 1], lz2)
 				liq[lk] = oi2 if not liq.has(lk) or liq[lk] == oi2 else -2
+	var om := ore_table()
 	var oidx := -1
 	for ch in order:
 		oidx += 1
@@ -1911,9 +2224,7 @@ func apply(center: Chunk, nine: Array) -> bool:
 				continue
 			if mode != W_FORCE:
 				var cur := center.get_block(x & 15, y, z & 15)
-				if mode == W_AIR and cur != 0 and (blocks.st_flags[cur] & BlockRegistry.F_REPLACEABLE) == 0:
-					continue
-				if mode == W_REPLACEABLE and cur != 0 and (blocks.st_flags[cur] & (BlockRegistry.F_REPLACEABLE | BlockRegistry.F_LEAVES)) == 0:
+				if not write_ok(mode, cur, blocks.st_flags, om):
 					continue
 			center.set_block(x & 15, y, z & 15, st)
 	if Native.ok and Native.chunkops_ok:
@@ -1925,16 +2236,110 @@ func apply(center: Chunk, nine: Array) -> bool:
 				_temps.append(tv)
 		var kc := PackedInt32Array([BlockRegistry.F_REPLACEABLE, BlockRegistry.F_LEAVES, BlockRegistry.F_FULL_SHAPE, blocks.WATER,
 			blocks.default_state("ice"), blocks.default_state("snow"), blocks.block_id("ice"), blocks.block_id("packed_ice"), gen.sea_level,
-			BlockRegistry.F_LIQUID, blocks.default_state("cave_air")] if not _no_poolfix else [])
+			BlockRegistry.F_LIQUID, blocks.default_state("cave_air")] + _snowy_pairs() if not _no_poolfix else [])
 		var res: Array = Native.inst.chunk_decorate(center.raw_sections(), wls, center.cx * 16, center.cz * 16, blocks.st_flags, blocks.st_opacity, kc,
-			center.biomes, _temps, blocks.st_block)
+			center.biomes, _temps, blocks.st_block, _leaf_info(), om)
 		center.set_sections(res[0])
 		center.heightmap = res[1]
 		_post_process(center, nine)
 		return true
+	_leaf_distances(center, order)
 	_freeze(center)
 	_post_process(center, nine)
 	return false
+
+
+## GDScript twin of the native leaf distance pass (chunkops.cpp, TreeFeature.updateLeaves): breadth-first from logs
+## through leaves, 6 steps, over the chunk and a 6-block margin taken from the origins' write lists.
+func _leaf_distances(center: Chunk, order: Array) -> void:
+	var lf := _leaf_info()
+	var x0 := center.cx * 16
+	var z0 := center.cz * 16
+	var cls := {}   # Vector3i -> 1 log / 2 leaves
+	for ch in order:
+		var w: PackedInt32Array = ch.feature_writes
+		for k in range(0, w.size(), 5):
+			var x := w[k]
+			var z := w[k + 2]
+			if (x >= x0 and x < x0 + 16 and z >= z0 and z < z0 + 16) or x < x0 - 6 or x >= x0 + 22 or z < z0 - 6 or z >= z0 + 22:
+				continue
+			var c := lf[w[k + 3]] if w[k + 3] > 0 and w[k + 3] < lf.size() else 0
+			var q := Vector3i(x, w[k + 1], z)
+			if c == 0:
+				cls.erase(q)
+			else:
+				cls[q] = 1 if c < 0 else 2
+	var any := false
+	for y in range(Coords.MIN_Y, Coords.MAX_Y):
+		for lz in 16:
+			for lx in 16:
+				var st := center.get_block(lx, y, lz)
+				if st <= 0 or st >= lf.size() or lf[st] == 0:
+					continue
+				cls[Vector3i(x0 + lx, y, z0 + lz)] = 1 if lf[st] < 0 else 2
+				if lf[st] > 0:
+					any = true
+	if not any:
+		return
+	var dist := {}
+	var queue: Array = []
+	for q in cls:
+		if cls[q] == 1:
+			dist[q] = 0
+			queue.append(q)
+	var h := 0
+	while h < queue.size():
+		var c: Vector3i = queue[h]
+		h += 1
+		var d: int = int(dist[c]) + 1
+		if d >= 7:
+			continue
+		for o in [Vector3i(-1, 0, 0), Vector3i(1, 0, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(0, -1, 0), Vector3i(0, 1, 0)]:
+			var n: Vector3i = c + o
+			if n.x < x0 - 6 or n.x >= x0 + 22 or n.z < z0 - 6 or n.z >= z0 + 22:
+				continue
+			if int(cls.get(n, 0)) != 2 or int(dist.get(n, 7)) <= d:
+				continue
+			dist[n] = d
+			queue.append(n)
+	for q in dist:
+		var qv: Vector3i = q
+		if qv.x < x0 or qv.x >= x0 + 16 or qv.z < z0 or qv.z >= z0 + 16 or int(dist[q]) == 0:
+			continue
+		var st2 := center.get_block(qv.x & 15, qv.y, qv.z & 15)
+		var c2 := lf[st2]
+		if c2 > 0:
+			center.set_block(qv.x & 15, qv.y, qv.z & 15, st2 + (int(dist[q]) - (c2 & 15)) * (c2 >> 4))
+
+
+## Per state for the native leaf distance pass (TreeFeature.updateLeaves): -1 for #logs, (distance stride << 4 | current
+## distance) for leaves with a distance property, 0 otherwise. Built once.
+static var _linfo := PackedInt32Array()
+static var _linfo_m := Mutex.new()
+
+
+func _leaf_info() -> PackedInt32Array:
+	if _linfo.size() == blocks.total_states:
+		return _linfo
+	_linfo_m.lock()
+	if _linfo.size() != blocks.total_states:
+		var out := PackedInt32Array()
+		out.resize(blocks.total_states)
+		var logs := {}
+		if Res.mode == "vanilla":
+			for n in Tags.resolve("block", "#minecraft:logs"):
+				logs[str(n).trim_prefix("minecraft:")] = true
+		for st in blocks.total_states:
+			var n2 := blocks.name_of(st)
+			if logs.has(n2) or (logs.is_empty() and (n2.ends_with("_log") or n2.ends_with("_wood"))):
+				out[st] = -1
+			elif blocks.has_prop(st, "distance") and n2.ends_with("_leaves"):
+				var cur := int(blocks.get_prop(st, "distance"))
+				var stride := blocks.with_prop(st, "distance", "2") - blocks.with_prop(st, "distance", "1")
+				out[st] = (stride << 4) | cur
+		_linfo = out
+	_linfo_m.unlock()
+	return _linfo
 
 
 ## Java LevelChunk.postProcessGeneration: blocks a structure piece marked (fences, iron bars: StructurePiece
@@ -2005,6 +2410,17 @@ static func _other_liquid(liq: Dictionary, x: int, y: int, z: int, li: int) -> b
 	return false
 
 
+## SnowAndFreezeFeature: blocks with a SNOWY property (grass block, podzol, mycelium) under new snow -> [n, false, true]*.
+func _snowy_pairs() -> Array:
+	var out: Array = [0]
+	for nm in ["grass_block", "podzol", "mycelium"]:
+		var s0 := blocks.default_state(nm)
+		if s0 > 0 and blocks.has_prop(s0, "snowy"):
+			out.append_array([blocks.with_prop(s0, "snowy", "false"), blocks.with_prop(s0, "snowy", "true")])
+			out[0] += 1
+	return out
+
+
 func _freeze(ch: Chunk) -> void:
 	var snow := blocks.default_state("snow")
 	var ice := blocks.default_state("ice")
@@ -2022,6 +2438,8 @@ func _freeze(ch: Chunk) -> void:
 				var tn := blocks.name_of(top)
 				if tn != "ice" and tn != "packed_ice":
 					ch.set_block(lx, y, lz, snow)
+					if blocks.has_prop(top, "snowy"):
+						ch.set_block(lx, y - 1, lz, blocks.with_prop(top, "snowy", "true"))
 
 
 ## Compatibility entry for the old single-pass decorate (used if the chunk manager has no features stage).

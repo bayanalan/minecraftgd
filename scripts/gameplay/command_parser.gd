@@ -146,27 +146,33 @@ func _dispatch(cmd: String, a: PackedStringArray, ctx: Ctx) -> int:
 			if a.is_empty():
 				_say(ctx, "Usage: /gamerule <rule> [value]")
 				return 0
+			# 26.x ids (keep_inventory ...; the old camelCase names are still understood)
+			var gid := GameRules.canonical(a[0])
+			if gid == "":
+				_say(ctx, "Incorrect argument for command")
+				return 0
 			if a.size() == 1:
-				_say(ctx, "Gamerule %s is currently set to: %s" % [a[0], str(world.gamerules.get(a[0], "?"))])
-				return int(world.gamerules.get(a[0], 0)) if str(world.gamerules.get(a[0], "")).is_valid_int() else 1
-			var v = GameRules.validate(a[0], a[1])
+				_say(ctx, "Gamerule %s is currently set to: %s" % [gid, str(world.gamerules.get(gid, "?"))])
+				return int(world.gamerules.get(gid, 0)) if str(world.gamerules.get(gid, "")).is_valid_int() else (1 if world.gamerules.get(gid, false) == true else 0)
+			var v = GameRules.validate(gid, a[1])
 			if v == null:
 				_say(ctx, "Invalid gamerule or value")
 				return 0
-			world.gamerules[a[0]] = v
-			_say(ctx, "Gamerule %s is now set to: %s" % [a[0], str(v)])
+			world.gamerules[gid] = v
+			_say(ctx, "Gamerule %s is now set to: %s" % [gid, str(v)])
 			return 1
 		"time":
 			if a.size() >= 2 and (a[0] == "set" or a[0] == "add"):
 				var tv = {"day": 1000, "noon": 6000, "night": 13000, "midnight": 18000}.get(a[1], _ticks(a[1]))
+				# Java TimeCommand: set / add the level's dayTime (it keeps counting days; set resets the day count)
 				if a[0] == "set":
-					world.day_time = int(tv) % 24000
+					world.day_time = int(tv)
 				else:
-					world.day_time = (world.day_time + int(tv)) % 24000
+					world.day_time = int(world.day_time) + int(tv)
 				_say(ctx, "Set the time to %d" % world.day_time)
 				return world.day_time
 			if a.size() >= 2 and a[0] == "query":
-				var q: int = world.day_time if a[1] == "daytime" else (world.game_time if a[1] == "gametime" else world.game_time / 24000)
+				var q: int = int(world.day_time) % 24000 if a[1] == "daytime" else (world.game_time if a[1] == "gametime" else int(world.day_time) / 24000)
 				_say(ctx, "The time is %d" % q)
 				return q
 			_say(ctx, "Usage: /time <set|add|query> <value>")
@@ -175,9 +181,16 @@ func _dispatch(cmd: String, a: PackedStringArray, ctx: Ctx) -> int:
 			if a.is_empty():
 				_say(ctx, "Usage: /weather <clear|rain|thunder> [duration]")
 				return 0
+			# Java WeatherCommand: without a duration the natural one is drawn (clear 12000-180000, rain 12000-24000,
+			# thunder 3600-15600); rain and thunder timers both get it
+			var wr: RandomNumberGenerator = world.rng
+			var dur := _ticks(a[1]) if a.size() > 1 else (wr.randi_range(12000, 180000) if a[0] == "clear" else (wr.randi_range(12000, 24000) if a[0] == "rain" else wr.randi_range(3600, 15600)))
 			world.raining = a[0] != "clear"
 			world.thundering = a[0] == "thunder"
-			world.weather_timer = _ticks(a[1]) if a.size() > 1 else 6000
+			world.weather_timer = dur
+			if world.get("thunder_timer") != null:
+				world.thunder_timer = dur
+				world._thunder_flag = a[0] == "thunder"
 			_say(ctx, "Changed the weather")
 			return 1
 		"seed":
@@ -324,18 +337,28 @@ func _dispatch(cmd: String, a: PackedStringArray, ctx: Ctx) -> int:
 				var secs := 30 if a.size() <= 3 else (1000000 if a[3] == "infinite" else int(a[3]))
 				var amp := int(a[4]) if a.size() > 4 else 0
 				var n := 0
-				for t in _players(a[1], ctx):
-					t.add_effect(eid, amp, secs * 20)
+				for t in _targets(a[1], ctx):
+					if t is Player:
+						t.add_effect(eid, amp, secs * 20)
+					elif t is EntityManager.Ent and t.kind == "mob":
+						MobBehaviors.add_effect(t, eid, amp, secs * 20)   # (Glowing: GlowOutline draws the outline)
+					else:
+						continue
 					n += 1
 				_say(ctx, "Applied effect %s to %d target(s)" % [eid, n])
 				return n
 			if a.size() >= 1 and a[0] == "clear":
 				var n2 := 0
-				for t in _players(a[1] if a.size() > 1 else "@s", ctx):
+				for t in _targets(a[1] if a.size() > 1 else "@s", ctx):
+					var tfx = t.effects if t is Player else (t.data.get("fx") if t is EntityManager.Ent and t.kind == "mob" else null)
+					if not (tfx is Dictionary):
+						if t is EntityManager.Ent and t.kind == "mob":
+							n2 += 1
+						continue
 					if a.size() > 2:
-						t.effects.erase(a[2].trim_prefix("minecraft:"))
+						(tfx as Dictionary).erase(a[2].trim_prefix("minecraft:"))
 					else:
-						t.effects.clear()
+						(tfx as Dictionary).clear()
 					n2 += 1
 				_say(ctx, "Removed effects from %d target(s)" % n2)
 				return n2
@@ -1044,7 +1067,9 @@ func _clone(a: PackedStringArray, ctx: Ctx) -> int:
 
 func _locate(a: PackedStringArray, ctx: Ctx) -> int:
 	if a.size() >= 2 and a[0] == "biome":
-		_say(ctx, _locate_biome(a[1].trim_prefix("minecraft:"), ctx))
+		var lb := _locate_biome(a[1].trim_prefix("minecraft:"), ctx)
+		if lb != "":
+			_say(ctx, lb)
 		return 1
 	if a.size() >= 2 and a[0] == "structure":
 		var sname := a[1].trim_prefix("minecraft:")
@@ -1059,38 +1084,60 @@ func _locate(a: PackedStringArray, ctx: Ctx) -> int:
 		WorkerThreadPool.add_task(func():
 			var res: Dictionary = sts.locate(sname, int(floor(pp.x)) >> 4, int(floor(pp.z)) >> 4)
 			if res.is_empty():
-				hud.call_deferred("chat_message", "Could not find a structure of type " + sname + " nearby")
+				hud.call_deferred("chat_message", "Could not find a structure of type \"minecraft:%s\" nearby" % sname)
 				return
 			var ch: Vector2i = res["chunk"]
 			var bx := ch.x * 16 + 8
 			var bz := ch.y * 16 + 8
-			var dist := int(Vector2(bx - pp.x, bz - pp.z).length())
-			hud.call_deferred("chat_message", "The nearest %s is at [%d, ~, %d] (%d blocks away)" % [sname, bx, bz, dist], "/tp @s %d ~ %d" % [bx, bz]))
+			var dist := floori(Vector2(bx - floor(pp.x), bz - floor(pp.z)).length())
+			hud.call_deferred("chat_message", "The nearest minecraft:%s is at [%d, ~, %d] (%d blocks away)" % [sname, bx, bz, dist], "/tp @s %d ~ %d" % [bx, bz]))
 		return 1
 	_say(ctx, "Usage: /locate biome <biome> | /locate structure <structure> (poi not supported)")
 	return 0
 
 
 func _locate_biome(name: String, ctx: Ctx) -> String:
-	var bid: int = world.biomes.index.get(name, -1)
-	if bid < 0:
-		return "There is no biome with type \"%s\"" % name
+	# a biome id or a biome tag (#minecraft:is_forest), like Java's ResourceOrTagArgument
+	var ids: Array = []
+	var printable := "minecraft:" + name
+	if name.begins_with("#"):
+		printable = "#minecraft:" + name.substr(1).trim_prefix("minecraft:")
+		for bn in Tags.resolve("worldgen/biome", printable):
+			var tid: int = world.biomes.index.get(str(bn).trim_prefix("minecraft:"), -1)
+			if tid >= 0:
+				ids.append(tid)
+		if ids.is_empty():
+			return "There is no biome tag with type \"%s\"" % printable
+	else:
+		var bid: int = world.biomes.index.get(name, -1)
+		if bid < 0:
+			return "There is no biome with type \"%s\"" % printable
+		ids = [bid]
 	if world.gen is VanillaGenerator:
-		# biome-source search (Java findClosestBiome3d) runs on a worker; the answer is posted to chat
+		# Java findClosestBiome3d (radius 6400, steps 32 / 64) on a worker, native biome source; the answer is posted to
+		# chat as Java's green clickable [x, y, z] with the 3D distance
 		var vg: VanillaGenerator = world.gen
 		var hud = world.hud
+		var bnames: Array = world.biomes.names
 		var px := int(floor(ctx.pos.x))
 		var py := int(floor(ctx.pos.y))
 		var pz := int(floor(ctx.pos.z))
 		WorkerThreadPool.add_task(func():
-			var at: Vector3i = vg.find_biome(bid, px, py, pz)
-			var msg := "Could not find a biome of type \"%s\" within 2048 blocks" % name
+			var t0 := Time.get_ticks_msec()
+			var at: Vector3i = vg.find_biome(ids, px, py, pz)
+			var msg := "Could not find a biome of type \"%s\" within reasonable distance" % printable
 			var tp_cmd := ""
 			if at.y != -999999:
-				msg = "The nearest %s is at [%d, %d, %d] (%d blocks away)" % [name, at.x, at.y, at.z, int(Vector2(at.x - px, at.z - pz).length())]
+				var shown := printable
+				if printable.begins_with("#"):
+					var hit: int = vg.last_found_biome
+					if hit >= 0 and hit < bnames.size():
+						shown = "%s (minecraft:%s)" % [printable, bnames[hit]]
+				msg = "The nearest %s is at [%d, %d, %d] (%d blocks away)" % [shown, at.x, at.y, at.z, floori(sqrt(float((at.x - px) * (at.x - px) + (at.y - py) * (at.y - py) + (at.z - pz) * (at.z - pz))))]
 				tp_cmd = "/tp @s %d %d %d" % [at.x, at.y, at.z]
+			print("Locating element %s took %d ms" % [printable, Time.get_ticks_msec() - t0])   # Java LocateCommand log line
 			hud.call_deferred("chat_message", msg, tp_cmd))
-		return "Locating %s..." % name
+		return ""
 	for r in range(0, 32):
 		for dz in range(-r, r + 1):
 			for dx in range(-r, r + 1):
@@ -1100,7 +1147,7 @@ func _locate_biome(name: String, ctx: Ctx) -> String:
 				if c == null:
 					continue
 				for i in 16:
-					if c.biomes[i + 16 * 30] == bid:
+					if ids.has(int(c.biomes[i + 16 * 30])):
 						return "The nearest %s is at [%d, ~, %d]" % [name, c.cx * 16 + 8, c.cz * 16 + 8]
 	return "Could not find a biome of type \"%s\" within loaded chunks" % name
 
@@ -1636,6 +1683,26 @@ func _apply_nbt(e, raw: String) -> void:
 		e.data["tags"] = tags
 	if s.contains("Age:-"):
 		e.baby_age = -24000
+	# VillagerData:{profession:"minecraft:cartographer",level:3}: the profession with the trade sets up to that level
+	var vd := s.find("VillagerData:")
+	if vd >= 0 and e.id == "villager":
+		var pi := s.find("profession:", vd)
+		if pi >= 0:
+			var pv := s.substr(pi + 11).strip_edges().trim_prefix("\"")
+			var pend := 0
+			while pend < pv.length() and (pv[pend] == ":" or pv[pend] == "_" or (pv[pend] >= "a" and pv[pend] <= "z")):
+				pend += 1
+			var prof := pv.substr(0, pend).trim_prefix("minecraft:")
+			if prof in Trading.PROFESSIONS or prof == "none":
+				var vr := RandomNumberGenerator.new()
+				vr.randomize()
+				Trading.set_profession(e, prof, vr)
+				var li := s.find("level:", vd)
+				var lv := clampi(int(s.substr(li + 6, 2).to_int()), 1, 5) if li >= 0 else 1
+				for l2 in range(2, lv + 1):
+					e.data["level"] = l2
+					Trading._add_set(e, "%s/level_%d" % [prof, l2], vr)
+				MobBehaviors.villager_layers(e)
 
 
 # ------------------------------------------------------------------ data-pack functions
@@ -1827,16 +1894,12 @@ func _place(a: Array, ctx: Ctx) -> int:
 ## to the world.
 func _apply_place_writes(c: Features.FCtx) -> void:
 	var w: PackedInt32Array = c.writes
+	var om := Features.ore_table()
 	for k in range(0, w.size(), 5):
 		var st := w[k + 3]
 		var mode := w[k + 4]
-		if mode != Features.W_FORCE:
-			var cur: int = world.state_at(w[k], w[k + 1], w[k + 2])
-			var fl: int = Res.blocks.st_flags[cur] if cur > 0 else 0
-			if mode == Features.W_AIR and cur != 0 and (fl & BlockRegistry.F_REPLACEABLE) == 0:
-				continue
-			if mode == Features.W_REPLACEABLE and cur != 0 and (fl & (BlockRegistry.F_REPLACEABLE | BlockRegistry.F_LEAVES)) == 0:
-				continue
+		if mode != Features.W_FORCE and not Features.write_ok(mode, world.state_at(w[k], w[k + 1], w[k + 2]), Res.blocks.st_flags, om):
+			continue
 		world.set_block(w[k], w[k + 1], w[k + 2], st, false)
 	for bpos in c.block_entities:
 		BlockEntities.set_data(world, bpos, (c.block_entities[bpos] as Dictionary).duplicate(true))

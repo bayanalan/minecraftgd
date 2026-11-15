@@ -295,6 +295,7 @@ func overlay_tip(tip: Array, mp: Vector2) -> void:
 func _draw_overlay() -> void:
 	var s := UiKit.scale()
 	_over.draw_set_transform(Vector2.ZERO, 0.0, Vector2(s, s))
+	Glint.begin(_over, s)
 	_ci = _over
 	if _over_cursor != null and not _over_cursor.is_empty():
 		_draw_stack(_over_cursor, _over_mp - Vector2(8, 8), UiKit.font())
@@ -308,6 +309,7 @@ func _draw() -> void:
 	_ensure_overlay()
 	_over_cursor = null
 	_over_tip = []
+	Glint.begin(self, s)
 	draw_dim()
 	draw_set_transform(Vector2.ZERO, 0.0, Vector2(s, s))
 	var o := origin()
@@ -530,11 +532,17 @@ func _draw_stack(st: ItemStack, p: Vector2, font: Font) -> void:
 	var ic := ItemIcons.icon_for(st)
 	if ic != null:
 		_ci.draw_texture_rect(ic, Rect2(p, Vector2(16, 16)), false)
+		if Glint.has_glint(st):
+			Glint.add(_ci, ic, Rect2(p, Vector2(16, 16)), st, UiKit.scale())
+	if world != null and world.player != null and world.player.on_cooldown(st.name()):
+		var cf: float = world.player.cooldown_percent(st.name(), clampf(float(world.tick_accum) / 0.05, 0.0, 1.0))
+		var top := p.y + floorf(16.0 * (1.0 - cf))
+		_ci.draw_rect(Rect2(p.x, top, 16, ceilf(16.0 * cf)), Color(1, 1, 1, 127.0 / 255.0))
 	if st.count > 1:
 		var t := str(st.count)
 		var w := font.get_string_size(t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
-		_ci.draw_string(font, p + Vector2(18 - w, 18), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color(0.25, 0.25, 0.25))
-		_ci.draw_string(font, p + Vector2(17 - w, 17), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color.WHITE)
+		_ci.draw_string(font, p + Vector2(18 - w, 17), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color(0.25, 0.25, 0.25))
+		_ci.draw_string(font, p + Vector2(17 - w, 16), t, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color.WHITE)
 	if Bundles.is_bundle(st) and not Bundles.contents(st).is_empty():
 		# Java BundleItem bar: 1 + 12 * fullness px, blue (red when full)
 		var bw := Bundles.weight(st)
@@ -590,7 +598,8 @@ func _gui_input(event: InputEvent) -> void:
 		elif cur0.is_empty():
 			if shift and btn == MOUSE_BUTTON_LEFT:
 				quick_move(hover)
-			elif not _dbl:
+			else:
+				# (Java clicks on every press, double clicks too; the release then collects - fast clicks were dropped)
 				click(hover, btn == MOUSE_BUTTON_RIGHT)
 			_skip_release = true
 		elif shift and btn == MOUSE_BUTTON_LEFT:
@@ -660,7 +669,8 @@ func _drag_each() -> int:
 ## drag that stayed on one slot is a normal click there.
 func _release(btn: int) -> void:
 	var cur: ItemStack = world.player.inventory.cursor
-	if _dbl and btn == MOUSE_BUTTON_LEFT and hover >= 0:
+	# Java canTakeItemForPickAll: never from a result slot (fast clicks on a crafting output each craft once more)
+	if _dbl and btn == MOUSE_BUTTON_LEFT and hover >= 0 and not bool(slots[hover].get("output", false)):
 		_collect(hover)
 		_dbl = false
 		_last_click = 0

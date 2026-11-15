@@ -7,7 +7,7 @@ extends Node
 signal changed(key: String)
 
 const PATH := "user://settings.cfg"
-const SCHEMA := 2
+const SCHEMA := 3
 
 # key: [default, min/choices, max]
 const SPEC := {
@@ -19,7 +19,7 @@ const SPEC := {
 	"terrain_renderer": ["rd", ["rd", "godot"]],   # takes effect when a world is loaded
 	"background_fps": [30, [15, 30, 60]],
 	"render_distance": [12, 2, 32],
-	"simulation_distance": [6, 2, 16],
+	"simulation_distance": [6, 5, 32],   # wiki: Options (minimum 5, values as Render Distance)
 	"lod_distance": [0, 0, 64],
 	"fov": [70.0, 30.0, 110.0],
 	"graphics": ["fancy", ["fast", "fancy", "fabulous"]],
@@ -58,7 +58,7 @@ const SPEC := {
 	# Advanced video (Recraft optimizations, each can be switched off)
 	"adv_threads": [0, 0, 16],          # chunk builder threads, 0 = auto
 	"adv_pin_main": [true],             # main thread on the fastest core cluster
-	"adv_leaf_cull": [true],            # skip leaf faces buried two leaves deep
+	"adv_leaf_cull": [false],           # skip leaf faces buried two leaves deep (off: vanilla, every leaf face)
 	"adv_merge_faces": [true],          # greedy merging of identical faces (off = one quad per face, like Java)
 	"adv_occlusion": [true],            # skip sections hidden behind terrain (visibility graph)
 	"adv_dir_cull": [true],             # skip face directions turned away from the camera
@@ -85,6 +85,10 @@ const SPEC := {
 	"high_contrast": [false],
 	"text_shadow": [true],
 	"damage_tilt": [1.0, 0.0, 1.0],
+	"fov_effects": [1.0, 0.0, 1.0],         # wiki: Options (FOV Effects 100 %)
+	"darkness_pulsing": [1.0, 0.0, 1.0],    # wiki: Options (Darkness Pulsing 100 %)
+	"glint_speed": [0.5, 0.0, 1.0],         # wiki: Options (Glint Speed 50 %)
+	"glint_strength": [0.75, 0.0, 1.0],     # wiki: Options (Glint Strength 75 %)
 	"hide_lightning": [false],
 	"main_hand": ["right", ["right", "left"]],
 	"skin_path": [""],
@@ -145,13 +149,15 @@ func _apply_rate() -> void:
 	if in_menu:
 		lim = 60 if lim == 0 else mini(lim, 60)
 	Engine.max_fps = lim
-	if in_menu:
-		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_ENABLED)
-	else:
-		match str(values["vsync"]):
-			"off": DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
-			"on": DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_ENABLED)
-			"adaptive": DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_ADAPTIVE)
+	# Java caps menus by frame rate only (Minecraft.getFramerateLimit), never by V-Sync. A present-mode change rebuilds
+	# the window's swap chain: it ran on every focus change / menu (V-Sync forced on in menus), and a rebuild while
+	# alt-tab activates the window sometimes kept the game from coming back. Set only when it differs.
+	var want := DisplayServer.VSYNC_ENABLED
+	match str(values["vsync"]):
+		"off": want = DisplayServer.VSYNC_DISABLED
+		"adaptive": want = DisplayServer.VSYNC_ADAPTIVE
+	if DisplayServer.get_name() != "headless" and DisplayServer.window_get_vsync_mode() != want:
+		DisplayServer.window_set_vsync_mode(want)
 
 
 func default_of(key: String):
@@ -190,6 +196,8 @@ func load_settings() -> void:
 			values[k] = validate(k, cf.get_value("options", k))
 	if schema < 2 and values["max_fps"] == 260:
 		values["max_fps"] = 0
+	if schema < 3:
+		values["adv_leaf_cull"] = false   # leaf culling became opt-in (vanilla: every face between leaves is drawn)
 
 
 func save() -> void:
@@ -202,6 +210,14 @@ func save() -> void:
 
 func get_v(key: String):
 	return values.get(key, default_of(key) if SPEC.has(key) else null)
+
+
+## Java KeyboardHandler: the fullscreen key (F11) toggles fullscreen on every screen (title, menus, in game).
+func _input(event: InputEvent) -> void:
+	if event is InputEventKey and event.pressed and not event.echo and InputMap.has_action("fullscreen") and event.is_action_pressed("fullscreen"):
+		set_v("display_mode", "windowed" if str(values["display_mode"]) != "windowed" else "borderless")
+		save()
+		get_viewport().set_input_as_handled()
 
 
 func set_v(key: String, v, apply := true) -> void:

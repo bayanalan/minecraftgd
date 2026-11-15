@@ -19,6 +19,8 @@ class Section:
 	var light_u := 0
 	var rt := -1                      # cached "palette has a random-tickable state" (-1 unknown)
 	var rt_n := 0                     # palette size when rt was computed
+	var rs := -1                      # cached Interest bits of the palette (-1 unknown; see Interest.section_mask)
+	var rs_n := 0                     # palette size when rs was computed
 	var shared := false               # arrays are referenced by a snapshot: copy before the next in-place write
 
 	## Copy-on-write: packed arrays are shared by reference in Godot 4, so a section handed to a worker snapshot gets
@@ -76,6 +78,7 @@ class Section:
 
 	func fill_raw(raw: PackedInt32Array, off: int) -> void:
 		rt = -1
+		rs = -1
 		shared = false   # fresh arrays below
 		var first := raw[off]
 		var uniform := true
@@ -168,9 +171,15 @@ var light_partial := false            # lit while some 3x3 neighbour was not yet
 var light_halo_secs: Array = []       # 24 x (PackedByteArray 18x18x16 | int uniform), from Lighting.compute
 var light_epoch := 0
 var mesh_epoch := 0
+## Collision version for caches keyed by region (Collision): a fresh value from one global sequence whenever this
+## chunk's collision may have changed (set_block, generated / decorated sections installed), so a reloaded chunk never
+## repeats an old value.
+static var _bseq := 0
+var bepoch := 0
 var mesh_undecor := 0                 # 3x3 neighbours (bit (dz+1)*3+(dx+1)) still undecorated when a mesh group was last built
 var modified := false                 # contains player edits -> must be saved
 var from_disk := false                # loaded from a save (decorated data, no pristine heightmaps)
+var gen_ticked := false               # worldgen fluid ticks queued (BlockUpdates.gen_fluid_ticks)
 var raw: Chunk = null                 # from_disk only: the pristine generated terrain, regenerated on demand so this chunk's
                                       # features (and its neighbours' features) are computed exactly as on first generation
 var dirty_groups := 0                 # bitmask of mesh groups needing rebuild (pipeline progress: first build, relight)
@@ -221,6 +230,12 @@ func set_block(lx: int, y: int, lz: int, st: int) -> int:
 	var sec: Section = sections[(y - Coords.MIN_Y) >> 4]
 	var old := sec.set_at(((y & 15) << 8) | (lz << 4) | lx, st)
 	if old != st:
+		# only changes that can alter collision boxes (flowing water / air churn left every cache valid)
+		var fl: PackedInt32Array = Res.blocks.st_flags
+		var nfl := fl.size()
+		if (old > 0 and (old >= nfl or (fl[old] & BlockRegistry.F_COLLIDE) != 0)) or (st > 0 and (st >= nfl or (fl[st] & BlockRegistry.F_COLLIDE) != 0)):
+			_bseq += 1
+			bepoch = _bseq
 		_snap = []
 		refs_gen += 1   # an in-place write may have copied a packed array another holder shared: sec_refs must rebuild
 	if sec.rt < 0:
@@ -354,6 +369,7 @@ func decor_shell() -> Chunk:
 		dst.idx = src.idx
 		dst.wide = src.wide
 		dst.rt = src.rt
+		dst.rs = -1
 	c.biomes = biomes
 	c.heightmap = heightmap.duplicate()
 	c.gen_surface = gen_surface
@@ -366,6 +382,8 @@ func decor_shell() -> Chunk:
 
 ## Main thread, decoration commit: take over the decorated sections / heightmap / block entities of the job's shell.
 func adopt_decoration(shell: Chunk) -> void:
+	_bseq += 1
+	bepoch = _bseq
 	for s in Coords.SECTIONS:
 		var src: Section = shell.sections[s]
 		var dst: Section = sections[s]
@@ -373,6 +391,7 @@ func adopt_decoration(shell: Chunk) -> void:
 		dst.idx = src.idx
 		dst.wide = src.wide
 		dst.rt = -1
+		dst.rs = -1
 		dst.shared = true   # the shell (and native results) may still reference the arrays
 	heightmap = shell.heightmap
 	block_entities = shell.block_entities
@@ -385,6 +404,8 @@ func adopt_decoration(shell: Chunk) -> void:
 
 ## Install packed sections from native code (RecraftNative.chunk_finish / chunk_decorate): [pal, idx, wide] x 24.
 func set_sections(arr: Array) -> void:
+	_bseq += 1
+	bepoch = _bseq
 	_snap = []
 	for s in Coords.SECTIONS:
 		var sec: Section = sections[s]
@@ -393,6 +414,7 @@ func set_sections(arr: Array) -> void:
 		sec.idx = e[1]
 		sec.wide = e[2]
 		sec.rt = -1
+		sec.rs = -1
 		sec.shared = true   # the arrays may also be referenced by the native caller's result: copy before editing
 	if rt_listed and not rt_dirty:
 		BlockUpdates.rt_chunk_dirty(self)

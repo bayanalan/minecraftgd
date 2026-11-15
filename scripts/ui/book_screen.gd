@@ -205,12 +205,16 @@ func _turn(d: int) -> void:
 	if _editable() and page + d >= pages.size() and pages.size() < 100:
 		pages.append("")
 		_set_pages(pages)
+	var before := page
 	page = clampi(page + d, 0, _pages().size() - 1)
 	if lectern.y != -9999:
 		var ld := BlockEntities.get_data(world, lectern)
 		ld["page"] = page
 		BlockEntities.set_data(world, lectern, ld)
-	Audio.play("item.book.page_turn", world.player.pos, "Players")
+		if page != before:
+			Redstone.lectern_pulse(world, lectern)   # wiki Lectern: 2-tick pulse + page sound at the lectern
+	else:
+		Audio.play("item.book.page_turn", world.player.pos, "Players")
 	_build()
 
 

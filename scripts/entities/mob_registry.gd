@@ -31,13 +31,15 @@ const DEFS := {
 		"parts": [["head", [0, 6, -8], [-3, -4, -6], [6, 6, 8], [0, 0], 0], ["body", [0, 5, 2], [-4, -10, -7], [8, 16, 6], [28, 8], 90],
 			["leg0", [-3, 12, 7], [-2, 0, -2], [4, 12, 4], [0, 16], 0], ["leg1", [3, 12, 7], [-2, 0, -2], [4, 12, 4], [0, 16], 0],
 			["leg2", [-3, 12, -5], [-2, 0, -2], [4, 12, 4], [0, 16], 0], ["leg3", [3, 12, -5], [-2, 0, -2], [4, 12, 4], [0, 16], 0]]},
-	"chicken": {"hp": 4, "speed": 0.25, "w": 0.4, "h": 0.7, "kind": "passive", "tex": "entity/chicken/chicken_temperate", "tex_size": [64, 32], "food": ["wheat_seeds", "melon_seeds", "pumpkin_seeds", "beetroot_seeds", "torchflower_seeds", "pitcher_pod"], "xp": [1, 3],
+	"chicken": {"hp": 4, "speed": 0.25, "w": 0.4, "h": 0.7, "baby_w": 0.3, "baby_h": 0.4, "kind": "passive", "tex": "entity/chicken/chicken_temperate", "tex_size": [64, 32], "food": ["wheat_seeds", "melon_seeds", "pumpkin_seeds", "beetroot_seeds", "torchflower_seeds", "pitcher_pod"], "xp": [1, 3],
 		"parts": [["head", [0, 15, -4], [-2, -6, -2], [4, 6, 3], [0, 0], 0], ["bill", [0, 15, -4], [-2, -4, -4], [4, 2, 2], [14, 0], 0], ["chin", [0, 15, -4], [-1, -2, -3], [2, 2, 2], [14, 4], 0],
 			["body", [0, 16, 0], [-3, -4, -3], [6, 8, 6], [0, 9], 90], ["leg0", [-2, 19, 1], [-1, 0, -3], [3, 5, 3], [26, 0], 0], ["leg1", [1, 19, 1], [-1, 0, -3], [3, 5, 3], [26, 0], 0],
 			["wing0", [-4, 13, 0], [0, 0, -3], [1, 4, 6], [24, 13], 0], ["wing1", [4, 13, 0], [-1, 0, -3], [1, 4, 6], [24, 13], 0]]},
-	"zombie": {"hp": 20, "speed": 0.23, "w": 0.6, "h": 1.95, "kind": "hostile", "tex": "entity/zombie/zombie", "tex_size": [64, 64], "attack": 3.0, "burns": true, "xp": [5, 5], "rig": "humanoid"},
-	"husk": {"hp": 20, "speed": 0.23, "w": 0.6, "h": 1.95, "kind": "hostile", "tex": "entity/zombie/husk", "tex_size": [64, 64], "attack": 3.0, "xp": [5, 5], "rig": "humanoid"},
-	"drowned": {"hp": 20, "speed": 0.23, "w": 0.6, "h": 1.95, "kind": "hostile", "tex": "entity/zombie/drowned", "tex_size": [64, 64], "attack": 3.0, "burns": true, "xp": [5, 5], "rig": "humanoid"},
+	# wiki (Attribute / Hitbox / Zombie): zombie types armor 2, follow range 35, baby hitbox 0.49 x 0.98, baby zombie
+	# speed 0.345; drowned step height 1
+	"zombie": {"hp": 20, "speed": 0.23, "baby_speed": 0.345, "w": 0.6, "h": 1.95, "baby_w": 0.49, "baby_h": 0.98, "kind": "hostile", "tex": "entity/zombie/zombie", "tex_size": [64, 64], "attack": 3.0, "armor_points": 2, "follow_range": 35.0, "burns": true, "xp": [5, 5], "rig": "humanoid"},
+	"husk": {"hp": 20, "speed": 0.23, "baby_speed": 0.345, "w": 0.6, "h": 1.95, "baby_w": 0.49, "baby_h": 0.98, "kind": "hostile", "tex": "entity/zombie/husk", "tex_size": [64, 64], "attack": 3.0, "armor_points": 2, "follow_range": 35.0, "xp": [5, 5], "rig": "humanoid"},
+	"drowned": {"hp": 20, "speed": 0.23, "baby_speed": 0.345, "w": 0.6, "h": 1.95, "baby_w": 0.49, "baby_h": 0.98, "kind": "hostile", "tex": "entity/zombie/drowned", "tex_size": [64, 64], "attack": 3.0, "armor_points": 2, "follow_range": 35.0, "step_height": 1.0, "burns": true, "xp": [5, 5], "rig": "humanoid"},
 	"skeleton": {"hp": 20, "speed": 0.25, "w": 0.6, "h": 1.99, "kind": "hostile", "tex": "entity/skeleton/skeleton", "tex_size": [64, 32], "attack": 2.0, "ranged": true, "burns": true, "xp": [5, 5], "rig": "skeleton"},
 	"stray": {"hp": 20, "speed": 0.25, "w": 0.6, "h": 1.99, "kind": "hostile", "tex": "entity/skeleton/stray", "tex_size": [64, 32], "attack": 2.0, "ranged": true, "burns": true, "xp": [5, 5], "rig": "skeleton"},
 	"creeper": {"hp": 20, "speed": 0.25, "w": 0.6, "h": 1.7, "kind": "hostile", "tex": "entity/creeper/creeper", "tex_size": [64, 32], "explodes": true, "xp": [5, 5],
@@ -68,21 +70,30 @@ const QUADRUPED := [["head", [0, 12, -6], [-4, -4, -8], [8, 8, 8], [0, 0], 0], [
 ## Extra part fields: [6] = rot_z degrees. Flags: fire_immune, flies, hover_y, fireball (small|large), neutral,
 ## group_anger, teleports, splits, size (slime scale), lava_walker, water_hurts, spawn (on_ground|in_lava|in_water|air).
 const DEFS2 := {
-	"zombified_piglin": {"hp": 20, "speed": 0.23, "w": 0.6, "h": 1.95, "kind": "hostile", "neutral": true, "group_anger": true, "tex": "entity/piglin/zombified_piglin", "tex_size": [64, 64], "attack": 5.0, "fire_immune": true, "xp": [5, 5], "rig": "piglin"},
-	"piglin": {"hp": 16, "speed": 0.35, "w": 0.6, "h": 1.95, "kind": "hostile", "gold_peace": true, "tex": "entity/piglin/piglin", "tex_size": [64, 64], "attack": 5.0, "xp": [5, 5], "rig": "piglin"},
-	"piglin_brute": {"hp": 50, "speed": 0.35, "w": 0.6, "h": 1.95, "kind": "hostile", "tex": "entity/piglin/piglin_brute", "tex_size": [64, 64], "attack": 7.0, "xp": [20, 20], "rig": "piglin"},
-	"ghast": {"hp": 10, "speed": 0.03, "w": 4.0, "h": 4.0, "kind": "hostile", "flies": true, "fireball": "large", "fire_immune": true, "tex": "entity/ghast/ghast", "tex_size": [64, 32], "scale": 4.5, "xp": [5, 5], "spawn": "on_ground", "spawn_chance": 0.05, "rig": "ghast"},
-	"blaze": {"hp": 20, "speed": 0.23, "w": 0.6, "h": 1.8, "kind": "hostile", "flies": true, "hover_y": 2.5, "fireball": "small", "fire_immune": true, "water_hurts": true, "tex": "entity/blaze/blaze", "tex_size": [64, 32], "attack": 6.0, "xp": [10, 10], "rig": "blaze"},
-	"magma_cube": {"hp": 16, "speed": 0.2, "w": 2.08, "h": 2.08, "kind": "hostile", "hops": true, "splits": true, "size": 4, "fire_immune": true, "tex": "entity/slime/magmacube", "tex_size": [64, 32], "attack": 6.0, "xp": [4, 4], "rig": "magma_cube"},
-	"slime": {"hp": 16, "speed": 0.2, "w": 2.08, "h": 2.08, "kind": "hostile", "hops": true, "splits": true, "size": 4, "tex": "entity/slime/slime", "tex_size": [64, 32], "attack": 4.0, "xp": [4, 4], "rig": "slime"},
+	# wiki (Zombified Piglin / Piglin Brute): fixed-weapon attack = Normal damage with the weapon (golden sword 8,
+	# golden axe 13); zombified piglin armor 2, follow range 35; piglin brute follow range 12; babies 0.49 x 0.98
+	"zombified_piglin": {"hp": 20, "speed": 0.23, "baby_speed": 0.345, "w": 0.6, "h": 1.95, "baby_w": 0.49, "baby_h": 0.98, "kind": "hostile", "neutral": true, "group_anger": true, "tex": "entity/piglin/zombified_piglin", "tex_size": [64, 64], "attack": 8.0, "armor_points": 2, "follow_range": 35.0, "fire_immune": true, "xp": [5, 5], "rig": "piglin"},
+	"piglin": {"hp": 16, "speed": 0.35, "w": 0.6, "h": 1.95, "baby_w": 0.49, "baby_h": 0.98, "kind": "hostile", "gold_peace": true, "tex": "entity/piglin/piglin", "tex_size": [64, 64], "attack": 5.0, "xp": [5, 5], "rig": "piglin"},
+	"piglin_brute": {"hp": 50, "speed": 0.35, "w": 0.6, "h": 1.95, "kind": "hostile", "tex": "entity/piglin/piglin_brute", "tex_size": [64, 64], "attack": 13.0, "follow_range": 12.0, "xp": [20, 20], "rig": "piglin"},
+	# wiki (Attribute): ghast movement speed 0.7 (unused: _ghast flies with its own constants), flying speed 0.06,
+	# follow range 100; blaze follow range 48
+	"ghast": {"hp": 10, "speed": 0.7, "fly_speed": 0.06, "follow_range": 100.0, "w": 4.0, "h": 4.0, "kind": "hostile", "flies": true, "fireball": "large", "fire_immune": true, "tex": "entity/ghast/ghast", "tex_size": [64, 32], "scale": 4.5, "xp": [5, 5], "spawn": "on_ground", "spawn_chance": 0.05, "rig": "ghast"},
+	"blaze": {"hp": 20, "speed": 0.23, "follow_range": 48.0, "w": 0.6, "h": 1.8, "kind": "hostile", "flies": true, "hover_y": 2.5, "fireball": "small", "fire_immune": true, "water_hurts": true, "tex": "entity/blaze/blaze", "tex_size": [64, 32], "attack": 6.0, "xp": [10, 10], "rig": "blaze"},
+	# wiki (Hitbox / Magma Cube): big cube 2.0808 wide x 2.08 tall (0.5202 / 0.52 per size); magma cube armor 3 per size
+	"magma_cube": {"hp": 16, "speed": 0.2, "w": 2.0808, "h": 2.08, "kind": "hostile", "hops": true, "splits": true, "size": 4, "armor_points": 12, "fire_immune": true, "tex": "entity/slime/magmacube", "tex_size": [64, 32], "attack": 6.0, "xp": [4, 4], "rig": "magma_cube"},
+	"slime": {"hp": 16, "speed": 0.2, "w": 2.0808, "h": 2.08, "kind": "hostile", "hops": true, "splits": true, "size": 4, "tex": "entity/slime/slime", "tex_size": [64, 32], "attack": 4.0, "xp": [4, 4], "rig": "slime"},
 	"wither_skeleton": {"hp": 20, "speed": 0.25, "w": 0.7, "h": 2.4, "kind": "hostile", "fire_immune": true, "wither_hit": true, "tex": "entity/skeleton/wither_skeleton", "tex_size": [64, 32], "attack": 8.0, "scale": 1.2, "xp": [5, 5], "rig": "skeleton"},
-	"hoglin": {"hp": 40, "speed": 0.3, "w": 1.4, "h": 1.4, "kind": "hostile", "tex": "entity/hoglin/hoglin", "tex_size": [128, 64], "attack": 6.0, "food": ["crimson_fungus"], "xp": [5, 5], "rig": "hoglin"},
-	"zoglin": {"hp": 40, "speed": 0.25, "w": 1.4, "h": 1.4, "kind": "hostile", "tex": "entity/hoglin/zoglin", "tex_size": [128, 64], "attack": 6.0, "xp": [5, 5], "rig": "hoglin"},
-	"strider": {"hp": 20, "speed": 0.175, "w": 0.9, "h": 1.7, "kind": "passive", "lava_walker": true, "fire_immune": true, "water_hurts": true, "food": ["warped_fungus"], "tex": "entity/strider/strider", "tex_size": [64, 128], "xp": [1, 3], "spawn": "in_lava", "rig": "strider"},
-	"enderman": {"hp": 40, "speed": 0.3, "w": 0.6, "h": 2.9, "kind": "hostile", "neutral": true, "teleports": true, "water_hurts": true, "tex": "entity/enderman/enderman", "tex_size": [64, 32], "attack": 7.0, "xp": [5, 5], "rig": "enderman"},
+	# wiki (Attribute / Hitbox / Zoglin): knockback resistance 0.6, attack knockback 1, baby hoglin 0.75 x 0.85, zoglins
+	# immune to fire
+	"hoglin": {"hp": 40, "speed": 0.3, "w": 1.3965, "h": 1.4, "baby_w": 0.75, "baby_h": 0.85, "kind": "hostile", "tex": "entity/hoglin/hoglin", "tex_size": [128, 64], "attack": 6.0, "attack_knockback": 1.0, "knockback_resistance": 0.6, "food": ["crimson_fungus"], "xp": [5, 5], "rig": "hoglin"},
+	"zoglin": {"hp": 40, "speed": 0.3, "w": 1.3965, "h": 1.4, "kind": "hostile", "fire_immune": true, "tex": "entity/hoglin/zoglin", "tex_size": [128, 64], "attack": 6.0, "attack_knockback": 1.0, "knockback_resistance": 0.6, "xp": [5, 5], "rig": "hoglin"},
+	"strider": {"hp": 20, "speed": 0.175, "w": 0.9, "h": 1.7, "kind": "passive", "lava_walker": true, "fire_immune": true, "water_hurts": true, "food": ["warped_fungus"], "tempt": ["warped_fungus_on_a_stick"], "tex": "entity/strider/strider", "tex_size": [64, 128], "xp": [1, 3], "spawn": "in_lava", "rig": "strider"},
+	"enderman": {"hp": 40, "speed": 0.3, "follow_range": 64.0, "step_height": 1.0, "w": 0.6, "h": 2.9, "kind": "hostile", "neutral": true, "teleports": true, "water_hurts": true, "tex": "entity/enderman/enderman", "tex_size": [64, 32], "attack": 7.0, "xp": [5, 5], "rig": "enderman"},
 	"endermite": {"hp": 8, "speed": 0.25, "w": 0.4, "h": 0.3, "kind": "hostile", "tex": "entity/endermite/endermite", "tex_size": [64, 32], "attack": 2.0, "xp": [3, 3], "rig": "endermite"},
-	"shulker": {"hp": 30, "speed": 0.0, "w": 1.0, "h": 1.0, "kind": "hostile", "stationary": true, "shoots": "shulker_bullet", "teleports": true, "tex": "entity/shulker/shulker", "tex_size": [64, 64], "xp": [5, 5], "rig": "shulker"},
-	"ender_dragon": {"hp": 200, "speed": 0.6, "w": 5.0, "h": 3.0, "kind": "hostile", "boss": true, "dragon": true, "flies": true, "fire_immune": true, "tex": "entity/enderdragon/dragon", "tex_size": [256, 256], "xp": [0, 0], "rig": "dragon",
+	# wiki (Attribute): shulker / ender dragon movement speed 0.7 (unused: stationary / DragonFight); enderman follow
+	# range 64, step height 1
+	"shulker": {"hp": 30, "speed": 0.7, "w": 1.0, "h": 1.0, "kind": "hostile", "stationary": true, "shoots": "shulker_bullet", "teleports": true, "tex": "entity/shulker/shulker", "tex_size": [64, 64], "xp": [5, 5], "rig": "shulker"},
+	"ender_dragon": {"hp": 200, "speed": 0.7, "w": 5.0, "h": 3.0, "kind": "hostile", "boss": true, "dragon": true, "flies": true, "fire_immune": true, "tex": "entity/enderdragon/dragon", "tex_size": [256, 256], "xp": [0, 0], "rig": "dragon",
 		"children": {"wing1": "wing0", "wing4": "wing0", "wing6": "wing4", "wing3": "wing2", "wing5": "wing2", "wing7": "wing5", "jaw": "head", "lip": "head"}},
 	"end_crystal": {"hp": 1, "speed": 0.0, "w": 2.0, "h": 2.0, "kind": "passive", "stationary": true, "crystal": true, "fire_immune": true, "tex": "entity/end_crystal/end_crystal", "tex_size": [64, 32], "xp": [0, 0], "rig": "crystal"},
 	"silverfish": {"hp": 8, "speed": 0.25, "w": 0.4, "h": 0.3, "kind": "hostile", "tex": "entity/silverfish/silverfish", "tex_size": [64, 32], "attack": 1.0, "xp": [5, 5], "rig": "endermite"},

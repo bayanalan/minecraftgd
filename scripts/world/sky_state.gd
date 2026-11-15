@@ -181,7 +181,7 @@ func _update_time(world, ticks: float, rain: float, thunder: float) -> void:
 	sun_angle = deg_to_rad(float(_tl(0.0, "minecraft:visual/sun_angle", ticks)))
 	moon_angle = deg_to_rad(float(_tl(180.0, "minecraft:visual/moon_angle", ticks)))
 	star_angle = deg_to_rad(float(_tl(0.0, "minecraft:visual/star_angle", ticks)))
-	var mp = _tl("full_moon", "minecraft:visual/moon_phase", ticks + float(world.game_time / 24000) * 24000.0)
+	var mp = _tl("full_moon", "minecraft:visual/moon_phase", ticks)   # (day_time keeps counting; moon.json wraps at 8 days)
 	moon_phase = str(mp)
 	# ClientLevel.getCloudColor: towards 0.6 x grey with rain, 0.2 x grey with thunder (95 %)
 	if rain > 0.0:
@@ -237,7 +237,9 @@ func update(world, cam_pos: Vector3, look: Vector3, ticks: float, rd_chunks: int
 	if thunder > 0.0:
 		var t2 := 1.0 - thunder * 0.5
 		fog = Color(fog.r * t2, fog.g * t2, fog.b * t2)
-	var u := cam_pos.y - float(world.dim_type.get("min_y", -64.0))
+	# wiki: Fog - below minY + 32 the fog fades to black: (clamp((y - minY) * 0.03125, 0, 1))^2 (superflat: scale 1)
+	var flat: bool = world.gen != null and str(world.gen.generator_id) == "flat"
+	var u := (cam_pos.y - float(world.dim_type.get("min_y", -64.0))) * (1.0 if flat else 0.03125)
 	if u < 1.0:
 		u = maxf(u, 0.0)
 		fog = Color(fog.r * u * u, fog.g * u * u, fog.b * u * u)

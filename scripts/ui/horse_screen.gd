@@ -7,13 +7,18 @@ var mount   # EntityManager.Ent
 
 
 func build() -> void:
-	bg_tex = UiKit.sprite("gui/container/horse")
+	var naut: bool = str(mount.id) in Taming.NAUTILI
+	bg_tex = UiKit.sprite("gui/container/nautilus" if naut else "gui/container/horse")   # (26.3 NautilusInventoryScreen)
 	bg_size = Vector2(176, 166)
 	title = str(mount.data.get("CustomName", mount.id.capitalize()))
 	add_slot(Vector2(8, 18), _get_saddle, _set_saddle, 0, false, func(s: ItemStack): return s.name() == "saddle", "saddle")
 	if not (mount.id in ["donkey", "mule"]):
-		add_slot(Vector2(8, 36), _get_armor, _set_armor, 0, false, _armor_ok, "llama_armor" if str(mount.id) in ["llama", "trader_llama"] else "horse_armor")
+		add_slot(Vector2(8, 36), _get_armor, _set_armor, 0, false, _armor_ok, "nautilus_armor" if naut else ("llama_armor" if str(mount.id) in ["llama", "trader_llama"] else "horse_armor"))
 	if bool(mount.data.get("chest", false)):
+		# wiki Llama: 3 x strength slots (3 rows of `strength` columns); donkeys / mules 15
+		var cols := 5
+		if str(mount.id) in ["llama", "trader_llama"]:
+			cols = clampi(int(mount.data.get("strength", 3)), 1, 5)
 		var items: Array = mount.data.get("items", [])
 		if items.size() < 15:
 			items.resize(15)
@@ -22,7 +27,7 @@ func build() -> void:
 					items[i] = {}
 			mount.data["items"] = items
 		for r in 3:
-			for c in 5:
+			for c in cols:
 				var idx := r * 5 + c
 				add_slot(Vector2(80 + c * 18, 18 + r * 18), _get_item.bind(idx), _set_item.bind(idx), 0)
 	add_player_inventory(8, 84)
@@ -31,6 +36,8 @@ func build() -> void:
 func _armor_ok(s: ItemStack) -> bool:
 	if mount.id in ["llama", "trader_llama"]:
 		return s.name().ends_with("_carpet")
+	if mount.id in Taming.NAUTILI:
+		return s.name().ends_with("_nautilus_armor")
 	return s.name().ends_with("_horse_armor")
 
 

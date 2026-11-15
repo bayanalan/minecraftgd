@@ -9,6 +9,8 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -45,6 +47,7 @@ struct FxCfg {
 	std::vector<int32_t> I, flags, stblock, half_up, wl, consts, simplex;
 	std::vector<uint8_t> airn, logn;
 	int F_LEAVES = 1048576;
+	int F_TREE_REPL = 0;   // consts[10]: BlockRegistry.F_TREE_REPL (0: the old replaceable / leaves rule)
 	std::vector<double> F;
 	std::vector<uint8_t> M, BS, cat, below;
 	int F_LIQUID = 8, F_WATERLOGGED = 256, F_COLLIDE = 4, F_REPLACEABLE = 16, F_FULL_SHAPE = 262144, F_OPAQUE = 2, F_LAVA = 65536;
@@ -66,7 +69,7 @@ struct Fx {
 	const uint8_t *bio = nullptr;
 	const uint8_t *bset = nullptr;
 	int nbio = 0;
-	Xoroshiro r;
+	WorldgenXoro r;   // Java WorldgenRandom(XoroshiroRandomSource) semantics
 	std::vector<int32_t> writes;
 	std::vector<int64_t> bes;   // block entity requests: kind, x, y, z, value
 
@@ -564,15 +567,26 @@ struct Fx {
 			case 31: return fungus(n, x, y, z);
 			case 32: return sculk_patch(n, x, y, z);
 			case 13: {
-				for (int k2 = 0; k2 < 12; k2++) {
-					int qx = x + (int)r.next_int_bound(5) - 2;
-					int qy = y + (int)r.next_int_bound(2);
-					int qz = z + (int)r.next_int_bound(5) - 2;
-					if (get(qx, qy, qz) == 0 && get(qx, qy - 1, qz) > 0) {
-						int st = provide(n[1], qx, qy, qz);
-						set(qx, qy, qz, st, W_AIR);
-					}
-				}
+				// Java BlockPileFeature: an ellipse-ish 2..3 x 2..3 pile two layers high; mayPlaceOn: dirt path below ->
+				// nextBoolean, otherwise the face below must be sturdy (full collision cube here)
+				if (y < c.gen_min_y + 5) return false;
+				int pi = 2 + (int)r.next_int_bound(2);
+				int pj = 2 + (int)r.next_int_bound(2);
+				for (int qz = z - pj; qz <= z + pj; qz++)
+					for (int qy = y; qy <= y + 1; qy++)
+						for (int qx = x - pi; qx <= x + pi; qx++) {
+							int k = x - qx, l = z - qz;
+							float fa = (float)r.next_float() * 10.0f;   // (Java evaluates left to right)
+							float fb = (float)r.next_float() * 6.0f;
+							bool put = (float)(k * k + l * l) <= fa - fb;
+							if (!put) put = r.next_float() < 0.031;
+							if (!put || !is_air(get(qx, qy, qz))) continue;
+							int below = get(qx, qy - 1, qz);
+							bool ok;
+							if (below > 0 && c.stblock[below] == n[2]) ok = r.next_bool();
+							else ok = below > 0 && (flags(below) & c.F_COLLIDE) && (flags(below) & c.F_FULL_SHAPE);
+							if (ok) set(qx, qy, qz, provide(n[1], qx, qy, qz), W_FORCE);
+						}
 				return true;
 			}
 		}
@@ -965,6 +979,7 @@ struct Fx {
 		if (st == 0) return true;
 		if (st < 0) return false;
 		int fl = flags(st);
+		if (c.F_TREE_REPL) return (fl & c.F_TREE_REPL) != 0;   // TreeFeature.validTreePos: air or #replaceable_by_trees
 		return (fl & (c.F_REPLACEABLE | c.F_LEAVES)) && !(fl & c.F_LIQUID);
 	}
 	// Trees._log; axis 0 y, 1 x, 2 z
@@ -982,7 +997,11 @@ struct Fx {
 	}
 	void tleaf(int fpv, int x, int y, int z) {
 		if (tvalid(x, y, z)) {
-			set(x, y, z, provide(fpv, x, y, z), W_REPLACEABLE);
+			// FoliagePlacer.tryPlaceLeaf: leaves placed in water are waterlogged
+			int s = provide(fpv, x, y, z);
+			int cur = get(x, y, z);
+			if (cur > 0 && (flags(cur) & c.F_LIQUID) && !(flags(cur) & c.F_LAVA) && s >= 0 && s < (int)c.wl.size() && c.wl[s] >= 0) s = c.wl[s];
+			set(x, y, z, s, cur == 0 ? W_REPLACEABLE : W_FORCE);   // (a plant / water there was checked by tvalid)
 			if (leaves_n == 0 || y < leaves_min_y) leaves_min_y = y;
 			leaves_n++;
 			leaves.push_back(V3{x, y, z});
@@ -1089,9 +1108,14 @@ struct Fx {
 			case 10: {
 				int cnt2 = n[14];
 				for (int q = 0; q < cnt2; q++) {
-					int qx = ax + (int)r.next_int_bound(radius * 2 + 1) - radius;
-					int qy = ay + (int)r.next_int_bound(fh + 1) - fh / 2;
-					int qz = az + (int)r.next_int_bound(radius * 2 + 1) - radius;
+					// Java RandomSpreadFoliagePlacer: nextInt(r) - nextInt(r) per axis (x, y, z; radius / foliage height)
+					int rr = std::max(radius, 1), hh = std::max(fh, 1);
+					int qx = ax + (int)r.next_int_bound(rr);
+					qx -= (int)r.next_int_bound(rr);
+					int qy = ay + (int)r.next_int_bound(hh);
+					qy -= (int)r.next_int_bound(hh);
+					int qz = az + (int)r.next_int_bound(rr);
+					qz -= (int)r.next_int_bound(rr);
 					tleaf(fpv, qx, qy, qz);
 				}
 				break;
@@ -1110,20 +1134,23 @@ struct Fx {
 			const int32_t *d = I + n[nd_off + 1 + di];
 			double prob = F[d[1]];
 			switch (d[0]) {
-				case 1:
+					case 1:
+					// Java TrunkVineDecorator: a vine on each side with nextInt(3) > 0 (2 in 3)
 					for (const V3 &q : logs)
 						for (int k = 0; k < 4; k++) {
-							if (r.next_int_bound(3) > 0) continue;
+							if (r.next_int_bound(3) == 0) continue;
 							int nx = q.x + HD[k][0], ny = q.y, nz = q.z + HD[k][2];
 							if (tair(nx, ny, nz) && d[2 + k] >= 0) set(nx, ny, nz, d[2 + k], W_AIR);
 						}
 					break;
 				case 2: {
 					if (r.next_float() >= prob || logs.empty()) break;
-					int y0 = logs[0].y;
+						int y0 = logs[0].y;
+					static const int CO[4] = {3, 0, 2, 1};   // Java Direction.Plane.HORIZONTAL N, E, S, W (pods at +z, -x, -z, +x)
 					for (const V3 &q : logs) {
 						if (q.y - y0 > 2) continue;
-						for (int k = 0; k < 4; k++) {
+						for (int kk = 0; kk < 4; kk++) {
+							int k = CO[kk];
 							if (r.next_float() <= 0.25) {
 								int nx = q.x + HD[k][0], ny = q.y, nz = q.z + HD[k][2];
 								if (d[2] > 0 && tair(nx, ny, nz)) {
@@ -1350,6 +1377,87 @@ struct Fx {
 		for (const FC &fc : coords)
 			if ((double)(fc.base - py) >= (double)jh * 0.2) atts.push_back(Att{fc.x, fc.y, fc.z, 0, false});
 	}
+	// TrunkPlacer.placeLog with UpwardsBranchingTrunkPlacer.validTreePos (Trees._ub_log): axis y
+	bool ub_log(int pv, const int32_t *axt, int na, const uint8_t *gm, int x, int y, int z) {
+		if (!tvalid(x, y, z)) {
+			int st = get(x, y, z);
+			if (st <= 0 || !gm || st >= (int)c.flags.size() || !gm[st]) return false;
+		}
+		int s = provide(pv, x, y, z);
+		if (s > 0) for (int k = 0; k < na; k++) if (axt[k * 4] == s) { s = axt[k * 4 + 1]; break; }
+		set(x, y, z, s, W_FORCE);
+		logs.push_back(V3{x, y, z});
+		return true;
+	}
+	// Java MangroveRootPlacer (Trees._mangrove_roots ... _wl_state). rd: [trunk_offset_y, root provider, can_grow_through
+	// mask, muddy_roots_in mask, muddy provider, max length, max width, skew chance (F), above chance (F) or -1, above provider]
+	bool root_ok(const int32_t *rd, int x, int y, int z) {
+		if (tvalid(x, y, z)) return true;
+		int st = get(x, y, z);
+		return st > 0 && st < (int)c.flags.size() && c.M[rd[2] + st];
+	}
+	int root_wl(int cur, int s) const {
+		if (s <= 0 || s >= (int)c.wl.size() || c.wl[s] < 0) return s;
+		int fl = flags(cur);
+		bool wet = ((fl & c.F_LIQUID) && !(fl & c.F_LAVA)) || (fl & c.F_WATERLOGGED);
+		return wet ? c.wl[s] : s;
+	}
+	bool sim_roots(const int32_t *rd, int px, int py, int pz, int dx, int dz, int tx, int ty, int tz, std::vector<V3> &lst, int length) {
+		int mx = rd[5];
+		if (length == mx || (int)lst.size() > mx) return false;
+		V3 cand[2];
+		int nc = 1;
+		int i = std::abs(px - tx) + std::abs(py - ty) + std::abs(pz - tz);
+		int w = rd[6];
+		double sk = F[rd[7]];
+		cand[0] = V3{px, py - 1, pz};
+		if (i > w - 3 && i <= w) {
+			if (r.next_float() < sk) { cand[1] = V3{px + dx, py - 1, pz + dz}; nc = 2; }
+		} else if (i <= w) {
+			if (!(r.next_float() < sk) && r.next_bool()) cand[0] = V3{px + dx, py, pz + dz};
+		}
+		for (int k = 0; k < nc; k++) {
+			const V3 q = cand[k];
+			if (!root_ok(rd, q.x, q.y, q.z)) continue;
+			lst.push_back(q);
+			if (!sim_roots(rd, q.x, q.y, q.z, dx, dz, tx, ty, tz, lst, length + 1)) return false;
+		}
+		return true;
+	}
+	void place_root(const int32_t *rd, int x, int y, int z) {
+		int st = get(x, y, z);
+		if (st > 0 && st < (int)c.flags.size() && c.M[rd[3] + st]) {
+			int ms = provide(rd[4], x, y, z);
+			set(x, y, z, root_wl(st, ms), W_FORCE);
+			return;
+		}
+		if (!root_ok(rd, x, y, z)) return;
+		int rs = provide(rd[1], x, y, z);
+		set(x, y, z, root_wl(st, rs), W_FORCE);
+		if (rd[8] >= 0 && r.next_float() < F[rd[8]]) {
+			int ast = get(x, y + 1, z);
+			if (ast == 0 || (ast > 0 && (flags(ast) & 1))) {   // isAir (F_AIR)
+				int as = provide(rd[9], x, y + 1, z);
+				set(x, y + 1, z, root_wl(ast, as), W_FORCE);
+			}
+		}
+	}
+	bool mangrove_roots(const int32_t *rd, int px, int oy, int pz, int ty) {
+		for (int y = oy; y < ty; y++) if (!root_ok(rd, px, y, pz)) return false;
+		static const int D4r[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};   // N E S W
+		std::vector<V3> pos;
+		pos.push_back(V3{px, ty - 1, pz});
+		std::vector<V3> lst;
+		for (int d = 0; d < 4; d++) {
+			lst.clear();
+			int sx = px + D4r[d][0], sz = pz + D4r[d][1];
+			if (!sim_roots(rd, sx, ty, sz, D4r[d][0], D4r[d][1], px, ty, pz, lst, 0)) return false;
+			pos.insert(pos.end(), lst.begin(), lst.end());
+			pos.push_back(V3{sx, ty, sz});
+		}
+		for (const V3 &q : pos) place_root(rd, q.x, q.y, q.z);
+		return true;
+	}
 	bool tree(const int32_t *n, int px, int py, int pz) {
 		int tk = n[1];
 		bool bending = n[2] != 0;
@@ -1362,7 +1470,7 @@ struct Fx {
 		else if (n[7] == 1) fh = std::max(4, h - (int)ip(n[8]));
 		else fh = (int)ip(n[8]);
 		int radius = (int)ip(n[9]);
-		int offset = (int)ip(n[10]);
+		if (fk == 4) radius += (int)r.next_int_bound(std::max(h - fh + 1, 1));   // PineFoliagePlacer.foliageRadius
 		bool dbl = tk == 1 || tk == 2 || tk == 3;
 		int na = n[15];
 		const int32_t *axt = n + 16;
@@ -1370,12 +1478,38 @@ struct Fx {
 		logs.clear();
 		leaves.clear();
 		leaves_n = 0;
-		if (py < MIN_Y + 1 || py + h + 1 >= MAX_Y) return false;
+		// Java TreeFeature.doPlace: build height, then getMaxFreeTreeHeight over minimum_size (Trees._max_free_height);
+		// a rejected tree draws no offset / trunk / foliage random; the trunk gets the free height
+		// extras after minimum_size (features_native.emit_tree): can_grow_through mask, branch probability, branch length /
+		// steps, root placer flag + root data; a root placer starts the trunk trunk_offset_y above the origin (RootPlacer.
+		// getTrunkOrigin, drawn after the foliage radius)
+		const int32_t *tex = n + nd_off + 1 + n[nd_off] + 9;
+		const uint8_t *tgm = tex[0] >= 0 ? c.M.data() + tex[0] : nullptr;
+		const int32_t *rd = tex[4] ? tex + 5 : nullptr;
+		int oy = py;
+		if (rd) py = oy + (int)ip(rd[0]);
+		if (oy < MIN_Y + 1 || py + h + 1 > MAX_Y) return false;
 		int w = dbl ? 2 : 1;
-		for (int y = 0; y < h; y++)
-			for (int dx = 0; dx < w; dx++)
-				for (int dz = 0; dz < w; dz++)
-					if (!tvalid(px + dx, py + y, pz + dz)) return false;
+		{
+			const int32_t *ms = n + nd_off + 1 + n[nd_off];   // [kind, limit, upper_limit, lower, middle, upper, min_clip, ignore_vines, vine block]
+			int free_h = h;
+			for (int i = 0; i <= h + 1 && free_h == h; i++) {
+				int j = i < ms[1] ? ms[3] : (ms[0] == 1 ? (i >= h - ms[2] ? ms[5] : ms[4]) : ms[5]);
+				for (int k = -j; k <= j && free_h == h; k++)
+					for (int l = -j; l <= j; l++) {
+						int qx = px + k, qy = py + i, qz = pz + l;
+						int st = get(qx, qy, qz);
+						bool fr = tvalid(qx, qy, qz) || (st > 0 && st < (int)c.logn.size() && c.logn[st]);
+						if (!fr && tgm && st > 0 && st < (int)c.flags.size() && tgm[st]) fr = true;   // (UpwardsBranchingTrunkPlacer.validTreePos)
+						if (fr && !ms[7] && st > 0 && st < (int)c.stblock.size() && c.stblock[st] == ms[8]) fr = false;
+						if (!fr) { free_h = i - 2; break; }
+					}
+			}
+			if (!(free_h >= h || (ms[6] >= 0 && free_h >= ms[6]))) return false;
+			h = free_h;
+		}
+		if (rd && !mangrove_roots(rd, px, oy, pz, py)) return false;
+		if (tk != 6)   // (UpwardsBranchingTrunkPlacer places no soil: the root under a mangrove trunk stays)
 		for (int dx = 0; dx < w; dx++)
 			for (int dz = 0; dz < w; dz++) {
 				int bx = px + dx, by = py - 1, bz = pz + dz;
@@ -1460,6 +1594,36 @@ struct Fx {
 				}
 				break;
 			}
+			case 6: {
+				// Java UpwardsBranchingTrunkPlacer (Trees._upwards_trunk)
+				static const int D4u[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};   // N E S W
+				double prob = F[tex[1]];
+				for (int i = 0; i < h; i++) {
+					int y = py + i;
+					if (ub_log(tpv, axt, na, tgm, px, y, pz) && i < h - 1 && r.next_float() < prob) {
+						int di = (int)r.next_int_bound(4);
+						int k = (int)ip(tex[2]);
+						int l = std::max(0, k - (int)ip(tex[2]) - 1);
+						int steps = (int)ip(tex[3]);
+						int top = y + l, bx = px, bz = pz;
+						for (; l < h && steps > 0; l++, steps--) {
+							if (l < 1) continue;
+							int m = y + l;
+							top = m;
+							bx += D4u[di][0];
+							bz += D4u[di][1];
+							if (ub_log(tpv, axt, na, tgm, bx, m, bz)) top++;
+							atts.push_back(Att{bx, m, bz, 0, false});
+						}
+						if (top - y > 1) {
+							atts.push_back(Att{bx, top, bz, 0, false});
+							atts.push_back(Att{bx, top - 2, bz, 0, false});
+						}
+					}
+					if (i == h - 1) atts.push_back(Att{px, y + 1, pz, 0, false});
+				}
+				break;
+			}
 			case 5: {
 				// Java FancyTrunkPlacer (Trees._fancy_trunk)
 				fancy_trunk(n, tpv, axt, na, px, py, pz, h, atts);
@@ -1490,7 +1654,10 @@ struct Fx {
 				for (int y = 0; y < h; y++) tlog(n, tpv, axt, na, px, py + y, pz, 0);
 				atts.push_back(Att{px, py + h, pz, 0, false});
 		}
-		for (const Att &at : atts) tfoliage(n, fk, at.x, at.y, at.z, at.ro, at.dbl, fh, radius, offset);
+		for (const Att &at : atts) {
+			int offset = (int)ip(n[10]);   // FoliagePlacer.createFoliage: per attachment
+			tfoliage(n, fk, at.x, at.y, at.z, at.ro, at.dbl, fh, radius, offset);
+		}
 		tdecorators(n, nd_off);
 		return true;
 	}
@@ -1555,23 +1722,83 @@ struct Fx {
 				}
 		}
 		return true;
-	}	bool fallen(const int32_t *n, int px, int py, int pz) {
-		int below = get(px, py - 1, pz);
-		if (below <= 0 || !(flags(below) & c.F_FULL_SHAPE) || get(px, py, pz) != 0) return false;
+	}
+	// Java FallenTreeFeature (Trees.fallen): [23, trunk, log length, na, axis table (na x 4), stump vine flag, 4 vine
+	// states (-x, +x, -z, +z sides), n attached_to_logs, per one: prob (F index), provider, n dirs, dir codes (0 down, 1 up,
+	// 2 north, 3 south, 4 west, 5 east)]
+	bool fallen(const int32_t *n, int px, int py, int pz) {
 		int na = n[3];
 		const int32_t *axt = n + 4;
-		logs.clear();
-		tlog(n, n[1], axt, na, px, py, pz, 0);
-		int64_t length = ip(n[2]);
-		static const int D4c[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+		const int32_t *ex = n + 4 + na * 4;
+		auto put_log = [&](int x, int y, int z, int axis) {
+			int s = provide(n[1], x, y, z);
+			if (s > 0) {
+				for (int k = 0; k < na; k++) if (axt[k * 4] == s) { s = axt[k * 4 + 1 + axis]; break; }
+			}
+			set(x, y, z, s, W_FORCE);
+		};
+		static const int HDV[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+		put_log(px, py, pz, 0);
+		if (ex[0]) {
+			for (int k = 0; k < 4; k++) {
+				if (r.next_int_bound(3) == 0) continue;
+				int nx = px + HDV[k][0], nz = pz + HDV[k][1];
+				if (tair(nx, py, nz) && ex[1 + k] >= 0) set(nx, py, nz, ex[1 + k], W_AIR);
+			}
+		}
+		static const int DIRS[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};   // N E S W
 		int di = (int)r.next_int_bound(4);
+		int length = (int)ip(n[2]) - 2;
 		int sk = 2 + (int)r.next_int_bound(2);
-		int sx = px + D4c[di][0] * sk, sz = pz + D4c[di][1] * sk;
-		for (int64_t k = 0; k < length; k++) {
-			int qx = sx + D4c[di][0] * (int)k, qz = sz + D4c[di][1] * (int)k;
-			int bl = get(qx, py - 1, qz);
-			if (get(qx, py, qz) != 0 || bl <= 0 || !(flags(bl) & c.F_COLLIDE)) break;
-			tlog(n, n[1], axt, na, qx, py, qz, D4c[di][0] != 0 ? 1 : 2);
+		int qx = px + DIRS[di][0] * sk, qy = py + 1, qz = pz + DIRS[di][1] * sk;
+		auto solid_below = [&](int x, int y, int z) {
+			int b = get(x, y - 1, z);
+			return b > 0 && (flags(b) & c.F_COLLIDE) && (flags(b) & c.F_FULL_SHAPE);
+		};
+		for (int i = 0; i < 6; i++) {
+			if (tvalid(qx, qy, qz) && solid_below(qx, qy, qz)) break;
+			qy--;
+		}
+		int gap = 0;
+		for (int j = 0; j < length; j++) {
+			int tx = qx + DIRS[di][0] * j, tz = qz + DIRS[di][1] * j;
+			if (!tvalid(tx, qy, tz)) return true;
+			if (!solid_below(tx, qy, tz)) { if (++gap > 2) return true; }
+			else gap = 0;
+		}
+		std::vector<V3> placed;
+		for (int j = 0; j < length; j++) {
+			int tx = qx + DIRS[di][0] * j, tz = qz + DIRS[di][1] * j;
+			put_log(tx, qy, tz, DIRS[di][0] != 0 ? 1 : 2);
+			placed.push_back(V3{tx, qy, tz});
+		}
+		// java.util.HashSet<BlockPos> iteration order (16 buckets, insertion order inside one)
+		std::vector<V3> order;
+		for (int bk = 0; bk < 16; bk++)
+			for (const V3 &v : placed) {
+				uint32_t h = (uint32_t)((uint32_t)(v.y + v.z * 31) * 31u + (uint32_t)v.x);
+				if ((int)((h ^ (h >> 16)) & 15u) == bk) order.push_back(v);
+			}
+		const int32_t *ad = ex + 5;
+		int nat = ad[0];
+		ad++;
+		static const int DV[6][3] = {{0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}};
+		for (int a2 = 0; a2 < nat; a2++) {
+			double prob = F[ad[0]];
+			int pv = ad[1];
+			int nd = ad[2];
+			const int32_t *dirs = ad + 3;
+			std::vector<V3> sh = order;
+			for (int i = (int)sh.size() - 1; i > 0; i--) {
+				int j = (int)r.next_int_bound(i + 1);
+				V3 t = sh[i]; sh[i] = sh[j]; sh[j] = t;
+			}
+			for (const V3 &q : sh) {
+				int dc = nd > 0 ? dirs[(int)r.next_int_bound(nd)] : 1;
+				int tx = q.x + DV[dc][0], ty = q.y + DV[dc][1], tz = q.z + DV[dc][2];
+				if (r.next_float() <= prob && tair(tx, ty, tz)) set(tx, ty, tz, provide(pv, tx, ty, tz), W_FORCE);
+			}
+			ad += 3 + nd;
 		}
 		return true;
 	}
@@ -2236,7 +2463,8 @@ struct Fx {
 		return any;
 	}
 
-	// ---------------------------------------------------------------- ore / scattered ore (Features._ore / _scattered_ore)
+	// ---------------------------------------------------------------- ore / scattered ore (Features._ore / _scattered_ore): targets are (rule node, state, merge mode) - the
+	// mode is Features.W_ORE | rule << 2 (the decorate merge re-tests the cell, chunkops.cpp)
 	bool can_place_ore(int tnode, int st, int x, int y, int z, double discard) {
 		if (!rule(tnode, st, y)) return false;
 		if (discard <= 0.0) return true;
@@ -2318,8 +2546,8 @@ struct Fx {
 						if (!in_region(xx, zz)) continue;
 						int st = get(xx, yy, zz);
 						for (int t = 0; t < nt; t++) {
-							if (can_place_ore(tg[t * 2], st, xx, yy, zz, discard)) {
-								set(xx, yy, zz, tg[t * 2 + 1], W_FORCE);
+							if (can_place_ore(tg[t * 3], st, xx, yy, zz, discard)) {
+								set(xx, yy, zz, tg[t * 3 + 1], tg[t * 3 + 2]);
 								placed = true;
 								break;
 							}
@@ -2345,8 +2573,8 @@ struct Fx {
 			int x = ox + dx, y = oy + dy, z = oz + dz;
 			int st = get(x, y, z);
 			for (int t = 0; t < nt; t++) {
-				if (can_place_ore(tg[t * 2], st, x, y, z, discard)) {
-					set(x, y, z, tg[t * 2 + 1], W_FORCE);
+				if (can_place_ore(tg[t * 3], st, x, y, z, discard)) {
+					set(x, y, z, tg[t * 3 + 1], tg[t * 3 + 2]);
 					break;
 				}
 			}
@@ -2376,6 +2604,7 @@ bool fn_fx_config(const Args &a, void *ret) {
 	}
 	if (size_of(GDEXTENSION_VARIANT_TYPE_ARRAY, d) > 13) rd_u8(array_get(d, 13), c->logn);
 	if (c->consts.size() >= 10) c->F_LEAVES = c->consts[9];
+	if (c->consts.size() >= 11) c->F_TREE_REPL = c->consts[10];
 	if (c->simplex.size() < 256) c->simplex.assign(256, 0);
 	if (c->consts.size() >= 9) {
 		c->F_LIQUID = c->consts[0]; c->F_WATERLOGGED = c->consts[1]; c->F_COLLIDE = c->consts[2]; c->F_REPLACEABLE = c->consts[3];

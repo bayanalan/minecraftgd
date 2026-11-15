@@ -90,7 +90,7 @@ func _apply_prefill() -> void:
 	st["flat_biome"] = str(gs.get("flat_biome", "plains"))
 	st["single_biome"] = str(gs.get("single_biome", "plains"))
 	st["profile"] = maxi(0, ["java_26_3", "java_1_18_2_exact", "hybrid_1_18_2_terrain_26_3_content"].find(str(prefill.get("generator_id", "java_26_3"))))
-	var gr: Dictionary = prefill.get("gamerules", {})
+	var gr: Dictionary = GameRules.migrate(prefill.get("gamerules", {}))
 	for k in gr:
 		if GameRules.SPEC.has(k) and gr[k] != GameRules.SPEC[k][0]:
 			st["rules"][k] = gr[k]

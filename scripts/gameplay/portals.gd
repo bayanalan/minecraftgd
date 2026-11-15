@@ -197,27 +197,16 @@ static func arrive_nether_portal(world, target: Vector3i, axis: String) -> Vecto
 	var bottom: int = gmin
 	var right2 := Vector3i(1, 0, 0) if axis == "x" else Vector3i(0, 0, 1)
 	var fwd := Vector3i(0, 0, 1) if axis == "x" else Vector3i(1, 0, 0)
-	# search a spot with solid floor and 4x5 free space within 16 blocks (closest wins)
-	var best := Vector3i(0, -99999, 0)
-	var bd := 1 << 60
-	for dz in range(-16, 17):
-		for dx in range(-16, 17):
-			var x := target.x + dx
-			var z := target.z + dz
-			var y := mini(top - 5, 120 if dim == "the_nether" else top - 5)
-			while y > bottom + 1:
-				if _spot_ok(world, Vector3i(x, y, z), right2, fwd):
-					var d := Vector3i(x, y, z).distance_squared_to(target)
-					if d < bd:
-						bd = d
-						best = Vector3i(x, y, z)
-					break
-				y -= 1
-		if bd < 64:
-			break
+	# wiki Nether portal: the closest spot (3D) within 16 blocks horizontally, any height, with a 3 x 4 area of buildable
+	# blocks (4 along the portal's axis, 3 across) and 4 air blocks above all 12; else a 1 x 4 strip the same way
+	var cols := {}
+	var best := _find_spot(world, target, right2, fwd, bottom, top, 1, cols)
+	if best.y == -99999:
+		best = _find_spot(world, target, right2, fwd, bottom, top, 0, cols)
 	var forced := best.y == -99999
 	if forced:
-		best = Vector3i(target.x, clampi(target.y, 70, top - 10), target.z)
+		# wiki: Nether_portal - y clamped between 70 and 10 below the world height (118 Nether, 310 Overworld)
+		best = Vector3i(target.x, clampi(target.y, 70, top + 1 - 10), target.z)
 		# obsidian platform with air above (Java forced creation)
 		for i in range(-1, 2):
 			for j in range(0, 2):
@@ -241,18 +230,77 @@ static func arrive_nether_portal(world, target: Vector3i, axis: String) -> Vecto
 	return Vector3(best) + Vector3(right2) * 0.5 + Vector3(0.5, 0.0, 0.5)
 
 
-static func _spot_ok(world, p: Vector3i, right: Vector3i, fwd: Vector3i) -> bool:
-	for o in range(-1, 3):
-		var fl: Vector3i = p + right * o + Vector3i(0, -1, 0)
-		var st: int = world.state_at(fl.x, fl.y, fl.z)
-		if st <= 0 or (Res.blocks.st_flags[st] & BlockRegistry.F_COLLIDE) == 0 or (Res.blocks.st_flags[st] & BlockRegistry.F_LIQUID) != 0:
-			return false
-		for h in range(0, 5):
-			var q: Vector3i = p + right * o + Vector3i(0, h, 0)
-			var s2: int = world.state_at(q.x, q.y, q.z)
-			if s2 != 0:
-				return false
-	return true
+## Closest origin (the frame's first inner column, floor level + 1) within 16 blocks of target whose footprint (4 along
+## `right` from -1 .. 2, 2 x half + 1 across) has a buildable floor and 4 free blocks above every column; NONE-style
+## y -99999 when there is none. cols caches the per-column candidate heights between the two passes.
+static func _find_spot(world, target: Vector3i, right: Vector3i, fwd: Vector3i, bottom: int, top: int, half: int, cols: Dictionary) -> Vector3i:
+	var lo := bottom + 1
+	var hi := top - 3
+	var best := Vector3i(0, -99999, 0)
+	if hi < lo:
+		return best
+	var bd := 1 << 60
+	for dz in range(-16, 17):
+		for dx in range(-16, 17):
+			var ox := target.x + dx
+			var oz := target.z + dz
+			var h2 := dx * dx + dz * dz
+			if h2 >= bd:
+				continue
+			var first: Array = []
+			var rest: Array = []
+			for j in range(-1, 3):
+				for s in range(-half, half + 1):
+					var c: Array = _column(world, Vector2i(ox + right.x * j + fwd.x * s, oz + right.z * j + fwd.z * s), lo, hi, cols)
+					if first.is_empty() and rest.is_empty():
+						first = c
+					rest.append(c)
+			for y in first[1]:
+				var dy: int = int(y) - target.y
+				if h2 + dy * dy >= bd:
+					continue
+				var ok := true
+				for c2 in rest:
+					if (c2[0] as PackedByteArray)[int(y) - lo] == 0:
+						ok = false
+						break
+				if ok:
+					bd = h2 + dy * dy
+					best = Vector3i(ox, int(y), oz)
+	return best
+
+
+## [PackedByteArray flags (y - lo), Array of heights] for the column: 1 where the block below is buildable (solid, not
+## a fluid) and the 4 blocks from y up are free (air, or replaceable non-fluid blocks such as grass).
+static func _column(world, c: Vector2i, lo: int, hi: int, cols: Dictionary) -> Array:
+	var got = cols.get(c)
+	if got != null:
+		return got
+	var b := Res.blocks
+	var n := hi - lo + 1
+	var flags := PackedByteArray()
+	flags.resize(n)
+	var ys: Array = []
+	var ch: Chunk = world.cm.get_chunk(c.x >> 4, c.y >> 4) if world.get("cm") != null else null
+	if ch != null and ch.state >= Chunk.DECORATED:
+		var lx := c.x & 15
+		var lz := c.y & 15
+		var run := 0          # free blocks counted downward from the top
+		var y := hi + 3
+		while y >= lo - 1:
+			var st := ch.get_block(lx, y, lz)
+			var fl: int = b.st_flags[st] if st > 0 else 0
+			var free := st == 0 or ((fl & BlockRegistry.F_REPLACEABLE) != 0 and (fl & BlockRegistry.F_LIQUID) == 0)
+			var solid := st > 0 and (fl & BlockRegistry.F_COLLIDE) != 0 and (fl & BlockRegistry.F_LIQUID) == 0 and not free
+			# y is the floor of the spot y + 1 when the 4 blocks above it are free
+			if solid and run >= 4 and y + 1 <= hi:
+				flags[y + 1 - lo] = 1
+				ys.append(y + 1)
+			run = run + 1 if free else 0
+			y -= 1
+	var out := [flags, ys]
+	cols[c] = out
+	return out
 
 
 # ------------------------------------------------------------------ End portal

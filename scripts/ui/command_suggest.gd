@@ -112,10 +112,8 @@ static func suggest(world, text: String) -> Array:
 			"ench":
 				cands = _ids(Enchanting.defs.keys().map(func(x): return str(x).trim_prefix("minecraft:")))
 			"rule":
-				cands = ["announceAdvancements", "commandBlockOutput", "doDaylightCycle", "doEntityDrops", "doFireTick", "doImmediateRespawn",
-					"doInsomnia", "doMobLoot", "doMobSpawning", "doTileDrops", "doWeatherCycle", "drowningDamage", "fallDamage", "fireDamage",
-					"freezeDamage", "keepInventory", "mobGriefing", "naturalRegeneration", "playersSleepingPercentage", "randomTickSpeed",
-					"showDeathMessages", "spawnRadius", "tntExplodes"]
+				cands = GameRules.SPEC.keys()   # (26.x ids)
+				cands.sort()
 			"locate_target":
 				var mode := toks[1] if toks.size() > 2 else ""
 				if mode == "biome" and world != null and world.biomes != null:

@@ -271,6 +271,11 @@ struct Job {
 				case 2: d += beard_c(K, dx, std::max(0, std::max(yb - y, y - pc[4])), dz, dyb) * 0.8; break;
 				case 3: d += bury((double)dx, (double)dyb / 2.0, (double)dz); break;
 				case 4: d += bury((double)dx / 2.0, (double)std::max(0, std::max(pc[1] - y, y - pc[4])) / 2.0, (double)dz / 2.0) * 0.8; break;
+				case 5: {   // JigsawJunction [x, ground y, z]: signed offsets, weight 0.4
+					int jy = y - pc[1];
+					d += beard_c(K, x - pc[0], jy, z - pc[2], jy) * 0.4;
+					break;
+				}
 				default: break;
 			}
 		}
@@ -1314,9 +1319,98 @@ bool fn_tg_biomes_within(const Args &a, void *ret) {
 	return true;
 }
 
+// tg_biome_at(cfg, x, y, z) -> [biome id, -1 without multi-noise biomes]: Java getNoiseBiome at the block's quart
+// position (the horizontal climate values from the column, depth at the quart y - as the chunk biomes).
+bool fn_tg_biome_at(const Args &a, void *ret) {
+	const Cfg *c = cfg_of(a.i(0));
+	if (!c) return false;
+	int x = (int)a.i(1), y = (int)a.i(2), z = (int)a.i(3);
+	const ClimateCfg &C = c->clim;
+	int id = -1;
+	if (C.single >= 0) {
+		id = C.single;
+	} else if (C.ok) {
+		Eval ev(*c->g, 0, 0, false);
+		ev.mode = 0;
+		int qx = x >> 2, qy = y >> 2, qz = z >> 2;
+		std::vector<int64_t> best(C.ng);
+		std::vector<int> bi(C.ng);
+		double v[6];
+		for (int k = 0; k < 6; k++) v[k] = k == 4 ? 0.0 : ev.at(C.nodes[k], qx * 4, 0, qz * 4);
+		climate_column(C, v[0], v[1], v[2], v[3], v[5], best.data(), bi.data());
+		id = climate_pick(C, best.data(), bi.data(), ev.at(C.nodes[4], qx * 4, qy * 4, qz * 4));
+	}
+	resize(GDEXTENSION_VARIANT_TYPE_ARRAY, ret, 1);
+	array_set_int(ret, 0, id);
+	return true;
+}
+
+// tg_find_biome(cfg, want: PackedByteArray (1 per accepted biome id), x, z, ys: PackedInt32Array, size, step)
+//   -> [found 0/1, x, y, z, biome id]. Java BiomeSource.findClosestBiome3d: columns in BlockPos.spiralAround order
+//   (east, south, west, north legs of 1, 1, 2, 2, 3, ... steps; (2 size + 1)^2 columns) step blocks apart, at each the
+//   heights ys (Mth.outFromOrigin order), the first quart biome accepted wins. -1 found: no multi-noise biomes.
+bool fn_tg_find_biome(const Args &a, void *ret) {
+	const Cfg *c = cfg_of(a.i(0));
+	if (!c) return false;
+	const void *wantp = a.obj(1, GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY);
+	const void *ysp = a.obj(4, GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY);
+	if (!wantp || !ysp) return false;
+	int nw = (int)size_of(GDEXTENSION_VARIANT_TYPE_PACKED_BYTE_ARRAY, wantp);
+	const uint8_t *want = bytes(wantp);
+	int ny = (int)size_of(GDEXTENSION_VARIANT_TYPE_PACKED_INT32_ARRAY, ysp);
+	const int32_t *ys = i32(ysp);
+	int x0 = (int)a.i(2), z0 = (int)a.i(3);
+	int size = (int)a.i(5), step = (int)a.i(6);
+	const ClimateCfg &C = c->clim;
+	int found = 0, fx = 0, fy = 0, fz = 0, fid = -1;
+	auto accept = [&](int id) { return id >= 0 && id < nw && want[id] != 0; };
+	if (C.single >= 0) {
+		if (accept(C.single) && ny > 0) { found = 1; fx = x0; fy = ys[0]; fz = z0; fid = C.single; }
+	} else if (!C.ok) {
+		found = -1;
+	} else if (ny > 0) {
+		Eval ev(*c->g, 0, 0, false);
+		ev.mode = 0;
+		std::vector<int64_t> best(C.ng);
+		std::vector<int> bi(C.ng);
+		static const int DX[4] = {1, 0, -1, 0};   // east, south, west, north
+		static const int DZ[4] = {0, 1, 0, -1};
+		int64_t total = (int64_t)(2 * size + 1) * (2 * size + 1);
+		int64_t emitted = 0;
+		int cx = 0, cz = 0, leg = 0, li = 0;
+		while (emitted < total && !found) {
+			if (emitted > 0) {
+				int len = leg / 2 + 1;
+				cx += DX[leg & 3];
+				cz += DZ[leg & 3];
+				if (++li >= len) { li = 0; leg++; }
+			}
+			emitted++;
+			int bx = x0 + cx * step, bz = z0 + cz * step;
+			int qx = bx >> 2, qz = bz >> 2;
+			double v[6];
+			for (int k = 0; k < 6; k++) v[k] = k == 4 ? 0.0 : ev.at(C.nodes[k], qx * 4, 0, qz * 4);
+			climate_column(C, v[0], v[1], v[2], v[3], v[5], best.data(), bi.data());
+			for (int yi = 0; yi < ny; yi++) {
+				int id = climate_pick(C, best.data(), bi.data(), ev.at(C.nodes[4], qx * 4, (ys[yi] >> 2) * 4, qz * 4));
+				if (accept(id)) { found = 1; fx = bx; fy = ys[yi]; fz = bz; fid = id; break; }
+			}
+		}
+	}
+	resize(GDEXTENSION_VARIANT_TYPE_ARRAY, ret, 5);
+	array_set_int(ret, 0, found);
+	array_set_int(ret, 1, fx);
+	array_set_int(ret, 2, fy);
+	array_set_int(ret, 3, fz);
+	array_set_int(ret, 4, fid);
+	return true;
+}
+
 } // namespace
 
 void register_terrain(const char *cls) {
+	register_method(cls, "tg_biome_at", fn_tg_biome_at, 4);
+	register_method(cls, "tg_find_biome", fn_tg_find_biome, 7);
 	register_method(cls, "tg_biomes_within", fn_tg_biomes_within, 5);
 	register_method(cls, "tg_config", fn_tg_config, 2);
 	register_method(cls, "tg_begin", fn_tg_begin, 3);

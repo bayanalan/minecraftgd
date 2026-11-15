@@ -364,5 +364,5 @@ static func block_item_mesh(state: int) -> ArrayMesh:
 	arr[Mesh.ARRAY_INDEX] = idx
 	var m := ArrayMesh.new()
 	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr, [], {}, Mesh.ARRAY_CUSTOM_RGBA_FLOAT << Mesh.ARRAY_FORMAT_CUSTOM0_SHIFT)
-	m.surface_set_material(0, Res.mat_cutout)
+	m.surface_set_material(0, Res.mat_item_block if Res.mat_item_block != null else Res.mat_cutout)
 	return m

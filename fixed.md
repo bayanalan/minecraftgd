@@ -2,7 +2,205 @@
 
 Moved out of PROGRESS.md (2026-11-12). Open work lives in PROGRESS.md (OPEN BUGS). Newest first.
 
+## Done 2026-11-15 (villager / mob leftovers of the wiki audit; details in the PROGRESS.md audit slices)
+- [x] Villagers claim beds, sleep at night (pose, wake rules, kicked out by players), hide / ring the bell / stop working
+      during raids and cheer after a victory; iron golem summoning (gossip 5 / panic 3, slept recently, no golem seen)
+- [x] Chest-loot explorer maps (buried treasure / abandoned camp maps) on the async ExplorerMaps search
+- [x] Nautilus / zombie nautilus saddle, armour, riding, dash + dash bar, Breath of the Nautilus; camel / camel husk heals
+- [x] Goat long jumps, fish schools, phantoms vs cats, vex charge texture / arms, llama strength + wolves fleeing llamas,
+      ominous item spawners saved with chunks and synced to LAN clients
+
 ## Fixed 2026-11-12 (from the user bug lists; screenshots: c:\Users\Gerbilicious_Dude\Pictures\Screenshots\Screenshot 2026-11-12 <time>.png)
+- [x] Own: snow / surface around structures vs the vanilla save: the snowy village (21, 6) area is now 10150 of 10201
+      columns exact (99.5 %; snow piles were the BlockPile approximation), the rest a 1-block terrain step east of it
+- [x] Occasional stutters when loading chunks and in transparent leaf areas: block ticks due in a tick (fluid flows at
+      cave aquifer edges as chunks load) ran in one frame - 14.6 ms worst seen; they now run in slices over the frames
+      until the next tick (2 ms budget per frame; worst 2.5 ms), the fluid spread search caches states and memoises.
+      Leaf areas measured (windowed, RD12, 1200 frames turning 360 degrees, --gpuprobe --gpuspin): over the dense
+      dappled forest canopy p50 2.0 / p99 3.1 / max 6.0 ms, inside under the canopy p50 1.3 / p99 3.6-5.4 / max 5.7-10.3 ms
+      (GPU max 3.6-4.7 ms) - no repeating stutter left
+- [x] Own: tree parity work - fallen trees now run Java's FallenTreeFeature (stump + decorators, N/E/S/W direction,
+      length - 2 logs placed only if the whole log fits, attached_to_logs mushrooms over Java's HashSet order; ours drew
+      its randoms in another order, shifting every later tree of the chunk), trunk vines 2 in 3 per side (inverted),
+      cocoa in N/E/S/W order; taiga surface columns equal to the vanilla save 77.0 -> 78.3 % (the rest: single trees -
+      one extra / missing tree at the end of a chunk's sequence, not traced further). Fluid ticks measured at 41-205 us
+      per game tick on average, spread over the frames since the slicing: a native port is not needed for frame time
+- [x] Worldgen leaves now get Java's distances (TreeFeature.updateLeaves: breadth-first from logs through leaves, 6
+      steps) in the native decoration pass (+ GDScript twin, --nativecheck decorate 0 differences); a spruce in the
+      vanilla save matches leaf for leaf (distance 1 / 2 ...)
+- [x] (Worldgen) Hand-coded structures (desert pyramid cellar + suspicious sand are in: DesertPyramidPiece.addCellar / afterPlace): swamp hut, jungle temple and desert pyramid now run Java's StructurePiece code (new JavaPieces: orientation transforms + state mirror / rotation, generateBox / selectors, fillColumnDown, reoriented
+      chests, trap dispensers, witch + cat), mineshafts run MineshaftPieces (room with dirt floor + entrances + dome,
+      corridors with supports / torches / cobwebs / rails / chests / cave-spider spawners and log pillars or chains,
+      crossings, stairs, recursive layout, moveBelowSeaLevel / mesa lift, liquid and deep-dark checks);
+      SinglePieceStructure sea-level corner check (also in /locate); /place
+      structure. Nether fortress now runs NetherFortressPieces (all 14 piece types, weighted picks with limits,
+      112-block reach, depth 30, moveInsideHeights 48..70, blaze spawner thrones, wart rooms, chests); structure
+      fences / bars get their connections after generation (Java SHAPE_CHECK_BLOCKS post-processing, also mineshafts);
+      natural spawning uses structure spawn_overrides (fortress enemies incl. wither skeletons, witches / cats in huts,
+      guardians, pillagers, nothing in trial chambers / ancient cities). Stronghold now runs StrongholdPieces (11 weighted pieces + filler corridors, small doors -
+      openings / oak / iron with buttons / grates, forced five-way crossing, library min depth 4 / portal room 5,
+      retries until a portal room exists, moveBelowSeaLevel, bury terrain adaptation, libraries with chandeliers,
+      prison cells, chests, the silverfish spawner and 10 % eyes per frame). Neighbour chunks' features (ore blobs)
+      no longer overwrite structure blocks: a chunk's own writes are applied last at decoration. Ocean monument now
+      runs OceanMonumentPieces (building shell, wings, entrance, roof, pillars to the sea floor, the 5 x 5 x 3 room
+      graph with Java's pruning, 7 room fitters, sponge rooms, gold core, 3 elder guardians, the 29-block ocean
+      surroundings check via native getBiomesWithin). Woodland mansion now generated (see fixed.md)
+- [x] (Build) Copper Age content (wiki Copper Golem / Shelf / Copper Golem Statue): copper golems are built from a copper block +
+      carved pumpkin (the block becomes a copper chest), sort items - up to 16 of the first item from the nearest copper
+      chest, 3 s per chest, into the nearest chest / trapped chest that is empty or holds that item (frontmost empty slot),
+      9 remembered chests, 7 s wander after 10 failures, 65 x 17 x 65 search - oxidise every 504000..552000 ticks, take
+      honeycomb / axe / lightning, show their carried item, and turn into statues (0.58 % / tick when fully oxidised);
+      statues cycle 4 poses, an axe revives an unoxidised one. Shelves: 3 slots shown on the front, click swaps the held
+      item with the slot under the cursor, powered rows of up to 3 (side_chain) swap with the 3 / 6 / 9 rightmost
+      hotbar slots, comparator 1 / 2 / 4 from the back, hoppers fill / empty them. Copper blocks also oxidise now
+      (Java WeatheringCopper random ticks - they never did), axes scrape / unwax and honeycomb waxes all 15 copper
+      families, lightning cleans copper. (Shelf item placement / scale on the front is not on the wiki: 1/4 size centred
+      on each third)
+- [x] GH#17 Water: translucent terrain (water, ice, stained glass) is now blended in sRGB exactly like Java (RD renderer:
+      the scene under it is copied to an 8-bit sRGB target, blended there far-to-near, written back) - the linear-space
+      blend made water over dark floors far too bright and blue; biome water colours come from the 26.3 data (swamp
+      #617b64, warm ocean #43d5ee ... tested) and blend per column
+- [x] GH#13 Fast inventory clicks: a second click within 250 ms on the same slot was swallowed (and on a crafting result
+      it ran pick-all, which Java never does on result slots); every press now clicks like Java
+- [x] GH#12 Chat input now looks and feels like Java's EditBox: shadowed text, "_" caret at the end / 1-px bar inside
+      blinking every 300 ms, Java's inverted selection, displayPos scrolling
+- [x] GH#10 Window / taskbar icon: the installed version's own icons/icon_256x256.png from the asset index (read at run
+      time; the .exe file icon stays Recraft's own - Mojang art is never shipped)
+- [x] GH#9 Item count text one pixel lower than Java's y + 9 (GuiGraphics.renderItemDecorations) - fixed in hotbar and
+      inventories
+- [x] GH#5 Toggle Sneak / Toggle Sprint work (Java ToggleKeyMapping: a key press flips the held state; reset on death)
+- [x] GH#4 Quality presets: picking one now refreshes every option on the Video Settings screen (they applied but the
+      screen kept the old values); changing an option the presets control shows Custom
+- [x] GH#3 Grey grass icons: flat item icons and held / dropped items now apply 26.3's item model tints (grass colormap
+      at 0.5 / 1.0 for short grass, ferns, vines; constants for lily pads; potion / dye defaults); block items' grass
+      tint is the same colormap colour
+- [x] GH#2 Bold text (pack screen headers, game rule categories): each glyph drawn twice with Java's one-pixel wider
+      advance (the whole string was drawn twice, piling the letters together)
+- [x] GH#1 F11 toggles fullscreen on every screen (it only worked in game with the mouse captured)
+- [x] GH#19 Pick block uses Java's clone item (wall torches / signs / banners / heads / fans -> their item, crops ->
+      seeds, wire -> redstone, vine bodies -> tips, potted plants -> the plant, candle cakes -> cake ...); creative puts
+      it in an empty hotbar slot first, survival pulls it from the main inventory
+- [x] GH#18 Selection outlines use Java's code shapes: torches / wall torches, lanterns, flower pots, ladders, rails,
+      signs, banners, heads, candles, rods, repeaters / comparators, daylight detectors, redstone wire
+- [x] GH#24 Floating sand clumps now fall: a block change schedules every gravity block next to it (Java FallingBlock
+      onPlace / updateShape), so a falling block's removal reaches the one above and columns / clumps come down
+- [x] GH#15 Falling sand flicker: the entity was drawn while the old terrain mesh still showed the block (z-fighting)
+      and vanished on landing before the new mesh showed it; it now appears once the mesh without the block is on
+      screen and stays drawn after landing until the mesh with it is
+- [x] GH#21 Blocks can no longer be placed into falling blocks, mobs, TNT, boats, minecarts or armour stands (Java
+      Level.isUnobstructed / blocksBuilding); the 4-tick use cooldown applies to every attempt
+- [x] GH#20 Sand on torches is vanilla (Java FallingBlock.isFree: only air, fire, liquids and replaceable blocks let it
+      fall; sand landing in a torch's space drops as an item) - unchanged
+- [x] GH#7 Cactus flower pops off with its cactus (Java CactusFlowerBlock: #support_override_cactus_flower or a sturdy
+      top); all plants now use 26.3's supports_* block tags (vegetation, dry vegetation, crops, stems, wither rose,
+      azalea, nether plants), leaf litter needs a sturdy floor
+- [x] GH#25 Fall damage: now the wiki formula floor(fall distance - 3 - Jump Boost) with the landing tick counted (it rounded
+      up before, often 1 extra heart); Feather Falling / Protection (and Fire / Blast / Projectile Protection) reduce damage
+      (EPF x 4 %, cap 20); hay / honey x0.2, beds half the distance, pointed dripstone, slow falling, lava halves the
+      fall distance per tick
+- [x] GH#26 Death screen shook wildly: the hurt timer stopped counting while dead, so the hurt camera roll was
+      recomputed from the frame's partial tick every frame; it counts down while dying now (Java baseTick)
+- [x] GH#11 Hunger bar shake: one java.util.Random seeded tickCount x 312871 per tick (Java Gui) instead of a new random
+      offset every frame; hearts and food share it in Java's order
+- [x] GH#16 Creative flight checked against Java Player.travel: 10.89 m/s, sprint 21.78 m/s, drag 0.91 / 0.6 (new tests)
+- [x] GH#8 Values from the wiki: walk 4.317 / sprint 5.612 / sneak 1.295 / flight m/s tested; hand swing 6 ticks, Haste
+      6 - level, Mining Fatigue 6 + 2 x level; item throw velocity with Java's random spread; breaking (GH#6)
+- [x] GH#6 Breaking speeds: hardness + needs-correct-tool for all 1273 blocks from the wiki data (scripts/core/
+      block_hardness.gd; deepslate ores 4.5, iron doors 5, end stone bricks 3 ... were wrong), sword only fast on
+      #sword_efficient (1.5) / bamboo instant / cobweb 15, shears wool 5 / leaves 15 / vines 2, Efficiency for any faster
+      tool, Aqua Affinity, Conduit Power; 5-tick delay after a non-instant break (was none); creative: one break per
+      6 ticks held, nothing with swords / spears / tridents / maces
+- [x] GH#23 Dropping an item swings the arm (Java handleKeybinds)
+- [x] GH#22 Hand lower / raise when the held item changes (Java ItemInHandRenderer heights: 0.4 / tick, swap below 0.1,
+      main hand follows attack strength cubed; off hand too); attack strength resets only on misses / hits
+- [x] Structures didn't clear trees around them (the forest "cobblestone column" was a plains village church): each
+      chunk's trees only saw its own part of a structure, so trees from the neighbouring chunks grew through the
+      other parts (village templates ignore air, so their leaves / trunks stayed inside the houses). Every chunk now
+      sees its neighbours' surface structures before its features run (Java: a chunk decorated after the piece's
+      chunk sees the piece, its trees fail the free-space check and leaves only fill air); parts are placed once and
+      shared. Vanilla save: logs + leaves inside the village pieces 2760 -> 2655 (vanilla 2649) at the taiga village
+- [x] BlockPile feature (village hay / melon / pumpkin / snow / ice piles) now runs Java's BlockPileFeature (2..3 x
+      2..3 ellipse, two layers, dirt-path coin flip, sturdy floor) - a snowy village's trees after a pile now match
+      the vanilla save exactly (they drew different random numbers before)
+- [x] Allay (scripts/entities/allay.gd): Java AllayModel.setupAnim (wing beat from age + walk, forward lean with speed,
+      hover bob, idle arm sway, arms forward holding an item, dance sway + spin; arms are body children now) and the
+      held item between its hands (translateToHand). AllayAi: give one item with the use key / empty hand takes it back
+      (carried stack dropped), owner cannot hurt it, others make it panic; fetches matching items within 32 blocks
+      (x1.75), delivers to the liked player within 64 or a note block heard within 16 (liked 30 s), throwing one item
+      per tick within 3 blocks, 3 s pickup cooldown; stays within 16 of its target (back to 4); idle fly stroll;
+      FlyingMoveControl speeds (flying speed 0.1, friction 0.91 - idle about 2 blocks/s, was 0.7); with / without item
+      ambient sounds; dances while a jukebox plays within 10 blocks; an amethyst shard while dancing duplicates it
+      (6000-tick cooldown, hearts, chime); death drops held + carried items. Probe --allaytest: 10 cobblestone fetched
+      and delivered in 4 s, dirt ignored
+- [x] Jukebox: taking a disc out left it inside (every empty-hand click copied the disc and the record never stopped).
+      Ejecting / breaking now removes it and stops the record; records play for the song's length_in_seconds
+- [x] Structures sank one block into the ground: the terrain around jigsaw pieces was raised one block too high. Java
+      passes each rigid piece a ground level delta down the jigsaw tree (parent delta minus the connection step) and
+      records JigsawJunctions that blend the ground toward path connections (weight 0.4); both ported (Structures
+      _try_children, beard_pieces, native beard case 5). Vanilla save comparison (seed -5039857033059012053, snowy
+      village at chunk 21,6): piece boxes identical, ground heights 4730 -> 5935 of 6140 columns exact, "1 higher"
+      1053 -> 10. Igloos now use Java's corner anchor, per-piece offsets and pivots, piece order and the hatch snow
+      block (all 9 pieces of the chunk -15,11 igloo identical to vanilla)
+- [x] World seed lost precision on reload: JSON read 64-bit seeds as doubles (-5039857033059012053 became
+      -5039857033059011584), so worlds regenerated untouched areas from a different seed. The exact digits are now read
+      back (SaveManager._exact_seed)
+- [x] Feature placement now follows vanilla for the same seed: Java's feature random is WorldgenRandom over Xoroshiro
+      (top bits, java.util.Random formulas: RandomSources.WorldgenXoro, native rng.h WorldgenXoro); feature indices come
+      from Java's FeatureSorter (Features._sort_features); each chunk runs the features of its 3x3 neighbourhood's
+      biomes; trees follow TreeFeature (minimum_size free height, offset per attachment after the trunk, pine radius +
+      nextInt, replaceable_by_trees incl. water, waterlogged leaves); block piles = Java BlockPileFeature; template
+      containers take their loot seed from the structure random. Vanilla save: all 20 diamond ores of a chunk identical,
+      forest ground heights 37 % -> 76 % exact (remaining: an extra pine here and there)
+- [x] Weather never changed blocks: Java tickPrecipitation (1 in 48 per randomTickSpeed per chunk = the wiki's 1/16):
+      still water freezes at cold edges, snow layers build up to snowAccumulationHeight while snowing, rain / snow fill
+      cauldrons (5 % / 10 %). Grass, podzol and mycelium under snow are snowy (worldgen freeze layer + gameplay updates;
+      215504 -> 140 non-snowy columns)
+- [x] Water flow showed late / stopped until a chunk update or the pause menu: every relight remeshed all of the
+      chunk's groups, one per 300 ms through a single update slot, so the group holding the water waited behind the
+      others (change-to-screen up to 3 s). Now only groups whose light changed, all groups of a chunk at once, 50 ms
+      near the player, 2 slots (fluid probe: longest delay 3030 ms -> 161 ms). Mismatched corner heights between groups
+      updated at different times ("lines, odd connections") go with it
+- [x] Thin air layer under every block in water: the water surface under a submerged block (8/9 high) was drawn from
+      below too; Java (FluidState.shouldRenderBackwardUpFace) draws the underside only under open water. Water faces
+      a waterlogged block's own solid side covers are skipped (Java isFaceOccludedBySelf; they z-fought 0.001 behind)
+- [x] Water generated cut off (springs in cliffs, aquifer edges in caves stood as walls): Java ticks generated fluid on
+      load (aquifer post-processing marks, SpringFeature.scheduleTick); now every generated fluid cell next to air /
+      the other fluid gets a tick when its chunk is first decorated (native scan, one chunk per frame)
+- [x] Lava / water: lava turns to obsidian (source) / cobblestone at once when water touches it (Java
+      LiquidBlock.shouldSpreadLiquid on neighbour change / placement, not on the lava's 30-tick tick); poured water no
+      longer replaces a lava source before it reacts; soul soil + blue ice -> basalt; lava fizz sound + smoke as Java;
+      lava flowing onto a waterlogged block only fizzes (was turning it to stone). Fluid walls use the real collision
+      faces of both blocks (Java canPassThroughWall: waterlogged stairs / slabs keep water in on their solid sides);
+      slope search treats waterloggable blocks as walls. Scheduled ticks: all due ticks run (late ticks used to be
+      thrown away every 200 ticks), stale duplicates skipped, ticks saved with their chunk and restored when it loads,
+      only within the simulation distance (Java ticking chunks). Neighbour fluid updates now come from every block change
+- [x] Chat in bed: the in-bed screen is Java's InBedChatScreen (a chat screen): type and Enter sends and stays in bed;
+      Leave Bed / Esc wake up
+- [x] Allays died in one punch and did not heal: flying mobs collected "fall distance" while drifting down and took it
+      as damage the next time they touched a floor (a punch's knockback in a cage). Fall damage now skips the game's
+      entity tag fall_damage_immune (allay, bat, bee, chicken, ...) plus ghast / phantom; water resets the fall
+      distance; allays heal 1 every 10 ticks (2 HP/s); horses / donkeys / mules / llamas / camels 1 in 900 per tick.
+      Outpost allays left their cages (template entity positions lacked Java's +1 transform)
+- [x] Dropped block items (and falling blocks, TNT) were not lit: they used the terrain material at full sky light;
+      now a voxel shader variant takes the light at the entity
+- [x] Eating particles: Java BreakingItemParticle - flat camera-facing 4x4-texel pieces of the item's own sprite
+      (also when an item breaks and for thrown eggs / snowballs)
+- [x] Advancement names in chat: the bracketed name green (task / goal) or dark purple (challenge), the player's name
+      instead of "Player" (toast headers were already yellow / pink)
+- [x] Grass and other plants took half a second to break: plants, flowers, crops, stems, pots fell through to the
+      1.0 default hardness; now Java's instabreak (0) and strengths (cocoa 0.2, chorus 0.4, bamboo sapling 1.0)
+- [x] Leaf culling: with it off, leaves hid faces between same-state leaves (glass-style self-culling) and canopies
+      looked thin and see-through; leaves now draw every face (Java Fancy). Leaf culling (skips faces behind two
+      leaf layers) is now off by default (settings schema 3 turns it off once for existing settings)
+- [x] (Performance) /locate biome took up to tens of seconds and stopped at 2048 blocks: Java findClosestBiome3d is now native
+      (RecraftNative.tg_find_biome: BlockPos.spiralAround column order, Mth.outFromOrigin heights, radius 6400, steps
+      32 / 64, same positions as the GDScript reference): plains 6 ms (was 2.1 s), cherry grove 51 ms (12.3 s), a
+      full 6400-block miss ~1.1 s; biome tags (#minecraft:is_forest), Java messages and 3D distance. Structure stub
+      biome checks use the native single-point lookup (tg_biome_at): /locate structure 0.3-60 ms (stronghold 227 ms
+      once, the ring positions are cached)
+- [x] (Performance) Pressing / did not reliably open the chat with "/" typed in: the command key now also matches any key that types
+      "/" (numpad, other keyboard layouts) and a separate character event cannot add a second "/" (UI test with the
+      US key, Shift+7 layouts and split key / character events: chat opens with exactly "/")
 - [x] (Rendering) Rain cost ~35-75 % FPS [180829]: the 441 column quads shaded ~78 M fragments per frame at 2880x1800
       and discarded 97.5 % of them (rain.png is 2.5 % opaque, snow.png 0.8 %). Each column is now drawn as one small
       quad per vertical run of visible texels (WeatherFX._streak_mesh, 7 texture repeats, u wraps for snow), placed in

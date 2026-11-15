@@ -29,7 +29,14 @@ static func gather(mn: Vector3, mx: Vector3, get_state: Callable, blocks: BlockR
 	var fast := _is_fast(get_state)
 	var key := PackedInt32Array()
 	if fast and cache.size() == 2:
-		key = PackedInt32Array([x0, y0, z0, x1, y1, z1, int(fast_cm.block_epoch)])
+		# the region plus the block versions of the chunks it spans (a global epoch was bumped by every edit / chunk
+		# commit anywhere, so while flying nothing was ever reused)
+		key = PackedInt32Array([x0, y0, z0, x1, y1, z1])
+		var chunks: Dictionary = fast_cm.chunks
+		for cx in range(x0 >> 4, (x1 >> 4) + 1):
+			for cz in range(z0 >> 4, (z1 >> 4) + 1):
+				var c: Chunk = chunks.get((cx << 32) | (cz & 0xFFFFFFFF))
+				key.append(-1 if c == null else (c.bepoch if c.state >= Chunk.DATA_READY else -2 - c.state))
 		if cache[0] == key:
 			return cache[1]
 	var out := PackedFloat32Array()
@@ -69,15 +76,31 @@ static func _gather_cm(x0: int, y0: int, z0: int, x1: int, y1: int, z1: int, blo
 					if y < Coords.MIN_Y or y >= Coords.MAX_Y:
 						st = 0
 					else:
-						st = (c.sections[(y - Coords.MIN_Y) >> 4] as Chunk.Section).get_at(((y & 15) << 8) | (lz << 4) | lx)
+						var sec: Chunk.Section = c.sections[(y - Coords.MIN_Y) >> 4]
+						var pal := sec.pal
+						if pal.size() == 1:
+							st = pal[0]
+						else:
+							var vi := ((y & 15) << 8) | (lz << 4) | lx
+							st = pal[sec.wide[vi]] if sec.wide.size() > 0 else pal[sec.idx[vi]]
 				if st < 0:
-					out.append_array([x, y, z, x + 1, y + 1, z + 1])
+					out.push_back(x)
+					out.push_back(y)
+					out.push_back(z)
+					out.push_back(x + 1)
+					out.push_back(y + 1)
+					out.push_back(z + 1)
 					continue
 				if st == 0 or (flags[st] & BlockRegistry.F_COLLIDE) == 0:
 					continue
 				var b := blocks.get_shape(st)
 				for i in range(0, b.size(), 6):
-					out.append_array([x + b[i], y + b[i + 1], z + b[i + 2], x + b[i + 3], y + b[i + 4], z + b[i + 5]])
+					out.push_back(x + b[i])
+					out.push_back(y + b[i + 1])
+					out.push_back(z + b[i + 2])
+					out.push_back(x + b[i + 3])
+					out.push_back(y + b[i + 4])
+					out.push_back(z + b[i + 5])
 
 
 static func _clip(boxes: PackedFloat32Array, mn: Vector3, mx: Vector3, axis: int, d: float) -> float:

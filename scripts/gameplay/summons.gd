@@ -16,8 +16,8 @@ static func try(world, pos: Vector3i, st: int) -> void:
 	if n == "wither_skeleton_skull" or n == "wither_skeleton_wall_skull":
 		_wither(world, pos)
 	elif n == "carved_pumpkin" or n == "jack_o_lantern":
-		if not _snow_golem(world, pos):
-			_iron_golem(world, pos)
+		if not _snow_golem(world, pos) and not _iron_golem(world, pos):
+			CopperGolem.try_build(world, pos, st)
 
 
 static func _is_base(n: String) -> bool:
@@ -70,7 +70,10 @@ static func _iron_golem(world, pos: Vector3i) -> bool:
 			continue
 		if _n(world, b + Vector3i(0, -1, 0)) != "iron_block":
 			continue
+		# wiki Iron Golem: the spaces above and below each arm must be air
 		if _n(world, b + axis + Vector3i(0, -1, 0)) != "air" or _n(world, b - axis + Vector3i(0, -1, 0)) != "air":
+			continue
+		if _n(world, pos + axis) != "air" or _n(world, pos - axis) != "air":
 			continue
 		world.set_block(pos.x, pos.y, pos.z, 0)
 		for q in [b, b + axis, b - axis, b + Vector3i(0, -1, 0)]:

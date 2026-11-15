@@ -294,6 +294,7 @@ func _draw() -> void:
 	_ensure_overlay()
 	_over_cursor = null
 	_over_tip = []
+	Glint.begin(self, s)
 	draw_dim()
 	draw_set_transform(Vector2.ZERO, 0.0, Vector2(s, s))
 	var o := origin()

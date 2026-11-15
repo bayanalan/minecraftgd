@@ -1,20 +1,29 @@
-## Leads — Java Leashable: use a lead on a leashable mob (not monsters, villagers or fish) to tie it to the player;
+## Leads — Java Leashable: use a lead on a leashable mob (the wiki's list below) to tie it to the player;
 ## right-click a fence while holding mobs to tie them to a knot there; right-click the fence again (or the mob) to
 ## untie (the lead drops). Physics (Java Leashable.tickLeash / legacyElasticRangeLeashBehaviour): beyond 6 blocks the
-## mob is pulled toward the holder, beyond 10 the lead snaps; mobs within range walk toward the holder.
+## mob is pulled toward the holder, beyond 12 the lead snaps (16 for a happy ghast; wiki: Lead); mobs within range walk
+## toward the holder.
 ## Rendering: Java LeashKnot/EntityRenderer.renderLeash - 24 segments, alternating brown shades, sagging curve.
 ## The tie is saved in the mob's data ("leash": "player" or [x, y, z] fence).
+## Boats take leads too (wiki Boat: "Leads can be attached to boats"; a lead does nothing while a player rides it).
 class_name Leads
 extends RefCounted
 
-const UNLEASHABLE := ["villager", "wandering_trader", "bat", "cod", "salmon", "pufferfish", "tropical_fish", "tadpole",
-	"squid", "glow_squid", "ender_dragon", "wither", "warden", "elder_guardian", "guardian", "shulker"]
+# wiki: Lead - the mobs a lead can be used on (wolves / nautiluses / zombie nautiluses only while not hostile)
+const LEASHABLE := ["allay", "armadillo", "axolotl", "bee", "camel", "camel_husk", "cat", "chicken", "copper_golem", "cow",
+	"dolphin", "donkey", "fox", "frog", "glow_squid", "goat", "happy_ghast", "hoglin", "horse", "iron_golem", "llama",
+	"mooshroom", "mule", "nautilus", "ocelot", "parrot", "pig", "polar_bear", "rabbit", "sheep", "skeleton_horse", "sniffer",
+	"snow_golem", "squid", "strider", "sulfur_cube", "trader_llama", "wolf", "zoglin", "zombie_horse", "zombie_nautilus"]
 
 static var _mesh: MeshInstance3D = null
 
 
 static func leashable(e) -> bool:
-	return e.kind == "mob" and not e.dead and str(e.def.get("kind", "")) != "hostile" and not (e.id in UNLEASHABLE)
+	if e.kind == "boat" and not e.dead:
+		return true
+	if e.kind != "mob" or e.dead or not (e.id in LEASHABLE):
+		return false
+	return not (e.id in ["wolf", "nautilus", "zombie_nautilus"] and e.angry)
 
 
 static func holder_pos(em, e) -> Variant:
@@ -60,7 +69,7 @@ static func use_on_fence(world, pos: Vector3i) -> bool:
 	var p: Player = world.player
 	var tied := false
 	for e in em.ents:
-		if e.kind == "mob" and not e.dead and str(e.data.get("leash", "")) == "player" and e.pos.distance_to(p.pos) < 7.0:
+		if (e.kind == "mob" or e.kind == "boat") and not e.dead and str(e.data.get("leash", "")) == "player" and e.pos.distance_to(p.pos) < 7.0:
 			e.data["leash"] = [pos.x, pos.y, pos.z]
 			tied = true
 	if tied:
@@ -80,7 +89,7 @@ static func use_on_fence(world, pos: Vector3i) -> bool:
 static func tick(em) -> void:
 	var b := Res.blocks
 	for e in em.ents:
-		if e.kind != "mob" or not e.data.has("leash"):
+		if (e.kind != "mob" and e.kind != "boat") or not e.data.has("leash"):
 			continue
 		if e.dead:
 			_drop(em, e)
@@ -97,13 +106,17 @@ static func tick(em) -> void:
 			continue
 		var to: Vector3 = (hp as Vector3) - (e.pos + Vector3(0, e.h * 0.5, 0))
 		var d := to.length()
-		if d > 10.0:
+		# wiki: Lead - a lead stretches at most 12 blocks (16 for a happy ghast) before it snaps
+		if d > (16.0 if e.id == "happy_ghast" else 12.0):
 			_drop(em, e)
 			Audio.play("entity.leash_knot.break", e.pos, "Neutral")
 			continue
-		if d > 6.0:
+		if e.kind == "boat" and em.world.player.vehicle == e:
+			continue   # (wiki Boat: the lead does nothing while a player rides)
+		var free := 10.0 if e.id == "happy_ghast" else 6.0   # wiki: Lead - happy ghasts roam freely within 10 blocks
+		if d > free:
 			var n := to / d
-			e.vel += Vector3(n.x * absf(n.x), n.y * absf(n.y), n.z * absf(n.z)) * 0.4 * ((d - 6.0) / 4.0 + 0.25)
+			e.vel += Vector3(n.x * absf(n.x), n.y * absf(n.y), n.z * absf(n.z)) * 0.4 * ((d - free) / 4.0 + 0.25)
 		elif d > 2.0 and str(l) == "player":
 			e.target_pos = hp
 			e.has_target = true
@@ -113,7 +126,7 @@ static func tick(em) -> void:
 static func render(em) -> void:
 	var any := false
 	for e in em.ents:
-		if e.kind == "mob" and e.data.has("leash") and not e.dead:
+		if (e.kind == "mob" or e.kind == "boat") and e.data.has("leash") and not e.dead:
 			any = true
 			break
 	if not any:
@@ -134,13 +147,13 @@ static func render(em) -> void:
 	im.clear_surfaces()
 	var drawn := 0
 	for e0 in em.ents:
-		if e0.kind == "mob" and e0.data.has("leash") and not e0.dead and holder_pos(em, e0) != null:
+		if (e0.kind == "mob" or e0.kind == "boat") and e0.data.has("leash") and not e0.dead and holder_pos(em, e0) != null:
 			drawn += 1
 	if drawn == 0:
 		return
 	im.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
 	for e in em.ents:
-		if e.kind != "mob" or not e.data.has("leash") or e.dead:
+		if (e.kind != "mob" and e.kind != "boat") or not e.data.has("leash") or e.dead:
 			continue
 		var hp = holder_pos(em, e)
 		if hp == null:

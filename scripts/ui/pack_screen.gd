@@ -82,16 +82,26 @@ func _layout() -> void:
 func _draw_head(l: McList, available: bool) -> void:
 	var s := l.gs()
 	var t := Res.tr_key("pack.available.title" if available else "pack.selected.title", "Available" if available else "Selected")
-	var tw := McList.text_w(t) + 1.0
+	# Java bold: every glyph drawn twice (1 px apart) and its advance one pixel wider - drawing the whole string twice
+	# without the wider advance piled the letters onto each other
+	var tw := McList.text_w(t) + float(t.length())
 	var x := floorf((200.0 - tw) / 2.0)
 	var y := 3.0 - l.scroll
 	if y + 9.0 < 0:
 		return
 	var f := UiKit.font()
-	for dx in [0.0, 1.0]:   # Java bold: second pass 1 px right
-		if Settings.get_v("text_shadow"):
-			l.draw_string(f, Vector2(x + dx + 1, y + 8) * s, t, HORIZONTAL_ALIGNMENT_LEFT, -1, int(8 * s), Color(0.25, 0.25, 0.25))
-		l.draw_string(f, Vector2(x + dx, y + 7) * s, t, HORIZONTAL_ALIGNMENT_LEFT, -1, int(8 * s), Color(1, 1, 1))
+	for layer_i in [0, 1]:   # shadows first, then the text (Java draws the shadow layer under the whole string)
+		if layer_i == 0 and not Settings.get_v("text_shadow"):
+			continue
+		var gx := x
+		for ch in t:
+			var adv := f.get_string_size(ch, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
+			for dx in [0.0, 1.0]:
+				if layer_i == 0:
+					l.draw_string(f, Vector2(gx + dx + 1, y + 8) * s, ch, HORIZONTAL_ALIGNMENT_LEFT, -1, int(8 * s), Color(0.25, 0.25, 0.25))
+				else:
+					l.draw_string(f, Vector2(gx + dx, y + 7) * s, ch, HORIZONTAL_ALIGNMENT_LEFT, -1, int(8 * s), Color(1, 1, 1))
+			gx += adv + 1.0
 	l.draw_rect(Rect2(Vector2(x, y + 8) * s, Vector2(tw, 1) * s), Color(1, 1, 1))   # underline
 
 

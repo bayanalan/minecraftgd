@@ -147,22 +147,37 @@ static func _centered(tpl_loc: String, base: Vector3i, rot: int) -> Vector3i:
 
 # ------------------------------------------------------------------ template structures
 
+## Java IglooStructure / IglooPieces: start at the chunk's corner (y 90 before the height fix), Rotation.getRandom;
+## half the igloos get a basement - laboratory (n*3 down) then n - 1 ladder sections - and the igloo itself last. Each
+## piece has its own offset and rotation pivot; IglooPiece.postProcess moves every piece by WORLD_SURFACE_WG - 91,
+## read at the one column that all three map to (template point (3, 0, 0) of the top piece).
+const IGLOO_OFF := {"igloo/top": Vector3i(0, 0, 0), "igloo/middle": Vector3i(2, -3, 4), "igloo/bottom": Vector3i(0, -3, -2)}
+const IGLOO_PIVOT := {"igloo/top": Vector3i(3, 5, 5), "igloo/middle": Vector3i(1, 3, 1), "igloo/bottom": Vector3i(3, 6, 7)}
+
 static func _igloo(st: Structures, sc: Vector2i, r: RandomSources.LegacyRandom) -> Dictionary:
+	var start := Vector3i(sc.x * 16, 90, sc.y * 16)
 	var rot := r.next_int_bound(4)
-	var cx := sc.x * 16 + 8
-	var cz := sc.y * 16 + 8
-	var y := st.first_free_height(cx, cz) - 1
-	var top := _centered("igloo/top", Vector3i(cx, y, cz), rot)
-	# Java IglooPieces: BlockIgnoreProcessor.STRUCTURE_BLOCK only -> template air is placed (hollows the room /
-	# ladder shaft out of the terrain)
-	var pieces: Array = [_tpl_piece("igloo/top", top, rot, [], false)]
+	var hp := start + StructureTemplate.transform(Vector3i(3, 0, 0), rot, IGLOO_PIVOT["igloo/top"])
+	var dy := st.first_free_height(hp.x, hp.z) - 90 - 1
+	var pieces: Array = []
 	if r.next_double() < 0.5:
 		var n := r.next_int_bound(8) + 4
-		var lad := top + StructureTemplate.transform(Vector3i(3, 0, 5), rot)
+		pieces.append(_igloo_piece("igloo/bottom", start, rot, n * 3, dy))
 		for j in n - 1:
-			pieces.append(_tpl_piece("igloo/middle", lad + Vector3i(-1, -3 - j * 3, -1), rot, [], false))
-		pieces.append(_tpl_piece("igloo/bottom", lad + StructureTemplate.transform(Vector3i(-3, 0, -7), rot) + Vector3i(0, -3 - n * 3, 0), rot, [], false))
-	return _pieces_result(_with_markers(pieces, "igloo"), Vector3i(cx, y, cz))
+			pieces.append(_igloo_piece("igloo/middle", start, rot, j * 3, dy))
+	pieces.append(_igloo_piece("igloo/top", start, rot, 0, dy))
+	return _pieces_result(_with_markers(pieces, "igloo"), start + Vector3i(8, dy, 8))
+
+
+static func _igloo_piece(loc: String, start: Vector3i, rot: int, down: int, dy: int) -> Dictionary:
+	var tpl := StructureTemplate.get_template(loc)
+	if tpl == null:
+		return {}
+	var pos: Vector3i = start + IGLOO_OFF[loc] + Vector3i(0, dy - down, 0)
+	var pivot: Vector3i = IGLOO_PIVOT[loc]
+	# BlockIgnoreProcessor.STRUCTURE_BLOCK only: template air is placed (hollows the room / shaft out of the terrain)
+	var el := {"t": "single", "loc": loc, "legacy": false, "proj": "rigid", "procs": [], "pivot": pivot}
+	return {"el": el, "pos": pos, "rot": rot, "box": tpl.box_m(pos, rot, 0, pivot)}
 
 
 const SHIP_OCEAN := ["shipwreck/with_mast", "shipwreck/sideways_full", "shipwreck/sideways_fronthalf", "shipwreck/sideways_backhalf", "shipwreck/rightsideup_full",

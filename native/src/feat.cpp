@@ -62,7 +62,7 @@ struct Rules {
 	const double *pf = nullptr;
 	const int32_t *st_block = nullptr;
 	int64_t n_states = 0;
-	bool test(int node, int st, int py, Xoroshiro &r) const {
+	bool test(int node, int st, int py, WorldgenXoro &r) const {
 		const int32_t *q = ri + node * 4;
 		switch (q[0]) {
 			case RT_TRUE: return true;
@@ -97,7 +97,7 @@ struct Rules {
 struct Kernel {
 	Region rg;
 	Rules ru;
-	Xoroshiro r;
+	WorldgenXoro r;   // Java WorldgenRandom(XoroshiroRandomSource)
 	const int32_t *targets = nullptr;
 	int ntargets = 0;
 	double discard = 0.0;

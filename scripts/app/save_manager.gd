@@ -79,8 +79,27 @@ static func _dir_size(p: String) -> int:
 static func _read_json_safe(p: String) -> Dictionary:
 	if not FileAccess.file_exists(p):
 		return {}
-	var j = JSON.parse_string(FileAccess.get_file_as_string(p))
-	return j if j is Dictionary else {}
+	var txt := FileAccess.get_file_as_string(p)
+	var j = JSON.parse_string(txt)
+	if not (j is Dictionary):
+		return {}
+	_exact_seed(j, txt)
+	return j
+
+
+## JSON numbers parse as doubles: a 64-bit world seed beyond 2^53 lost its low bits on every load (the world
+## generated from a rounded seed, not the vanilla one: e.g. -5039857033059012053 became -5039857033059011584). The
+## file holds the exact digits: take the "seed" number whose value rounds to the parsed one.
+static func _exact_seed(j: Dictionary, txt: String) -> void:
+	var sv = j.get("seed")
+	if not (sv is float or sv is int):
+		return
+	var rx := RegEx.create_from_string("\"seed\"\\s*:\\s*(-?\\d+)")
+	for m in rx.search_all(txt):
+		var v := m.get_string(1).to_int()
+		if float(v) == float(sv):
+			j["seed"] = v
+			return
 
 
 static func atomic_write(p: String, data: PackedByteArray) -> bool:
@@ -398,6 +417,8 @@ static func apply_chunk_data(c: Chunk, d: Dictionary, blocks: BlockRegistry) -> 
 			pal.append(st)
 		var sec: Chunk.Section = c.sections[s]
 		sec.pal = pal
+		sec.rs = -1
+		sec.rt = -1
 		sec.wide = PackedInt32Array()
 		sec.idx = PackedByteArray()
 		if pal.size() > 1:

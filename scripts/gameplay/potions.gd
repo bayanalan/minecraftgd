@@ -27,6 +27,46 @@ const EFFECTS := {
 	"wind_charged": [["wind_charged", 0, 3600]], "weaving": [["weaving", 0, 3600]], "oozing": [["oozing", 0, 3600]], "infested": [["infested", 0, 3600]],
 }
 
+# wiki Effect colors (Java): effect -> RGB; potions without effects (water, awkward ...) #385DC6
+const EFFECT_COLORS := {
+	"speed": 0x33EBFF, "slowness": 0x8BAFE0, "haste": 0xD9C043, "mining_fatigue": 0x4A4217, "strength": 0xFFC700,
+	"instant_health": 0xF82423, "instant_damage": 0xA9656A, "jump_boost": 0xFDFF84, "nausea": 0x551D4A, "regeneration": 0xCD5CAB,
+	"resistance": 0x9146F0, "fire_resistance": 0xFF9900, "water_breathing": 0x98DAC0, "invisibility": 0xF6F6F6, "blindness": 0x1F1F23,
+	"night_vision": 0xC2FF66, "hunger": 0x587653, "weakness": 0x484D48, "poison": 0x87A363, "wither": 0x736156,
+	"health_boost": 0xF87D23, "absorption": 0x2552A5, "saturation": 0xF82423, "glowing": 0x94A061, "levitation": 0xCEFFFF,
+	"luck": 0x59C106, "unluck": 0xC0A44D, "slow_falling": 0xF3CFB9, "conduit_power": 0x1DC2D1, "dolphins_grace": 0x88A3BE,
+	"bad_omen": 0x0B6138, "hero_of_the_village": 0x44FF44, "darkness": 0x292721, "trial_omen": 0x16A6A6, "raid_omen": 0xDE4058,
+	"wind_charged": 0xBDC9FF, "weaving": 0x78695A, "oozing": 0x99FFA3, "infested": 0x8C9B8C,
+}
+
+
+## A potion's colour: its effects' colours averaged, weighted by amplifier + 1 (the weighting is not on the wiki: Java
+## PotionContents); no effects -> #385DC6 (wiki Effect colors: water bottle).
+static func color_of(potion: String) -> Color:
+	var efs: Array = EFFECTS.get(potion, [])
+	if efs.is_empty():
+		return Color8(0x38, 0x5D, 0xC6)
+	var acc := Vector3.ZERO
+	var wsum := 0.0
+	for e in efs:
+		var c := int(EFFECT_COLORS.get(str(e[0]), 0x385DC6))
+		var wt := float(int(e[1]) + 1)
+		acc += Vector3((c >> 16) & 255, (c >> 8) & 255, c & 255) * wt
+		wsum += wt
+	acc /= wsum * 255.0
+	return Color(acc.x, acc.y, acc.z)
+
+
+## True when every effect of the potion is instant (healing / harming): lingering clouds use the instant potency 1/2,
+## otherwise the duration scale 1/4 (wiki Area Effect Cloud).
+static func all_instant(potion: String) -> bool:
+	var efs: Array = EFFECTS.get(potion, [])
+	for e in efs:
+		if str(e[0]) != "instant_health" and str(e[0]) != "instant_damage":
+			return false
+	return not efs.is_empty()
+
+
 # [from, ingredient, to]
 const MIXES := [
 	["water", "glowstone_dust", "thick"], ["water", "redstone", "mundane"], ["water", "nether_wart", "awkward"],
@@ -165,14 +205,16 @@ static func step(d: Dictionary) -> bool:
 
 
 ## Apply a potion's effects (scale < 1 for splash distance; instant effects scale the amount).
+## wiki Splash Potion: instant effects scale linearly with distance; other effects keep their level, their duration
+## scales and is rounded to the nearest tick, and nothing applies at 1 second (20 ticks) or less.
 static func apply(p: Player, potion: String, scale: float = 1.0) -> void:
 	for e in EFFECTS.get(potion, []):
 		var id: String = e[0]
 		if id == "instant_health":
-			p.health = minf(p.max_health, p.health + float(4 << int(e[1])) * scale)
+			p.heal(float(4 << int(e[1])) * scale)
 		elif id == "instant_damage":
 			p.hurt(float(6 << int(e[1])) * scale, "magic", true)
 		else:
-			var ticks := int(float(e[2]) * scale)
+			var ticks := roundi(float(e[2]) * scale)
 			if ticks > 20:
 				p.add_effect(id, int(e[1]), ticks)

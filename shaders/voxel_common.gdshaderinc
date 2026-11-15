@@ -16,12 +16,20 @@ global uniform sampler2D mc_lightmap;   // Java 26.3 lightmap texture (WorldMana
 
 #include "res://shaders/viewmodel.gdshaderinc"
 #include "res://shaders/mc_fog.gdshaderinc"
+#ifdef ITEM_LIGHT
+// block models of entities (dropped block items, falling blocks, TNT, minecart contents, held blocks): the light at
+// the entity (sky, block 0..1) set per instance like entity.gdshader; default full sky light
+instance uniform vec2 light = vec2(1.0, 0.0);
+#endif
 
 void vertex() {
 	v_light = CUSTOM0;
+#ifdef ITEM_LIGHT
+	v_light.zw = light;
+#endif
 	v_color = COLOR;
 	v_rel = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz - CAMERA_POSITION_WORLD;
-	v_lm = textureLod(mc_lightmap, (vec2(CUSTOM0.w, CUSTOM0.z) * 15.0 + 0.5) / 16.0, 0.0).rgb;
+	v_lm = textureLod(mc_lightmap, (vec2(v_light.w, v_light.z) * 15.0 + 0.5) / 16.0, 0.0).rgb;
 	VM_POSITION
 }
 

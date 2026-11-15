@@ -81,6 +81,40 @@ struct Xoroshiro {
 	bool next_bool() { return (next_long() & 1) != 0; }
 };
 
+// Java WorldgenRandom over a XoroshiroRandomSource (feature / structure piece placement; RandomSources.WorldgenXoro):
+// next(bits) = (int)(xoroshiro.nextLong() >>> 64 - bits), every other call java.util.Random's formula over next(bits).
+struct WorldgenXoro {
+	int64_t lo = 0, hi = 0;
+	int64_t raw() {
+		uint64_t l = (uint64_t)lo, m = (uint64_t)hi;
+		uint64_t s = l + m;
+		uint64_t n = ((s << 17) | (s >> 47)) + l;
+		m ^= l;
+		lo = (int64_t)(((l << 49) | (l >> 15)) ^ m ^ (m << 21));
+		hi = (int64_t)((m << 28) | (m >> 36));
+		return (int64_t)n;
+	}
+	int64_t next(int bits) {
+		int64_t v = (int64_t)(((uint64_t)raw()) >> (64 - bits));
+		return bits == 32 ? to_i32(v) : v;
+	}
+	int64_t next_int() { return next(32); }
+	int64_t next_int_bound(int64_t bound) {
+		if ((bound & -bound) == bound) return (bound * next(31)) >> 31;
+		int64_t bits, val;
+		while (true) {
+			bits = next(31);
+			val = bits % bound;
+			if (bits - val + (bound - 1) < 0x80000000LL) break;
+		}
+		return val;
+	}
+	int64_t next_long() { int64_t a = next(32); int64_t b = next(32); return wadd((int64_t)((uint64_t)a << 32), b); }
+	double next_double() { int64_t a = next(26); int64_t b = next(27); return (double)((a << 27) + b) * 1.1102230246251565e-16; }
+	double next_float() { return (double)next(24) * 5.9604645e-8; }
+	bool next_bool() { return next(1) != 0; }
+};
+
 // Positional factory: Xoroshiro (lo, hi) or legacy (seed). at() returns a generator of either kind.
 struct AnyRandom {
 	bool legacy = false;

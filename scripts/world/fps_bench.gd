@@ -181,11 +181,11 @@ static func run(w) -> void:
 	RenderingServer.viewport_set_measure_render_time(vp_rid, not w.autoplay.has("nomeasure"))
 	if w.autoplay.has("time"):   # fixed time of day for sky / lighting screenshots (daylight cycle frozen)
 		w.day_time = int(w.autoplay["time"])
-		w.gamerules["doDaylightCycle"] = false
+		w.gamerules["advance_time"] = false
 	if w.autoplay.has("rain"):   # --rain=1: rain all run (weather cost: precipitation columns, splashes, sky)
 		w.raining = true
 		w.rain = 1.0
-		w.gamerules["doWeatherCycle"] = false
+		w.gamerules["advance_weather"] = false
 	if w.autoplay.has("hold"):   # held item for view-model checks (A screenshots)
 		w.player.inventory.set_slot(w.player.inventory.selected, ItemStack.named(str(w.autoplay["hold"]), 1))
 	FrameProbe.busy_us = int(w.autoplay.get("busy", "0"))
@@ -268,6 +268,12 @@ static func run(w) -> void:
 	summary["memory_static_mb"] = snappedf(Performance.get_monitor(Performance.MEMORY_STATIC) / 1048576.0, 0.1)
 	summary["video_mem_mb"] = snappedf(Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0, 0.1)
 	summary["entities"] = w.entities.ents.size() if w.entities != null else -1
+	if w.entities != null:   # what the entities are (kind:id / item name -> count)
+		var cz := {}
+		for ce in w.entities.ents:
+			var ck: String = ce.kind + ":" + (ce.stack.name() if ce.stack != null else ce.id)
+			cz[ck] = int(cz.get(ck, 0)) + 1
+		summary["entity_census"] = cz
 	var f := FileAccess.open(dir + "/summary.json", FileAccess.WRITE)
 	f.store_string(JSON.stringify(summary, "  "))
 	f.close()

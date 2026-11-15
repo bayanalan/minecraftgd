@@ -5,15 +5,17 @@
 class_name ItemRegistry
 extends RefCounted
 
+# material -> [mining tier (0 = hand), mining efficiency, durability, attack damage bonus] (wiki: Tiers)
 const TIERS := {
 	"wooden": [1, 2.0, 59, 0.0], "stone": [2, 4.0, 131, 1.0], "copper": [2, 5.0, 190, 1.0], "iron": [3, 6.0, 250, 2.0],
 	"diamond": [4, 8.0, 1561, 3.0], "golden": [1, 12.0, 32, 0.0], "netherite": [5, 9.0, 2031, 4.0],
 }
 # tool kind -> [base attack damage, attack speed]
 const TOOL_KIND := {"sword": [3.0, 1.6], "pickaxe": [1.0, 1.2], "axe": [6.0, 0.9], "shovel": [1.5, 1.0], "hoe": [0.0, 1.0], "spear": [2.0, 1.0]}
+# material -> [head, chest, legs, feet armor points, durability multiplier, toughness, knockback resistance] (wiki: Armor materials)
 const ARMOR := {
-	"leather": [1, 3, 2, 1, 5, 0.0], "chainmail": [1, 5, 4, 1, 15, 0.0], "copper": [2, 4, 3, 1, 11, 0.0], "iron": [2, 6, 5, 2, 15, 0.0],
-	"golden": [2, 5, 3, 1, 7, 0.0], "diamond": [3, 8, 6, 3, 33, 2.0], "netherite": [3, 8, 6, 3, 37, 3.0], "turtle": [2, 0, 0, 0, 25, 0.0],
+	"leather": [1, 3, 2, 1, 5, 0.0, 0.0], "chainmail": [2, 5, 4, 1, 15, 0.0, 0.0], "copper": [2, 4, 3, 1, 11, 0.0, 0.0], "iron": [2, 6, 5, 2, 15, 0.0, 0.0],
+	"golden": [2, 5, 3, 1, 7, 0.0, 0.0], "diamond": [3, 8, 6, 3, 33, 2.0, 0.0], "netherite": [3, 8, 6, 3, 37, 3.0, 0.1], "turtle": [2, 0, 0, 0, 25, 0.0, 0.0],
 }
 const FOOD := {
 	"apple": [4, 2.4], "bread": [5, 6.0], "beef": [3, 1.8], "cooked_beef": [8, 12.8], "porkchop": [3, 1.8], "cooked_porkchop": [8, 12.8],
@@ -47,6 +49,7 @@ var attack_speed := PackedFloat32Array()
 var armor_slot := PackedInt32Array()     # -1 none, 0 feet 1 legs 2 chest 3 head
 var armor_points := PackedInt32Array()
 var armor_tough := PackedFloat32Array()
+var armor_kb := PackedFloat32Array()      # knockback resistance per piece (netherite 0.1)
 var food_nutrition := PackedInt32Array()
 var food_saturation := PackedFloat32Array()
 
@@ -70,6 +73,7 @@ func _add(name: String, model: String, blocks: BlockRegistry) -> void:
 	var aslot := -1
 	var apts := 0
 	var atough := 0.0
+	var akb := 0.0
 	for k in TOOL_KIND:
 		if name.ends_with("_" + k):
 			var mat := name.trim_suffix("_" + k)
@@ -87,6 +91,10 @@ func _add(name: String, model: String, blocks: BlockRegistry) -> void:
 				elif k == "hoe":
 					ad = 1.0
 					aspd = {"wooden": 1.0, "stone": 2.0, "copper": 2.0, "iron": 3.0, "golden": 1.0, "diamond": 4.0, "netherite": 4.0}.get(mat, 1.0)
+				elif k == "spear":
+					# wiki: Spear (Java tooltip "N Attack Damage" and attack speed per tier)
+					ad = {"wooden": 1.0, "stone": 2.0, "copper": 2.0, "iron": 3.0, "golden": 1.0, "diamond": 4.0, "netherite": 5.0}.get(mat, 1.0)
+					aspd = {"wooden": 1.54, "stone": 1.33, "copper": 1.18, "iron": 1.05, "golden": 1.05, "diamond": 0.95, "netherite": 0.87}.get(mat, 1.0)
 				stack = 1
 	var slots := ["boots", "leggings", "chestplate", "helmet"]
 	for si in 4:
@@ -98,6 +106,7 @@ func _add(name: String, model: String, blocks: BlockRegistry) -> void:
 				apts = [a[3], a[2], a[1], a[0]][si] if mat2 != "turtle" else 2
 				dmg = int(a[4]) * [13, 15, 16, 11][si]
 				atough = a[5]
+				akb = a[6]
 				stack = 1
 	if name in ["shears"]:
 		kind = "shears"; dmg = 238; stack = 1
@@ -119,9 +128,16 @@ func _add(name: String, model: String, blocks: BlockRegistry) -> void:
 		dmg = 500; stack = 1; ad = 6.0; aspd = 0.6
 	elif name == "brush":
 		dmg = 64; stack = 1
-	elif name.ends_with("_bucket") and name != "bucket" or name.ends_with("_boat") or name.ends_with("_raft") or name.ends_with("minecart") or name.ends_with("_horse_armor") or name.ends_with("_stew") or name == "beetroot_soup" or name.begins_with("music_disc") or name == "saddle" or name == "totem_of_undying" or name.ends_with("potion") or name == "cake" or name.ends_with("_bed") or name == "writable_book" or name == "enchanted_book" or name == "spyglass" or name == "debug_stick" or name.ends_with("_shulker_box") or name == "shulker_box" or name == "knowledge_book" or name == "bundle" or name.ends_with("_bundle") or name == "goat_horn" or name.ends_with("_harness") or name.ends_with("_nautilus_armor") or name == "wolf_armor":
+	elif name == "carrot_on_a_stick":
+		dmg = 25; stack = 1   # wiki: Durability
+	elif name == "warped_fungus_on_a_stick":
+		dmg = 100; stack = 1   # wiki: Durability
+	elif name == "wolf_armor":
+		dmg = 64; stack = 1   # wiki: Wolf Armor
+	elif name.ends_with("_bucket") and name != "bucket" or name.ends_with("_boat") or name.ends_with("_raft") or name.ends_with("minecart") or name.ends_with("_horse_armor") or name.ends_with("_stew") or name == "beetroot_soup" or name.begins_with("music_disc") or name == "saddle" or name == "totem_of_undying" or name.ends_with("potion") or name == "cake" or name.ends_with("_bed") or name == "writable_book" or name == "enchanted_book" or name == "spyglass" or name == "debug_stick" or name.ends_with("_shulker_box") or name == "shulker_box" or name == "knowledge_book" or name == "bundle" or name.ends_with("_bundle") or name == "goat_horn" or name.ends_with("_harness") or name.ends_with("_nautilus_armor") or name.ends_with("_banner_pattern"):
 		stack = 1
-	elif STACK16.has(name) or name.ends_with("_sign") or name.ends_with("_hanging_sign") or name.ends_with("_banner") or name.ends_with("_egg") and not name.ends_with("spawn_egg") and name != "dragon_egg":
+	elif STACK16.has(name) or name.ends_with("_sign") or name.ends_with("_hanging_sign") or name.ends_with("_banner"):
+		# eggs via STACK16 (egg / blue_egg / brown_egg); turtle and sniffer eggs stack to 64 (wiki: Turtle Egg, Sniffer Egg)
 		stack = 16
 	max_stack.append(stack)
 	max_damage.append(dmg)
@@ -133,6 +149,7 @@ func _add(name: String, model: String, blocks: BlockRegistry) -> void:
 	armor_slot.append(aslot)
 	armor_points.append(apts)
 	armor_tough.append(atough)
+	armor_kb.append(akb)
 	var f: Array = FOOD.get(name, [0, 0.0])
 	food_nutrition.append(int(f[0]))
 	food_saturation.append(float(f[1]))

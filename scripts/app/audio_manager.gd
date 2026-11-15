@@ -20,7 +20,8 @@ var _music_event := ""
 var missing := 0
 var played := 0
 var subtitles: Array = []         # [{text, pos, time}]
-var listener_pos := Vector3.ZERO
+var listener_pos := Vector3.ZERO   # world coordinates (the camera)
+var origin := Vector3.ZERO         # world -> scene offset (ChunkManager origin rebasing; the camera lives in scene space)
 var rng := RandomNumberGenerator.new()
 
 
@@ -123,6 +124,11 @@ func play(event: String, pos: Vector3, bus: String = "Blocks", volume: float = 1
 	var d := _resolve(event)
 	if d.is_empty():
 		return
+	# Java: a sound reaches a player only within its range (attenuation distance x max(volume, 1)) - culled here before
+	# the file is loaded (distant mob ambience used to stall frames loading sounds nobody could hear)
+	var rng_dist: float = float(d["dist"]) * maxf(1.0, volume)
+	if listener_pos.distance_squared_to(pos) > rng_dist * rng_dist:
+		return
 	var st := _stream_for(d["name"])
 	if st == null:
 		return
@@ -135,8 +141,11 @@ func play(event: String, pos: Vector3, bus: String = "Blocks", volume: float = 1
 		best = _pool3[rng.randi() % _pool3.size()]
 	best.stream = st
 	best.bus = bus
-	best.global_position = pos
+	best.global_position = pos - origin
+	# wiki: Sounds.json - range attenuation_distance (16) x max(volume, 1): a louder sound (thunder 10000, explosions 4)
+	# carries proportionally farther instead of only being clamped to full volume
 	best.max_distance = d["dist"] * maxf(1.0, volume)
+	best.unit_size = 4.0 * maxf(1.0, volume)
 	best.volume_db = linear_to_db(clampf(d["volume"] * volume, 0.0, 1.0))
 	best.pitch_scale = clampf(d["pitch"] * pitch, 0.5, 2.0)
 	best.play()
@@ -181,13 +190,14 @@ func set_music_context(ctx: String) -> void:
 		_music_timer = 3.0
 
 
-## Java-like gaps: menu 20..600 ticks, game 6000..24000 ticks (min/max delay), creative 1200..3600.
+## Gaps between tracks (seconds): menu 1..30 s (wiki: Music); in game the 26.3 minecraft:audio/background_music
+## min_delay / max_delay of the dimension / biome: 12000..24000 ticks for game, creative, underwater, Nether and
+## Overworld biome music (wiki: Music "10 to 20 minutes"), 6000..24000 ticks in the End.
 func _gap_for(ctx: String) -> float:
 	match ctx:
 		"menu": return rng.randf_range(1.0, 30.0)
-		"creative": return rng.randf_range(60.0, 180.0)
-		"underwater": return rng.randf_range(60.0, 180.0)
-	return rng.randf_range(300.0, 1200.0)
+		"end", "music.end": return rng.randf_range(300.0, 1200.0)
+	return rng.randf_range(600.0, 1200.0)
 
 
 func _process(delta: float) -> void:
@@ -229,3 +239,10 @@ func now_playing() -> String:
 func stop_music() -> void:
 	_music.stop()
 	_music_timer = _gap_for(music_context)
+
+
+## Stops the positional sounds of a bus playing at a point (an ejected jukebox record).
+func stop_at(pos: Vector3, bus: String) -> void:
+	for p in _pool3:
+		if p.playing and p.bus == bus and p.global_position.distance_to(pos) < 0.75:
+			p.stop()

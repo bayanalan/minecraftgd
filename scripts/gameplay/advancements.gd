@@ -106,7 +106,8 @@ func _award(id: String) -> void:
 		var head := {"goal": "Goal Reached!", "challenge": "Challenge Complete!"}.get(fr, "Advancement Made!")
 		world.hud.toast(head, d["title"], d["icon"], Color8(255, 136, 255) if fr == "challenge" else Color8(255, 255, 0))
 		var verb := {"goal": "has reached the goal", "challenge": "has completed the challenge"}.get(fr, "has made the advancement")
-		world.hud.chat_message("Player %s [%s]" % [verb, d["title"]])
+		# chat.type.advancement.<frame>: the name in brackets, green (task / goal) or dark purple (challenge)
+		world.hud.chat_message("%s %s [%s]" % [Taming.owner_name(), verb, d["title"]], "", Color8(0xAA, 0x00, 0xAA) if fr == "challenge" else Color8(0x55, 0xFF, 0x55))
 		if fr == "challenge":
 			Audio.play_ui("ui.toast.challenge_complete")
 
@@ -177,7 +178,7 @@ func _matches(kind: String, cond, ctx: Dictionary) -> bool:
 						if et2 is String and str(et2).trim_prefix("minecraft:") != str(ctx.get("entity", "")):
 							return false
 			return true
-		"consume_item":
+		"consume_item", "filled_bucket":
 			var it = cond.get("item", null)
 			if it is Dictionary and it.has("items"):
 				return _item_match(it["items"], str(ctx.get("item", "")))
@@ -197,6 +198,18 @@ func _matches(kind: String, cond, ctx: Dictionary) -> bool:
 			if s.contains("\"structures\"") and not s.contains(str(ctx.get("structure", "~"))):
 				return false
 			return s.contains("\"dimension\"") or s.contains("\"biomes\"") or s.contains("\"structures\"")
+		"entity_hurt_player":
+			# damage predicate: blocked + damage type tags (26.3 story/deflect_arrow: blocked #is_projectile)
+			var dmg = cond.get("damage", null)
+			if dmg is Dictionary:
+				if dmg.has("blocked") and bool(dmg["blocked"]) != bool(ctx.get("blocked", false)):
+					return false
+				var dt = dmg.get("type", null)
+				if dt is Dictionary:
+					for tg in dt.get("tags", []):
+						if tg is Dictionary and str(tg.get("id", "")).trim_prefix("#").trim_prefix("minecraft:") == "is_projectile" and bool(tg.get("expected", true)) != bool(ctx.get("projectile", false)):
+							return false
+			return true
 		"tick":
 			return true
 		"impossible":

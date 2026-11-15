@@ -5,13 +5,15 @@ shader_type spatial;
 render_mode unshaded, cull_disabled, depth_draw_opaque, blend_mix;
 
 uniform sampler2DArray blocks_tex : filter_nearest, source_color;
+global uniform float mc_partial;
 #include "res://shaders/mc_fog.gdshaderinc"
 varying vec3 v_rel;
 varying flat float v_layer;
 
 void vertex() {
-	vec3 center = (MODEL_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
-	float s = length(MODEL_MATRIX[0].xyz);
+	// per-tick instance data (Particles._build_terrain): [3] = position, [2] = previous - position, [0].x = size
+	vec3 center = MODEL_MATRIX[3].xyz + MODEL_MATRIX[2].xyz * (1.0 - mc_partial);
+	float s = MODEL_MATRIX[0].x;
 	vec3 right = INV_VIEW_MATRIX[0].xyz;
 	vec3 up = INV_VIEW_MATRIX[1].xyz;
 	vec3 w = center + (right * VERTEX.x + up * VERTEX.y) * s;

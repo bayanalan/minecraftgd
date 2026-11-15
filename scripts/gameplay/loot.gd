@@ -406,6 +406,34 @@ static func _cond(c, ctx: Dictionary) -> bool:
 	return true
 
 
+## Item predicate of a filtered modifier: "items" (id / list / tag) must match; each "predicates" / "components" key must
+## be present on the stack (the 26.3 tables only test minecraft:map_id {} - "has a map").
+static func _item_filter(f, s: ItemStack) -> bool:
+	if not (f is Dictionary) or s.is_empty():
+		return not s.is_empty()
+	var its = f.get("items")
+	if its is String:
+		var nm := str(its)
+		if nm.begins_with("#"):
+			if not Tags.items(nm).has(s.name()):
+				return false
+		elif nm.trim_prefix("minecraft:") != s.name():
+			return false
+	elif its is Array and not (its as Array).is_empty():
+		var hit := false
+		for n in its:
+			hit = hit or str(n).trim_prefix("minecraft:") == s.name()
+		if not hit:
+			return false
+	for key in ["predicates", "components"]:
+		var pr = f.get(key)
+		if pr is Dictionary:
+			for k in pr:
+				if not s.components.has("minecraft:" + str(k).trim_prefix("minecraft:")):
+					return false
+	return true
+
+
 static func _apply_fn(fn: Dictionary, s: ItemStack, ctx: Dictionary) -> ItemStack:
 	if not _conds(_entry_conds(fn), ctx):
 		return s
@@ -469,7 +497,53 @@ static func _apply_fn(fn: Dictionary, s: ItemStack, ctx: Dictionary) -> ItemStac
 						s.components[str(comp)] = v
 		"set_ominous_bottle_amplifier":
 			s.components["minecraft:ominous_bottle_amplifier"] = _int(fn.get("amplifier", 0), ctx)
-		"enchant_randomly", "enchant_with_levels", "set_components", "set_name", "set_lore", "copy_state", "set_stew_effect", "set_potion", "exploration_map", "set_instrument", "furnace_smelt":
+		"set_potion":
+			# Java SetPotionFunction: the potion_contents component (trial chamber consumables, ominous item drops)
+			s.components["minecraft:potion_contents"] = {"potion": "minecraft:" + str(fn.get("id", "water")).trim_prefix("minecraft:")}
+		"set_enchantments":
+			# Java SetEnchantmentsFunction: levels (number providers) set or, with add, added to the item's enchantments
+			var en: Dictionary = Enchanting.get_enchants(s)
+			var want = fn.get("enchantments", {})
+			if want is Dictionary:
+				for k in want:
+					var key := "minecraft:" + str(k).trim_prefix("minecraft:")
+					var lv := _int(want[k], ctx) + (int(en.get(key, 0)) if bool(fn.get("add", false)) else 0)
+					if lv > 0:
+						en[key] = lv
+					else:
+						en.erase(key)
+			Enchanting.set_enchants(s, en)
+		"set_components":
+			# Java SetComponentsFunction: data components merged in ("!id" removes one) - trims on trial equipment
+			var comps = fn.get("components", {})
+			if comps is Dictionary:
+				for k in comps:
+					var ck := str(k)
+					if ck.begins_with("!"):
+						s.components.erase("minecraft:" + ck.substr(1).trim_prefix("minecraft:"))
+					else:
+						s.components["minecraft:" + ck.trim_prefix("minecraft:")] = comps[k]
+		"exploration_map":
+			# Java ExplorationMapFunction on a map item (chest loot: buried treasure / camp maps): the search runs async
+			# from the container (ExplorerMaps.begin_at); without a world generator the map stays unset (and "filtered"
+			# below discards it, as Java does when nothing is found)
+			var org = ctx.get("origin")
+			if org is Vector3:
+				var mid := ExplorerMaps.begin_at(fn, org, ctx.get("container"))
+				if mid >= 0:
+					s.components["minecraft:map_id"] = mid
+		"filtered":
+			# 26.x filtered modifier: item_filter (items / component predicates - present) -> on_pass / on_fail modifiers
+			var mods = fn.get("on_pass" if _item_filter(fn.get("item_filter", {}), s) else "on_fail")
+			if mods is Dictionary:
+				mods = [mods]
+			if mods is Array:
+				for m in mods:
+					if m is Dictionary and not s.is_empty():
+						s = _apply_fn(m, s, ctx)
+		"discard":
+			s.clear()
+		"enchant_randomly", "enchant_with_levels", "set_name", "set_lore", "copy_state", "set_stew_effect", "set_instrument", "furnace_smelt":
 			if tp == "furnace_smelt" and ctx.get("on_fire", false):
 				var r := Crafting.smelt_result(s.item)
 				if r != null:

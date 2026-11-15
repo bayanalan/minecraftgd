@@ -563,23 +563,74 @@ func biome_at_block(ctx: DensityFunctions.Ctx, x: int, y: int, z: int) -> int:
 	return int(biome_ids.get(nm, 0))
 
 
-## Java ChunkGenerator.findClosestBiome3d: rings of step blocks out to radius, y levels out from y every 64.
-func find_biome(bid: int, x: int, y: int, z: int, radius: int = 2048, step: int = 32) -> Vector3i:
+## Java Mth.outFromOrigin(y, lo, hi, step): y, y + step, y - step, y + 2 step, ... within [lo, hi]; empty when y is
+## outside.
+static func out_from_origin(y: int, lo: int, hi: int, step: int) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	if y < lo or y > hi:
+		return out
+	var i := y
+	while true:
+		out.append(i)
+		var n := absi(y - i)
+		var below := i <= y
+		var nxt := y + n + step
+		if not below or y + n + step > hi:
+			var o := y - n - (step if below else 0)
+			if o >= lo:
+				nxt = o
+		i = nxt
+		var m := absi(y - i)
+		if not (y - m >= lo or y + m <= hi):
+			break
+	return out
+
+
+var last_found_biome := -1   # biome id of the last find_biome hit (/locate biome with a tag)
+var native_find := true      # false: the GDScript reference search (--biomecheck compares both)
+
+
+## Java ChunkGenerator.findClosestBiome3d (/locate biome: radius 6400, step 32, vertical step 64): columns in
+## BlockPos.spiralAround order, at each the heights out from y; the first quart biome in `ids` wins. Native when the
+## generator has its multi-noise biome source (RecraftNative.tg_find_biome, the same order and sampling).
+func find_biome(bid, x: int, y: int, z: int, radius: int = 6400, step: int = 32, vstep: int = 64) -> Vector3i:
+	var ids: Array = bid if bid is Array else [bid]
+	var ys := out_from_origin(y, gen_min_y + 1, gen_min_y + gen_depth, vstep)
+	if ys.is_empty():
+		return Vector3i(0, -999999, 0)
+	var size := floori(float(radius) / step)
+	if native_find and native_tg >= 0 and Native.density_ok and not end_biomes and Native.inst.has_method("tg_find_biome"):
+		var want := PackedByteArray()
+		var top := 0
+		for i in ids:
+			top = maxi(top, int(i) + 1)
+		want.resize(top)
+		for i2 in ids:
+			want[int(i2)] = 1
+		var r: Array = Native.inst.tg_find_biome(native_tg, want, x, z, ys, size, step)
+		if int(r[0]) == 1:
+			last_found_biome = int(r[4])
+			return Vector3i(int(r[1]), int(r[2]), int(r[3]))
+		if int(r[0]) == 0:
+			return Vector3i(0, -999999, 0)
 	var ctx := DensityFunctions.Ctx.new(dfc.node_count())
-	var ys: Array = [clampi(y, gen_min_y + 1, gen_min_y + gen_depth)]
-	for k in range(1, gen_depth / 64 + 1):
-		for s in [1, -1]:
-			var yy: int = y + s * k * 64
-			if yy > gen_min_y and yy <= gen_min_y + gen_depth:
-				ys.append(yy)
-	for ring in range(0, radius / step + 1):
-		for dz in range(-ring, ring + 1):
-			for dx in range(-ring, ring + 1):
-				if maxi(absi(dx), absi(dz)) != ring:
-					continue
-				for yy in ys:
-					if biome_at_block(ctx, x + dx * step, yy, z + dz * step) == bid:
-						return Vector3i(x + dx * step, yy, z + dz * step)
+	var dirs := [Vector2i(1, 0), Vector2i(0, 1), Vector2i(-1, 0), Vector2i(0, -1)]
+	var total := (2 * size + 1) * (2 * size + 1)
+	var c := Vector2i.ZERO
+	var leg := 0
+	var li := 0
+	for e in total:
+		if e > 0:
+			c += dirs[leg & 3]
+			li += 1
+			if li >= leg / 2 + 1:
+				li = 0
+				leg += 1
+		for yy in ys:
+			var fb := biome_at_block(ctx, x + c.x * step, yy, z + c.y * step)
+			if ids.has(fb):
+				last_found_biome = fb
+				return Vector3i(x + c.x * step, yy, z + c.y * step)
 	return Vector3i(0, -999999, 0)
 
 

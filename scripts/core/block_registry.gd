@@ -26,12 +26,13 @@ const F_TINT_WATER := 32768
 const F_LAVA := 65536
 const F_FLAMMABLE := 131072
 const F_FULL_SHAPE := 262144  # collision shape is a full unit cube
-const F_SELF_CULL := 524288   # same-state faces cull each other (glass, leaves fast)
+const F_SELF_CULL := 524288   # same-state faces cull each other (glass, ice; not leaves: Java draws every leaf face)
 const F_LEAVES := 1048576
 const F_TINT_CONST := 2097152
 const F_TINT_DRY := 4194304     # Java BlockColors: BiomeColors.getAverageDryFoliageColor (leaf litter)
 const F_NO_AO := 8388608        # flat lighting (Java: model "ambientocclusion": false, or the block emits light)
 const F_SOLID := 16777216       # Java BlockState.isSolid (legacy): collision bounds' mean size >= 0.7291666 or height >= 1
+const F_TREE_REPL := 33554432   # Java TreeFeature.validTreePos: air or #replaceable_by_trees (Features.setup sets it from the tag)
 
 var names := PackedStringArray()
 var block_index: Dictionary = {}
@@ -435,6 +436,8 @@ static func extra_props(name: String, info: Dictionary, props: Dictionary) -> vo
 			extra = {"enabled": ["true", "false"]}
 		"lectern", "bell":
 			extra = {"powered": ["false", "true"]}
+		"tripwire":
+			extra = {"powered": ["false", "true"], "disarmed": ["false", "true"]}   # (Java TripWireBlock; no model uses them)
 		"tnt":
 			extra = {"unstable": ["false", "true"]}
 		"scaffolding":
@@ -443,8 +446,8 @@ static func extra_props(name: String, info: Dictionary, props: Dictionary) -> vo
 			extra = {"age": _range(16)}
 		"kelp", "twisting_vines", "weeping_vines", "cave_vines":
 			extra = {"age": _range(26)}
-	if name.ends_with("_sapling") or name == "mangrove_propagule":
-		extra["stage"] = ["0", "1"]
+	if name.ends_with("_sapling") or name == "mangrove_propagule" or name == "bamboo":
+		extra["stage"] = ["0", "1"]   # (bamboo: 1 = stopped growing)
 	# block-entity-rendered blocks: their blockstate JSON is a single particle-only variant
 	var four := ["north", "south", "west", "east"]
 	if name == "chest" or name == "trapped_chest" or name.ends_with("copper_chest"):
@@ -662,8 +665,8 @@ func _add_state(b: int, name: String, info: Dictionary, bs: Dictionary, sp: Dict
 		if max_class == 0:
 			flags |= F_OPAQUE
 			cull = 63
-		else:
-			flags |= F_SELF_CULL
+		elif not name.ends_with("_leaves"):
+			flags |= F_SELF_CULL   # (Java: glass / ice / grates hide faces against themselves; leaves draw every face)
 	elif nq > 0 and liquid == "":
 		flags |= F_MODEL
 		for qi in nq:
@@ -683,7 +686,7 @@ func _add_state(b: int, name: String, info: Dictionary, bs: Dictionary, sp: Dict
 		flags |= F_TRANSLUCENT
 	if liquid == "water":
 		flags |= F_TRANSLUCENT | F_TINT_WATER
-	if name.contains("glass") or name.ends_with("_leaves") or name in ["ice", "slime_block", "honey_block"]:
+	if name.contains("glass") or name in ["ice", "slime_block", "honey_block"]:
 		flags |= F_SELF_CULL
 	# collision
 	var shape_boxes := PackedFloat32Array()
@@ -708,6 +711,10 @@ func _add_state(b: int, name: String, info: Dictionary, bs: Dictionary, sp: Dict
 			shape_boxes = PackedFloat32Array()
 		if name == "soul_sand" or name == "mud":
 			shape_boxes = PackedFloat32Array([0, 0, 0, 1, 0.875, 1])
+		elif name == "mangrove_roots":
+			shape_boxes = PackedFloat32Array([0, 0, 0, 1, 1, 1])   # (full collision; its model is crossed planes - wiki Waterlogging: no flow out of it)
+		elif not jo.is_empty() and (name.ends_with("_skull") or (name.ends_with("_head") and name != "piston_head")):
+			shape_boxes = jo   # (heads have no block model: Java SkullBlock / WallSkullBlock shapes, not the default box)
 		elif name == "farmland" or name == "dirt_path":
 			shape_boxes = PackedFloat32Array([0, 0, 0, 1, 0.9375, 1])
 		elif name == "snow":
@@ -747,8 +754,12 @@ func _add_state(b: int, name: String, info: Dictionary, bs: Dictionary, sp: Dict
 	if sp.get("lit", "") == "true":
 		if name.contains("furnace") or name == "smoker":
 			emit = 13
-		elif name == "redstone_lamp" or name.ends_with("copper_bulb"):
+		elif name == "redstone_lamp":
 			emit = 15
+		elif name.ends_with("copper_bulb"):
+			# wiki Light / Copper Bulb: 15 / 12 / 8 / 4 by oxidation (waxed the same)
+			var bn := name.trim_prefix("waxed_")
+			emit = 12 if bn.begins_with("exposed_") else (8 if bn.begins_with("weathered_") else (4 if bn.begins_with("oxidized_") else 15))
 		elif name.contains("redstone_ore"):
 			emit = 9
 		elif name.contains("candle"):
@@ -757,6 +768,15 @@ func _add_state(b: int, name: String, info: Dictionary, bs: Dictionary, sp: Dict
 		emit = 0
 	if name == "light":
 		emit = int(sp.get("level", "15"))
+	# wiki Light: respawn anchor floor(charges / 4 x 15) = 0 / 3 / 7 / 11 / 15; vault 12 while active / unlocking /
+	# ejecting, 6 inactive; trial spawner 8 active / ejecting, 4 waiting for players, 0 inactive / cooldown
+	if name == "respawn_anchor":
+		emit = int(floor(int(sp.get("charges", "0")) / 4.0 * 15.0))
+	if name == "vault":
+		emit = 6 if sp.get("vault_state", "inactive") == "inactive" else 12
+	if name == "trial_spawner":
+		var ts := str(sp.get("trial_spawner_state", "inactive"))
+		emit = 4 if ts == "waiting_for_players" else (8 if ts in ["active", "waiting_for_reward_ejection", "ejecting_reward"] else 0)
 	if name == "sea_pickle":
 		emit = 3 + 3 * int(sp.get("pickles", "1")) if sp.get("waterlogged", "false") == "true" else 0
 	if name.ends_with("cave_vines") or name.ends_with("cave_vines_plant"):

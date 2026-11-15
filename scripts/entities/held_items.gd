@@ -11,7 +11,9 @@
 class_name HeldItems
 extends RefCounted
 
-const RANDOM_WEAPON_MOBS := ["zombie", "husk", "drowned", "zombie_villager"]
+## mobs whose attack value excludes the weapon: the held weapon adds its attack damage (wiki Piglin: golden sword 8 on
+## Normal vs 5 unarmed)
+const RANDOM_WEAPON_MOBS := ["zombie", "husk", "drowned", "zombie_villager", "piglin"]
 
 
 static func equip(e, rng: RandomNumberGenerator, difficulty: int) -> void:
@@ -31,7 +33,8 @@ static func equip(e, rng: RandomNumberGenerator, difficulty: int) -> void:
 		"wither_skeleton":
 			main = "stone_sword"
 		"piglin":
-			main = "crossbow" if rng.randf() < 0.5 else "golden_sword"
+			if e.baby_age >= 0:   # wiki Piglin: babies never spawn with weapons
+				main = "crossbow" if rng.randf() < 0.5 else "golden_sword"
 		"piglin_brute":
 			main = "golden_axe"
 		"zombified_piglin":
@@ -56,17 +59,34 @@ static func attack_bonus(e) -> float:
 	if h == "" or Res.items == null:
 		return 0.0
 	var id: int = Res.items.id(h)
-	return maxf(0.0, float(Res.items.attack_damage[id]) - 1.0) if id > 0 else 0.0
+	var b := maxf(0.0, float(Res.items.attack_damage[id]) - 1.0) if id > 0 else 0.0
+	var sh := ench(e, "sharpness")
+	if sh > 0:
+		b += 0.5 * sh + 0.5   # wiki Sharpness (Java): +0.5 x level + 0.5
+	return b
+
+
+## Enchantment level on the mob's main-hand item (e.data["held_stack"]: equipment rolled from a loot table, e.g. the
+## ominous trial weapons - Sharpness / Knockback swords, Power / Punch bows).
+static func ench(e, id: String) -> int:
+	var hs = e.data.get("held_stack")
+	if not (hs is Dictionary) or not (hs as Dictionary).has("components"):
+		return 0
+	var en = (hs["components"] as Dictionary).get("minecraft:enchantments", {})
+	return int(en.get("minecraft:" + id, 0)) if en is Dictionary else 0
 
 
 static func drops(em, e, by_player: bool) -> void:
-	if not by_player:
+	if not by_player or e.data.has("no_equip_drop"):
 		return
 	for key in ["held", "offhand"]:
 		var nm := str(e.data.get(key, ""))
 		if nm == "" or em.rng.randf() >= 0.085:
 			continue
+		var hsd = e.data.get("held_stack") if key == "held" else null
 		var s := ItemStack.named(nm, 1)
+		if hsd is Dictionary and str(hsd.get("id", "")).trim_prefix("minecraft:") == nm and int(hsd.get("count", 1)) == 1:
+			s = ItemStack.from_dict(hsd)   # (keeps its enchantments)
 		var md: int = Res.items.max_damage[s.item]
 		if md > 0:
 			s.damage = md - em.rng.randi_range(0, em.rng.randi_range(0, maxi(md - 3, 1)))

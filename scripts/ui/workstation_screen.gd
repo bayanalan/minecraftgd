@@ -137,6 +137,9 @@ func on_changed() -> void:
 				result = r["result"]
 				cost = r["cost"]
 				use_right = r["use_right"]
+				# wiki: Anvil_mechanics - renaming alone is capped at 39 levels; anything above 39 is Too Expensive
+				if (inp[1] as ItemStack).is_empty() and cost >= 40:
+					cost = 39
 				if cost >= 40 and not p.is_creative():
 					result = ItemStack.new()
 		"grindstone":
@@ -221,6 +224,9 @@ func take_output(_i: int, all: bool) -> void:
 			if name_edit != null:
 				name_edit.text = ""
 		"grindstone":
+			var gxp := _grindstone_xp()
+			if gxp > 0:
+				world.entities.spawn_xp(Vector3(pos) + Vector3(0.5, 0.5, 0.5), gxp)
 			inp[0] = ItemStack.new()
 			inp[1] = ItemStack.new()
 			Audio.play("block.grindstone.use", Vector3(pos), "Blocks")
@@ -248,6 +254,26 @@ func take_output(_i: int, all: bool) -> void:
 				inp[k2] = ck if ck.count > 0 else ItemStack.new()
 			Audio.play("ui.cartography_table.take_result", Vector3(pos), "Blocks")
 	on_changed()
+
+
+## wiki: Grindstone - experience: a uniform random amount between 50 % and 100 % (rounded up) of the summed minimum
+## levels of every non-curse enchantment on the inputs.
+func _grindstone_xp() -> int:
+	var total := 0
+	for k in 2:
+		var s: ItemStack = inp[k]
+		if s.is_empty():
+			continue
+		var e := Enchanting.get_enchants(s)
+		for id in e:
+			var d: Dictionary = Enchanting.defs.get(id, {})
+			if d.is_empty() or bool(d.get("curse", false)):
+				continue
+			total += Enchanting._cost(int(d["min_b"]), int(d["min_p"]), int(e[id]))
+	if total <= 0:
+		return 0
+	var half := ceili(total / 2.0)
+	return half + world.rng.randi_range(0, half - 1)
 
 
 func _damage_anvil() -> void:

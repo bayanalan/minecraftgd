@@ -3,7 +3,8 @@
 ##   drag 0.98, ground friction 0.7 with -0.5 bounce, power 4 explosion; TNT caught in an explosion primes with
 ##   a 10-29 tick fuse.
 ## - Fishing hook (Java FishingHook): cast vector from the player's rotation (0.6 / |v| + triangular jitter),
-##   gravity 0.03, drag 0.92, floats in water; lure wait 100-600 ticks (-100 per Lure level), approach 20-80 ticks,
+##   gravity 0.03, drag 0.92, floats in water; lure wait 100-600 ticks (-100 per Lure level; ~20 % shorter in rain,
+##   ~doubled without open sky), approach 20-80 ticks,
 ##   bite window 20-40 ticks; reeling during a bite rolls the installed gameplay/fishing loot table, pulls the
 ##   catch toward the player and gives 1-6 XP; rod durability -1 (catch) / -2 (snagged on ground).
 ## - Item frames / glow item frames (item + 8 rotations), paintings (largest installed painting variant that fits
@@ -76,7 +77,9 @@ static func tick_tnt(em, e, gs: Callable, blocks: BlockRegistry) -> void:
 	e.fuse -= 1
 	if e.fuse <= 0:
 		em._remove(e)
-		em.explode(e.pos + Vector3(0, 0.0625, 0), 4.0, em.world.gamerule("tntExplodes", true))
+		# wiki: TNT - power 4, the explosion 0.06125 (0.98 / 16) above the entity's position; wiki: Explosion - blocks
+		# destroyed by TNT always drop (tnt_explosion_drop_decay)
+		em.explode(e.pos + Vector3(0, 0.06125, 0), 4.0, em.world.gamerule("tntExplodes", true), false, em.world.gamerule("tntExplosionDropDecay", false))
 
 
 # ------------------------------------------------------------------ fishing
@@ -177,9 +180,28 @@ static func _fish_tick(em, e, d: Dictionary) -> void:
 	if int(d["lure"]) <= 0:
 		d["lure"] = maxi(20, em.rng.randi_range(100, 600) - int(d.get("lure_lvl", 0)) * 100)
 		return
-	d["lure"] = int(d["lure"]) - 1
+	# wiki: Fishing - rain on the bobber shortens the wait by ~20 %, no direct sky about doubles it, rain without sky
+	# lengthens it by ~33.3 %: the wait drops 1 per tick, +1 with a 1/4 chance in rain, -1 with a 1/2 chance without sky
+	# (average rates 1.25 / 0.5 / 0.75)
+	var step := 1
+	var above: Vector3 = e.pos + Vector3(0, 1, 0)
+	if em.rng.randf() < 0.25 and em.world.weather_at(above) == "rain":
+		step += 1
+	if em.rng.randf() < 0.5 and not _sees_sky(em.world, above):
+		step -= 1
+	d["lure"] = int(d["lure"]) - step
 	if int(d["lure"]) <= 0:
 		d["hooked"] = em.rng.randi_range(20, 80)
+
+
+## Open to the sky at p (the chunk heightmap, as WorldManager.weather_at uses it).
+static func _sees_sky(world, p: Vector3) -> bool:
+	var x := floori(p.x)
+	var z := floori(p.z)
+	var ch = world.cm.get_chunk(x >> 4, z >> 4)
+	if ch == null or ch.heightmap.is_empty():
+		return true
+	return floori(p.y) >= int(ch.heightmap[(x & 15) + (z & 15) * 16])
 
 
 ## Java FishingHook.calculateOpenWater: the 5x4x5 area around the hook (y -1..2) must be layers of only water sources
@@ -374,6 +396,42 @@ static func _frame_n(e) -> Vector3i:
 	return Vector3i(int(n_a[0]), int(n_a[1]), int(n_a[2]))
 
 
+## Java HangingEntity bounding box: 1/16 thick along its facing, its width x height across it (frames 12 x 12 px).
+static func hanging_box(e) -> Array:
+	var n := _frame_n(e)
+	var c: Vector3 = e.pos + (Vector3(0, e.h * 0.5, 0) if e.kind == "painting" else Vector3(0, 0.375, 0))
+	var hw: float = e.w * 0.5
+	var hh: float = e.h * 0.5
+	var t := 1.0 / 32.0
+	var ext := Vector3(hw, t, hh) if n.y != 0 else (Vector3(t, hh, hw) if n.x != 0 else Vector3(hw, hh, t))
+	return [c - ext, c + ext]
+
+
+## A projectile hit a painting / item frame (Java HangingEntity.hurt / ItemFrame.hurt): a frame holding an item drops
+## the item first, otherwise the entity breaks and drops itself - nothing drops when the shooter is a Creative player.
+static func projectile_break(em, e, shooter) -> void:
+	var creative: bool = shooter is Player and (shooter as Player).is_creative()
+	if e.kind == "frame":
+		if not e.stack.is_empty():
+			if Maps.map_id(e.stack) >= 0:
+				Maps.frame_removed(em.world, frame_cell(e), e.stack)
+			var it: ItemStack = e.stack
+			e.stack = ItemStack.new()
+			_refresh_frame(em, e)
+			Audio.play("entity.item_frame.remove_item", e.pos, "Blocks")
+			if not creative:
+				em.spawn_item(e.pos + Vector3(0, 0.4, 0), it)
+			return
+		Audio.play("entity.item_frame.break", e.pos, "Blocks")
+		if not creative:
+			em.spawn_item(e.pos + Vector3(0, 0.4, 0), ItemStack.named(e.id, 1))
+	else:
+		Audio.play("entity.painting.break", e.pos, "Blocks")
+		if not creative:
+			em.spawn_item(e.pos + Vector3(0, 0.4, 0), ItemStack.named("painting", 1))
+	em._remove(e)
+
+
 static func _refresh_frame(em, e) -> void:
 	var spr: Sprite3D = e.node.get_node("item")
 	spr.texture = ItemIcons.icon(e.stack.item) if not e.stack.is_empty() else null
@@ -484,6 +542,13 @@ static func attack(em, e, p: Player) -> void:
 			if p.vehicle == e:
 				Taming.dismount(em, p)
 		"armor_stand":
+			# wiki Armor Stand: broken by quickly attacking it twice (a first hit only wobbles it; the window, 5 ticks,
+			# and the one-hit Creative break are Java's ArmorStand.hurt); hit sound entity.armor_stand.hit
+			var now: int = em.world.game_time
+			if not p.is_creative() and now - int(e.rt.get("last_hit", -100)) > 5:
+				e.rt["last_hit"] = now
+				Audio.play("entity.armor_stand.hit", e.pos, "Blocks")
+				return
 			drops.append(ItemStack.named("armor_stand", 1))
 			for a in e.data.get("armor", []):
 				if a is Dictionary and not a.is_empty():
@@ -594,6 +659,7 @@ static func spawn_stand(em, at: Vector3, yaw: float, armor: Array):
 	e.body_yaw = yaw
 	e.w = 0.5
 	e.h = 1.975
+	e.hp = 20.0   # wiki: Armor Stand - 20 HP (Java)
 	e.persistent = true
 	e.data = {"armor": armor if armor.size() == 4 else [{}, {}, {}, {}]}
 	e.node = EntityRenderer.build_rig({"tex": "entity/armorstand/wood", "tex_size": [64, 64], "parts": STAND_PARTS})
@@ -675,3 +741,139 @@ static func deser(em, d: Dictionary) -> void:
 			spawn_stand(em, Vector3(p[0], p[1], p[2]), float(d.get("y", 0.0)), dd.get("armor", []))
 		"cushion":
 			spawn_cushion(em, Vector3(p[0], p[1], p[2]), float(d.get("y", 0.0)), str(d.get("id", "white_cushion")))
+
+
+# ------------------------------------------------------------------ area effect clouds
+
+## Java AreaEffectCloud (wiki Area Effect Cloud / Lingering Potion / Dragon Fireball):
+## - lingering potion: radius 3 shrinking to 0 over 30 s (600 ticks, -3 / 600 per tick), nobody affected during the
+##   first second (wait 20), each affected entity shrinks it by 1/2 block and cuts 5 s (100 ticks) off its life; timed
+##   effects at 1/4 of the potion's duration, instant ones at 1/2 potency; an entity can be affected again after the
+##   reapplication delay (20 ticks; the delay and the 5-tick check interval are Java's defaults, not on the wiki);
+##   0.5 tall; gone below radius 0.5; drawn as the potion's coloured effect particles (no model)
+## - dragon fireball: Instant Damage II as a lingering Harming II, grows instead of shrinking and does not shrink on
+##   use (wiki; the growth 3 -> 7 over its 600 ticks is Java's DragonFireball, not on the wiki); purple
+## - dragon perch breath: a 5-6 block disc for 3 s, harmful core of 3-4 blocks at 3 HP per second (wiki Dragon
+##   Fireball: Perching breath attack)
+static func spawn_cloud(em, at: Vector3, potion: String, kind: String = "potion"):
+	if Net.is_client() and not Net.applying:
+		return null
+	var e := EntityManager.Ent.new()
+	e.kind = "cloud"
+	e.id = kind
+	e.pos = at
+	e.prev = at
+	e.w = 6.0
+	e.h = 0.5
+	var d := {"r": 3.0, "rpt": -3.0 / 600.0, "dur": 600, "wait": 20, "ron": -0.5, "don": -100, "delay": 20, "pot": potion}
+	match kind:
+		"dragon":
+			d["pot"] = "strong_harming"
+			d["rpt"] = (7.0 - 3.0) / 600.0
+			d["ron"] = 0.0
+			d["don"] = 0
+			d["wait"] = 0
+		"breath":
+			d["pot"] = ""
+			d["rpt"] = 0.0
+			d["dur"] = 60
+			d["wait"] = 0
+			d["ron"] = 0.0
+			d["don"] = 0
+	var col := Color(0.6, 0.15, 0.85) if kind != "potion" else Potions.color_of(potion)
+	e.rt["col"] = col
+	e.rt["vic"] = {}
+	e.data = d
+	em.ents.append(e)
+	return e
+
+
+static func tick_cloud(em, e, p: Player) -> void:
+	var d: Dictionary = e.data
+	var r := float(d["r"])
+	var waiting: bool = e.age < int(d["wait"])
+	_cloud_particles(em, e, 0.2 if waiting else r, waiting)
+	if e.age >= int(d["wait"]) + int(d["dur"]):
+		em._remove(e)
+		return
+	if waiting:
+		return
+	var rpt := float(d["rpt"])
+	if rpt != 0.0:
+		r += rpt
+		if r < 0.5:
+			em._remove(e)
+			return
+		d["r"] = r
+	if e.age % 5 != 0:
+		return
+	var vic: Dictionary = e.rt["vic"]
+	for k in vic.keys():
+		if int(vic[k]) <= e.age:
+			vic.erase(k)
+	var pot := str(d["pot"])
+	var breath: bool = e.id == "breath"
+	var reach := 1.75 if breath else r   # (breath: the 3-4 block harmful core of the wiki)
+	var targets: Array = []
+	if p != null and not p.dead and not p.is_spectator() and _in_cloud(e, reach, p.aabb_min(), p.aabb_max()):
+		targets.append(p)
+	for o in em.ents:
+		if o.kind == "mob" and not o.dead and o.death_time == 0 and o.id != "ender_dragon" and o.id != "armor_stand":
+			if _in_cloud(e, reach, Vector3(o.pos.x - o.w / 2.0, o.pos.y, o.pos.z - o.w / 2.0), Vector3(o.pos.x + o.w / 2.0, o.pos.y + o.h, o.pos.z + o.w / 2.0)):
+				targets.append(o)
+	if pot == "" and not breath:
+		return   # (water / awkward ...: particles only)
+	var scale := 0.5 if Potions.all_instant(pot) else 0.25
+	for t in targets:
+		if vic.has(t):
+			continue
+		vic[t] = e.age + (20 if breath else int(d["delay"]))
+		if breath:
+			if t is Player:
+				(t as Player).hurt(3.0, "dragon_breath", true)
+			else:
+				em._damage(t, 3.0, null, "magic")
+		elif t is Player:
+			Potions.apply(t, pot, scale)
+		else:
+			MobBehaviors.apply_potion(em, t, pot, scale)
+		var ron := float(d["ron"])
+		if ron != 0.0:
+			r += ron
+			d["r"] = r
+			if r < 0.5:
+				em._remove(e)
+				return
+		var don := int(d["don"])
+		if don != 0:
+			d["dur"] = int(d["dur"]) + don
+			if int(d["dur"]) <= 0:
+				em._remove(e)
+				return
+
+
+## Java AreaEffectCloud entity check: the entity's box touches the cloud box (radius, 0.5 tall) and its position is
+## within the radius horizontally.
+static func _in_cloud(e, r: float, mn: Vector3, mx: Vector3) -> bool:
+	if mx.y < e.pos.y or mn.y > e.pos.y + 0.5:
+		return false
+	var cx: float = (mn.x + mx.x) * 0.5 - e.pos.x
+	var cz: float = (mn.z + mx.z) * 0.5 - e.pos.z
+	return cx * cx + cz * cz <= r * r
+
+
+## Java AreaEffectCloud client tick: while waiting 2 particles in a 0.2 radius every other tick, then ceil(pi r^2)
+## per tick spread uniformly over the disc (capped at 48 per tick here), the potion colour; purple for the dragon.
+static func _cloud_particles(em, e, r: float, waiting: bool) -> void:
+	var rng: RandomNumberGenerator = em.rng
+	if waiting and rng.randi_range(0, 1) == 0:
+		return
+	var n := 2 if waiting else mini(48, ceili(PI * r * r))
+	var col: Color = e.rt.get("col", Color.WHITE)
+	var dragon: bool = e.id != "potion"
+	for i in n:
+		var a := rng.randf() * TAU
+		var dist := sqrt(rng.randf()) * r
+		var at := Vector3(e.pos.x + cos(a) * dist, e.pos.y, e.pos.z + sin(a) * dist)
+		var v := Vector3((0.5 - rng.randf()) * 0.15, 0.01, (0.5 - rng.randf()) * 0.15) if dragon else Vector3.ZERO
+		Particles.emit("effect", at, v, col)

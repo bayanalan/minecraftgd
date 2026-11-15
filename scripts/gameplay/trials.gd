@@ -9,7 +9,12 @@
 ## - Vault (Java VaultBlockEntity): active when a player is within 4 blocks; a trial key (ominous vaults: ominous
 ##   trial key) unlocks it once per player and ejects chests/trial_chambers/reward[_ominous] one item per 20 ticks.
 ## - Breeze wind charge (Java BreezeWindCharge): every 40 ticks within 16 blocks; burst knocks back within 1.2 blocks.
-## APPROXIMATE: no line-of-sight checks, no ominous trial spawners (Bad Omen variant), no spawner mob preview.
+## - Spawn eggs used on either spawner set its mob (set_spawner_mob); trial spawners show the mob they spawn next.
+## - Ominous trials (_omen_check): Bad Omen -> Trial Omen (15 min per level), spawners within 15 blocks turn ominous and
+##   use their ominous config until their cooldown ends: mobs wear the config's equipment loot table
+##   (equip_from_config: trial_chamber_melee / _ranged, no drops), and every 8 s an ominous item spawner appears 2-5
+##   blocks above a player in range or one of the spawner's mobs and drops / shoots its item after 3-6 s
+##   (_ominous_items / tick_ominous_item; items from items_to_drop_when_ominous).
 class_name Trials
 extends RefCounted
 
@@ -83,21 +88,33 @@ static func _spawner(world, pos: Vector3i, d: Dictionary) -> void:
 		return
 	var mob := str(d.get("mob", "pig"))
 	var near := 0
+	# wiki Monster Spawner: no spawning while 6 or more of its mob are in the 9 x 9 x 9 volume around it
+	var c := Vector3(pos) + Vector3(0.5, 0.5, 0.5)
 	for o in world.entities.ents:
-		if o.kind == "mob" and o.id == mob and absf(o.pos.x - pos.x) < 9.0 and absf(o.pos.y - pos.y) < 5.0 and absf(o.pos.z - pos.z) < 9.0:
+		if o.kind == "mob" and o.id == mob and absf(o.pos.x - c.x) < 4.5 and absf(o.pos.y + o.h * 0.5 - c.y) < 4.5 and absf(o.pos.z - c.z) < 4.5:
 			near += 1
+	var mdef := MobRegistry.get_def(mob)
 	for i in 4:
 		if near >= 6:
 			break
 		var q := Vector3(pos.x + (rng.randf() - rng.randf()) * 4.0 + 0.5, pos.y + rng.randi_range(-1, 1), pos.z + (rng.randf() - rng.randf()) * 4.0 + 0.5)
 		if not _free(world, q):
 			continue
+		# wiki Monster Spawner: dark-spawning monsters need the usual darkness (a torch stops it), blazes and
+		# silverfish a light level below 12
+		if str(mdef.get("kind", "")) == "hostile":
+			var ql: int = world.cm.get_light(int(floor(q.x)), int(floor(q.y)), int(floor(q.z)))
+			if mob == "blaze" or mob == "silverfish":
+				if MobAI.raw_light(world, ql) >= 12:
+					continue
+			elif not MobAI.dark_enough(world, rng, ql):
+				continue
 		var m = world.entities.spawn_mob(mob, q)
 		if m != null:
 			near += 1
 			for k in 3:
 				Particles.emit("smoke", q + Vector3(0, 0.5, 0), Vector3(rng.randf_range(-0.05, 0.05), 0.05, rng.randf_range(-0.05, 0.05)))
-	d["delay"] = rng.randi_range(200, 800)
+	d["delay"] = rng.randi_range(200, 799)   # wiki Monster Spawner: waits 200-799 ticks
 
 
 static func _free(world, q: Vector3) -> bool:
@@ -138,12 +155,17 @@ static func _set_state(world, pos: Vector3i, d: Dictionary, s: String) -> void:
 
 static func _trial(world, pos: Vector3i, d: Dictionary, dist: float) -> void:
 	var rng: RandomNumberGenerator = world.rng
-	var cfg := config(str(d.get("normal", "trial_chamber/melee/zombie/normal")))
-	var state := str(d.get("state", "waiting"))
 	var p: Player = world.player
+	_omen_check(world, pos, d, dist, p)
+	var ominous := bool(d.get("is_ominous", false)) and str(d.get("ominous", "")) != ""
+	var cfg := config(str(d.get("ominous", "")) if ominous else str(d.get("normal", "trial_chamber/melee/zombie/normal")))
+	var state := str(d.get("state", "waiting"))
 	match state:
 		"waiting":
-			if dist <= 14.0 and not p.is_spectator() and not p.is_creative():
+			# wiki Trial Spawner: a player within 14 blocks with line of sight to it; nothing on Peaceful
+			var eye := p.eye_pos()
+			var sc := Vector3(pos) + Vector3(0.5, 0.5, 0.5)
+			if dist <= 14.0 and not p.is_spectator() and not p.is_creative() and world.difficulty > 0 and _los(world, eye, sc, pos):
 				d["players"] = 1 + Net.proxies().size()
 				d["spawned"] = 0
 				d["next"] = world.game_time
@@ -166,18 +188,24 @@ static func _trial(world, pos: Vector3i, d: Dictionary, dist: float) -> void:
 				d["next"] = world.game_time + 40
 				_set_state(world, pos, d, "ejecting")
 				return
-			if int(d.get("spawned", 0)) < total and live.size() < sim and world.game_time >= int(d.get("next", 0)):
-				var mob := _pick_mob(cfg, rng)
+			if int(d.get("spawned", 0)) < total and live.size() < sim and world.game_time >= int(d.get("next", 0)) and world.difficulty > 0:
+				var mob := str(d.get("next_mob", "")) if str(d.get("next_mob", "")) != "" else next_mob(d, cfg, rng)
+				var nm := next_mob(d, cfg, rng)
+				if nm != str(d.get("next_mob", "")):
+					d["next_mob"] = nm
+					BERender.refresh(pos)
 				var rngd := float(cfg.get("spawn_range", 4))
 				for attempt in 8:
 					var q := Vector3(pos.x + 0.5 + rng.randf_range(-rngd, rngd), pos.y + rng.randi_range(-1, 1), pos.z + 0.5 + rng.randf_range(-rngd, rngd))
-					if not _free(world, q):
+					# wiki Trial Spawner: within a 4-block spherical radius, with line of sight to the spawner
+					if not _free(world, q) or q.distance_to(Vector3(pos) + Vector3(0.5, 0.0, 0.5)) > rngd or not _los(world, q + Vector3(0, 0.5, 0), Vector3(pos) + Vector3(0.5, 0.5, 0.5), pos):
 						continue
 					var m2 = world.entities.spawn_mob(mob, q)
 					if m2 != null:
 						m2.persistent = true
 						m2.target_player = true
 						m2.data["trial"] = true
+						equip_from_config(world, m2, cfg, mob)
 						(_tracked[pos] as Array).append(m2)
 						d["spawned"] = int(d.get("spawned", 0)) + 1
 						Audio.play("block.trial_spawner.spawn_mob", q, "Blocks")
@@ -185,13 +213,9 @@ static func _trial(world, pos: Vector3i, d: Dictionary, dist: float) -> void:
 							Particles.emit("flame", q + Vector3(rng.randf_range(-0.3, 0.3), rng.randf(), rng.randf_range(-0.3, 0.3)))
 					break
 				d["next"] = world.game_time + int(cfg.get("ticks_between_spawn", 40))
-			# players left: reset (Java: the spawner goes back to waiting when nobody is in range)
-			if dist > 40.0:
-				for m3 in _tracked.get(pos, []):
-					if m3 != null and not m3.dead:
-						world.entities._remove(m3)
-				_tracked[pos] = []
-				_set_state(world, pos, d, "waiting")
+			if ominous:
+				_ominous_items(world, pos, d, cfg, dist)
+			# (wiki Trial Spawner: once active it no longer needs players in range; its mobs don't despawn)
 		"ejecting":
 			if world.game_time < int(d.get("next", 0)):
 				return
@@ -200,7 +224,7 @@ static func _trial(world, pos: Vector3i, d: Dictionary, dist: float) -> void:
 				_set_state(world, pos, d, "cooldown")
 				return
 			d["eject"] = int(d["eject"]) - 1
-			d["next"] = world.game_time + 20
+			d["next"] = world.game_time + 30   # wiki Trial Spawner: 30 ticks between reward ejections
 			var tables: Array = cfg.get("loot_tables_to_eject", [{"data": "minecraft:spawners/trial_chamber/consumables", "weight": 1}, {"data": "minecraft:spawners/trial_chamber/key", "weight": 1}])
 			var tot := 0
 			for t in tables:
@@ -219,7 +243,112 @@ static func _trial(world, pos: Vector3i, d: Dictionary, dist: float) -> void:
 			Audio.play("block.trial_spawner.eject_item", Vector3(pos), "Blocks")
 		"cooldown":
 			if world.game_time >= int(d.get("until", 0)):
+				# wiki Ominous Trial Spawner: after its 30-minute cooldown it turns back into a regular trial spawner
+				if bool(d.get("is_ominous", false)):
+					_set_ominous(world, pos, d, false)
 				_set_state(world, pos, d, "waiting")
+
+
+## wiki Trial Omen / Trial Spawner: a player with Bad Omen seen by a trial spawner (14 blocks) gets Trial Omen for 15
+## minutes x the Bad Omen level (at least its remaining time); trial spawners within 15 blocks of a player with Trial
+## Omen and in sight of them turn ominous - their mobs despawn, they become active at once (a cooldown from a normal
+## trial is skipped) and use their ominous config (mobs, loot tables, ominous keys, equipment, item spawners).
+static func _omen_check(world, pos: Vector3i, d: Dictionary, dist: float, p: Player) -> void:
+	if p.dead or p.is_spectator() or p.is_creative() or dist > 15.0 or str(d.get("ominous", "")) == "":
+		return
+	var has_bad: bool = p.effects.has("bad_omen")
+	if not has_bad and not p.effects.has("trial_omen"):
+		return
+	if bool(d.get("is_ominous", false)) and not has_bad:
+		return
+	if world.game_time % 10 != 0:
+		return   # (line-of-sight checks every 10 ticks)
+	var sc := Vector3(pos) + Vector3(0.5, 0.5, 0.5)
+	if not _los(world, p.eye_pos(), sc, pos):
+		return
+	if has_bad and dist <= 14.0:
+		var lvl := int(p.effects["bad_omen"].get("amp", 0)) + 1
+		var cur := int(p.effects["trial_omen"].get("ticks", 0)) if p.effects.has("trial_omen") else 0
+		p.effects.erase("bad_omen")
+		p.effects.erase("trial_omen")
+		p.add_effect("trial_omen", 0, maxi(cur, 18000 * lvl))
+		Audio.play("event.mob_effect.trial_omen", p.pos, "Ambient", 0.8)
+	if not p.effects.has("trial_omen") or bool(d.get("is_ominous", false)):
+		return
+	for m in _tracked.get(pos, []):
+		if m != null and not m.dead:
+			world.entities._remove(m)
+	_tracked[pos] = []
+	var was := str(d.get("state", "waiting"))
+	_set_ominous(world, pos, d, true)
+	d["players"] = 1 + Net.proxies().size()
+	d["spawned"] = 0
+	d["next"] = world.game_time
+	d.erase("next_mob")
+	if was != "ejecting":
+		_set_state(world, pos, d, "active")
+	Audio.play("block.trial_spawner.ominous_activate", sc, "Blocks", 1.0, rng_pitch(world))
+
+
+static func rng_pitch(world) -> float:
+	return world.rng.randf_range(0.8, 1.2)
+
+
+static func _set_ominous(world, pos: Vector3i, d: Dictionary, on: bool) -> void:
+	d["is_ominous"] = on
+	var st: int = world.state_at(pos.x, pos.y, pos.z)
+	if st > 0 and Res.blocks.has_prop(st, "ominous"):
+		var ns := Res.blocks.with_prop(st, "ominous", "true" if on else "false")
+		if ns != st:
+			world.set_block(pos.x, pos.y, pos.z, ns, false)
+	BERender.refresh(pos)
+
+
+## Line of sight between two points, ignoring the spawner block itself.
+static func _los(world, a: Vector3, b: Vector3, own: Vector3i) -> bool:
+	var dv := b - a
+	var l := dv.length()
+	if l < 0.01:
+		return true
+	var hit: Dictionary = VoxelRaycast.cast(a, dv / l, l, world.state_at, Res.blocks)
+	return hit.is_empty() or hit.get("pos") == own
+
+
+## wiki Spawn Egg / Trial Spawner: a spawn egg used on a (trial) spawner sets the mob it spawns.
+static func set_spawner_mob(world, pos: Vector3i, kind: String, mob: String) -> void:
+	if MobRegistry.get_def(mob).is_empty():
+		return
+	var d := BlockEntities.get_data(world, pos)
+	if d.is_empty():
+		d = {"id": kind}
+	d["mob"] = mob
+	if kind == "trial_spawner":
+		d["next_mob"] = mob
+		var st: int = world.state_at(pos.x, pos.y, pos.z)
+		if st > 0 and Res.blocks.get_prop(st, "trial_spawner_state") == "inactive":
+			_set_state(world, pos, d, "waiting")
+	BlockEntities.set_data(world, pos, d)
+	BERender.refresh(pos)
+
+
+## The mob a trial spawner spawns next (shown inside it): a spawn-egg mob, else a roll of its spawn_potentials.
+static func next_mob(d: Dictionary, cfg: Dictionary, rng: RandomNumberGenerator) -> String:
+	if str(d.get("mob", "")) != "":
+		return str(d["mob"])
+	return _pick_mob(cfg, rng)
+
+
+## Mob shown in a trial spawner (BERender): the one it spawns next.
+static func display_mob(d: Dictionary) -> String:
+	if str(d.get("next_mob", "")) != "":
+		return str(d["next_mob"])
+	if str(d.get("mob", "")) != "":
+		return str(d["mob"])
+	var pots: Array = config(str(d.get("normal", "trial_chamber/melee/zombie/normal"))).get("spawn_potentials", [])
+	if pots.is_empty() or not (pots[0] is Dictionary):
+		return ""
+	var ent = (pots[0] as Dictionary).get("data", {}).get("entity", {})
+	return str(ent.get("id", "")).trim_prefix("minecraft:") if ent is Dictionary else ""
 
 
 static func _pick_mob(cfg: Dictionary, rng: RandomNumberGenerator) -> String:
@@ -234,6 +363,159 @@ static func _pick_mob(cfg: Dictionary, rng: RandomNumberGenerator) -> String:
 			var ent = e.get("data", {}).get("entity", {})
 			return str(ent.get("id", "minecraft:zombie")).trim_prefix("minecraft:") if ent is Dictionary else "zombie"
 	return "zombie"
+
+
+# ------------------------------------------------------------------ ominous equipment / item spawners
+
+## The spawn potential's equipment (26.3 trial_spawner configs: ominous melee / ranged mobs roll
+## equipment/trial_chamber_melee / _ranged): its items go to their slots (Java Mob.equip - armour by piece, anything
+## else into the main hand, the first item per slot); slot_drop_chances 0 = never dropped.
+static func equip_from_config(world, m, cfg: Dictionary, mob: String) -> void:
+	var eq = null
+	for pot in cfg.get("spawn_potentials", []):
+		var dat = pot.get("data", {}) if pot is Dictionary else {}
+		var ent = dat.get("entity", {}) if dat is Dictionary else {}
+		if ent is Dictionary and str(ent.get("id", "")).trim_prefix("minecraft:") == mob:
+			eq = dat.get("equipment")
+			break
+	if not (eq is Dictionary):
+		return
+	var table = eq.get("loot_table", "")
+	var ctx := {"rng": world.rng, "tool": ItemStack.new(), "entity_id": mob}
+	var stacks: Array = []
+	if table is Dictionary:
+		stacks = Loot.roll_table(table, ctx)
+	elif str(table) != "":
+		stacks = Loot.roll(str(table).trim_prefix("minecraft:"), ctx)
+	equip_stacks(m, stacks)
+	var dc = eq.get("slot_drop_chances", null)
+	if (dc is float or dc is int) and float(dc) <= 0.0:
+		m.data["no_equip_drop"] = true
+
+
+static func equip_stacks(m, stacks: Array) -> void:
+	var armor: Array = (m.data.get("armor", ["", "", "", ""]) as Array).duplicate()
+	while armor.size() < 4:
+		armor.append("")
+	var used := {}
+	for s in stacks:
+		var st: ItemStack = s
+		if st == null or st.is_empty():
+			continue
+		var nm := st.name()
+		var slot := -1
+		if nm.ends_with("_helmet"):
+			slot = 3
+		elif nm.ends_with("_chestplate"):
+			slot = 2
+		elif nm.ends_with("_leggings"):
+			slot = 1
+		elif nm.ends_with("_boots"):
+			slot = 0
+		if slot >= 0:
+			if not used.has(slot):
+				used[slot] = true
+				armor[slot] = st.to_dict()   # (dicts keep the trims / enchantments: ArmorRender.slots_of_dicts)
+		elif not used.has(-1):
+			used[-1] = true
+			m.data["held"] = nm
+			m.data["held_stack"] = st.to_dict()   # (enchantments: HeldItems.ench)
+	m.data["armor"] = armor
+
+
+## wiki Ominous Item Spawner: while an ominous trial spawner detects a player within its activation range, every 8
+## seconds it spawns an ominous item spawner above that player or one of its own mobs: a raycast from the feet to a
+## random height 2-5 blocks up; the hit block (else the end of the line) is used and the spawner sits at the bottom
+## centre of the block below it, unless that block has a collision box. The item (one of a roll of the config's
+## items_to_drop_when_ominous) is shown for 3-6 seconds.
+static func _ominous_items(world, pos: Vector3i, d: Dictionary, cfg: Dictionary, dist: float) -> void:
+	var gt := int(world.game_time)
+	if gt < int(d.get("oi_next", 0)):
+		return
+	var p: Player = world.player
+	if dist > float(cfg.get("player_detection_range", 14)) or p.dead or p.is_spectator() or p.is_creative():
+		return
+	d["oi_next"] = gt + 160
+	var rng: RandomNumberGenerator = world.rng
+	var cands: Array = [p]
+	for m in _tracked.get(pos, []):
+		if m != null and not m.dead:
+			cands.append(m)
+	var t = cands[rng.randi_range(0, cands.size() - 1)]
+	var feet: Vector3 = t.pos
+	var h := rng.randf_range(2.0, 5.0)
+	var hit: Dictionary = VoxelRaycast.cast(feet, Vector3.UP, h, world.state_at, Res.blocks)
+	var hb: Vector3i = hit["pos"] if not hit.is_empty() else Vector3i((feet + Vector3(0, h, 0)).floor())
+	var at := Vector3i(hb.x, hb.y - 1, hb.z)
+	var st: int = world.state_at(at.x, at.y, at.z)
+	if st > 0 and (Res.blocks.st_flags[st] & BlockRegistry.F_COLLIDE) != 0:
+		return
+	var table := str(cfg.get("items_to_drop_when_ominous", "minecraft:spawners/trial_chamber/items_to_drop_when_ominous")).trim_prefix("minecraft:")
+	var items: Array = Loot.roll(table, {"rng": rng, "tool": ItemStack.new()})
+	if items.is_empty():
+		return
+	spawn_ominous_item(world.entities, Vector3(at.x + 0.5, at.y, at.z + 0.5), items[rng.randi_range(0, items.size() - 1)], rng.randi_range(60, 120))
+
+
+## The ominous item spawner entity (kind "ominous_item", drawn like a dropped item; saved with its chunk -
+## EntityManager._ser - and sent to LAN clients as a puppet). sound: the spawn_item_begin sound (not on reloads).
+static func spawn_ominous_item(em, at: Vector3, s: ItemStack, ticks: int, sound: bool = true):
+	var e := EntityManager.Ent.new()
+	e.kind = "ominous_item"
+	e.id = "ominous_item_spawner"
+	e.pos = at
+	e.prev = at
+	e.stack = s
+	e.data["spawn_after"] = ticks
+	if em.has_method("_item_node"):
+		e.node = em._item_node(s)
+		em.add_child(e.node)
+	em.ents.append(e)
+	if sound:
+		Audio.play("block.trial_spawner.spawn_item_begin", at, "Blocks", 1.0, em.rng.randf_range(0.8, 1.2))
+	return e
+
+
+## wiki Ominous Item Spawner: after its display time the item is dispensed downward - projectiles (arrows, fire
+## charges, wind charges, splash / lingering potions) are shot as entities, anything else is dropped. Sounds
+## spawn_item_begin / about_to_spawn_item / spawn_item (when "prepares" plays is not on the wiki: 36 ticks before,
+## Java OminousItemSpawner). Launch speed not on the wiki: the dispenser's 1.1 (potions x1.25, Java DispenseConfig).
+static func tick_ominous_item(em, e) -> void:
+	var total := int(e.data.get("spawn_after", 60))
+	if e.age % 5 == 0:
+		Particles.emit("smoke", e.pos + Vector3(em.rng.randf_range(-0.3, 0.3), em.rng.randf_range(0.0, 0.5), em.rng.randf_range(-0.3, 0.3)), Vector3(0, 0.02, 0), Color(0.35, 0.8, 0.9))
+	if e.age == total - 36:
+		Audio.play("block.trial_spawner.about_to_spawn_item", e.pos, "Blocks")
+	if e.age < total:
+		return
+	var s: ItemStack = e.stack
+	var nm := s.name() if s != null else ""
+	var down := Vector3(em.rng.randfn(0, 0.0075), -1.0, em.rng.randfn(0, 0.0075)).normalized()
+	var n0: int = em.ents.size()
+	match nm:
+		"arrow", "tipped_arrow", "spectral_arrow":
+			em.spawn_projectile("arrow", e.pos, down * 1.1, null)
+			if em.ents.size() > n0:
+				var a = em.ents[em.ents.size() - 1]
+				var pot := Potions.potion_of(s)
+				if pot != "":
+					a.data["potion"] = pot
+				if nm == "spectral_arrow":
+					a.data["ammo"] = "spectral_arrow"
+		"fire_charge":
+			em.spawn_projectile("small_fireball", e.pos, down * 1.1, null)
+		"wind_charge", "snowball", "egg":
+			em.spawn_projectile(nm, e.pos, down * 1.1, null)
+		"splash_potion", "lingering_potion":
+			em.spawn_projectile(nm, e.pos, down * 1.375, null)
+			if em.ents.size() > n0:
+				em.ents[em.ents.size() - 1].stack = s.copy()
+		"":
+			pass
+		_:
+			em.spawn_item(e.pos, s)
+	Audio.play("block.trial_spawner.spawn_item", e.pos, "Blocks", 1.0, em.rng.randf_range(0.8, 1.2))
+	em._remove(e)
 
 
 # ------------------------------------------------------------------ vault

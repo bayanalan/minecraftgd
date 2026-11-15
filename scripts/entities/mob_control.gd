@@ -220,6 +220,6 @@ static func move_control(e, wanted: Vector3) -> int:
 	if d.length_squared() < 2.5000003e-7:
 		return 0
 	e.yaw = rotlerp(e.yaw, rad_to_deg(atan2(-d.x, d.z)), 90.0)
-	if d.y > 0.6 and d.x * d.x + d.z * d.z < maxf(1.0, e.w):
+	if d.y > float(e.def.get("step_height", 0.6)) and d.x * d.x + d.z * d.z < maxf(1.0, e.w):
 		return 2
 	return 1

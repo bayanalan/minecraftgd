@@ -12,7 +12,8 @@ static func _valid(f: Features, c: Features.FCtx, p: Vector3i) -> bool:
 	if st < 0:
 		return false
 	var fl: int = f.blocks.st_flags[st]
-	return (fl & (BlockRegistry.F_REPLACEABLE | BlockRegistry.F_LEAVES)) != 0 and (fl & BlockRegistry.F_LIQUID) == 0
+	# TreeFeature.validTreePos: air or #replaceable_by_trees (Features._mark_tree_replaceable)
+	return (fl & BlockRegistry.F_TREE_REPL) != 0
 
 
 static func _log(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector3i, axis: String = "y") -> void:
@@ -29,7 +30,13 @@ static func _log(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector3i, axi
 
 static func _leaf(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector3i) -> bool:
 	if _valid(f, c, p):
-		f.set_block(c, p, f.provide(c, cf["foliage"], p), 1)
+		# FoliagePlacer.tryPlaceLeaf: leaves placed in water are waterlogged
+		var s := f.provide(c, cf["foliage"], p)
+		var cur: int = f.get_block(c, p)
+		var wet := cur > 0 and (f.blocks.st_flags[cur] & BlockRegistry.F_LIQUID) != 0 and (f.blocks.st_flags[cur] & BlockRegistry.F_LAVA) == 0
+		if wet and s > 0 and f.blocks.has_prop(s, "waterlogged"):
+			s = f.blocks.with_prop(s, "waterlogged", "true")
+		f.set_block(c, p, s, 1 if cur == 0 else 0)
 		c.tree_leaves.append(p)
 		c.tree_leaf_set[p] = true
 		return true
@@ -87,27 +94,40 @@ static func place(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector3i) ->
 	var h := int(tp.get("base_height", 4)) + c.r.next_int_bound(int(tp.get("height_rand_a", 2)) + 1) + c.r.next_int_bound(int(tp.get("height_rand_b", 0)) + 1)
 	var fh := _foliage_height(f, c, fp, ftype, h)
 	var radius := f.sample_int(c, fp.get("radius", 2))
-	var offset := f.sample_int(c, fp.get("offset", 0))
+	if ftype == "pine":   # Java PineFoliagePlacer.foliageRadius: + nextInt(max(trunk height - foliage height + 1, 1))
+		radius += c.r.next_int_bound(maxi(h - fh + 1, 1))
 	var dbl := ttype in ["giant_trunk_placer", "mega_jungle_trunk_placer", "dark_oak_trunk_placer"]
 	c.tree_logs = []
 	c.tree_leaves = []
 	c.tree_leaf_set = {}
-	if p.y < Coords.MIN_Y + 1 or p.y + h + 1 >= Coords.MAX_Y:
+	# Java TreeFeature.doPlace: inside the build height (top y + 1 <= max y + 1), then getMaxFreeTreeHeight over the
+	# minimum_size shape; a tree whose free height is short of its height (and of min_clipped_height) is not placed
+	# - before the offset or any trunk / foliage random is drawn
+	# a root placer (MangroveRootPlacer) starts the trunk trunk_offset_y above the origin (RootPlacer.getTrunkOrigin,
+	# drawn after the foliage radius); the bounds cover both
+	var rp: Dictionary = cf.get("rp", {})
+	var org := p
+	if not rp.is_empty():
+		p = org + Vector3i(0, f.sample_int(c, rp["off"]), 0)
+	if mini(org.y, p.y) < Coords.MIN_Y + 1 or maxi(org.y, p.y) + h + 1 > Coords.MAX_Y:
 		return false
-	# space check along trunk
-	for y in h:
-		for dx in (2 if dbl else 1):
-			for dz in (2 if dbl else 1):
-				if not _valid(f, c, p + Vector3i(dx, y, dz)):
-					return false
+	var free_h := _max_free_height(f, c, cf, h, p)
+	var min_clip := int((cf.get("ms", {}) as Dictionary).get("min_clipped_height", -1))
+	if not (free_h >= h or (min_clip >= 0 and free_h >= min_clip)):
+		return false
+	h = free_h   # placeTrunk(freeTreeHeight)
+	if not rp.is_empty() and not _mangrove_roots(f, c, rp, org, p):
+		return false
 	# Java 26.x TrunkPlacer.placeBelowTrunkBlock under every trunk column: below_trunk_provider (soil_beneath_tree:
 	# dirt unless the block is in cannot_replace_below_tree_trunk) - air under an overhanging 2x2 corner becomes dirt
-	for dx in (2 if dbl else 1):
-		for dz in (2 if dbl else 1):
-			var below: Vector3i = p + Vector3i(dx, -1, dz)
-			var soil: int = f.provide(c, cf["soil"], below)
-			if soil > 0:
-				f.set_block(c, below, soil, 0)
+	# (UpwardsBranchingTrunkPlacer places none: the root under a mangrove trunk stays)
+	if ttype != "upwards_branching_trunk_placer":
+		for dx in (2 if dbl else 1):
+			for dz in (2 if dbl else 1):
+				var below: Vector3i = p + Vector3i(dx, -1, dz)
+				var soil: int = f.provide(c, cf["soil"], below)
+				if soil > 0:
+					f.set_block(c, below, soil, 0)
 	var atts: Array = []   # [pos, radius_offset, double]
 	match ttype:
 		"straight_trunk_placer":
@@ -169,7 +189,9 @@ static func place(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector3i) ->
 			_cherry_trunk(f, c, cf, tp, p, h, atts)
 		"poplar_trunk_placer":
 			_poplar_trunk(f, c, cf, tp, p, h, atts)
-		"forking_trunk_placer", "bending_trunk_placer", "upwards_branching_trunk_placer":
+		"upwards_branching_trunk_placer":
+			_upwards_trunk(f, c, cf, tp, p, h, atts)
+		"forking_trunk_placer", "bending_trunk_placer":
 			var dir: Vector3i = [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)][c.r.next_int_bound(4)]
 			var bend := h - c.r.next_int_bound(4) - 1
 			var bl := 3 - c.r.next_int_bound(3)
@@ -196,9 +218,188 @@ static func place(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector3i) ->
 				_log(f, c, cf, p + Vector3i(0, y, 0))
 			atts.append([p + Vector3i(0, h, 0), 0, false])
 	for at in atts:
+		var offset := f.sample_int(c, fp.get("offset", 0))   # FoliagePlacer.createFoliage: per attachment
 		_foliage(f, c, cf, fp, ftype, at[0], int(at[1]), at[2], fh, radius, offset)
 	_decorators(f, c, cf, p, h)
 	return true
+
+
+## Java FeatureSize.getSizeAtHeight (two_layers / three_layers_feature_size).
+static func _size_at(ms: Dictionary, height: int, y: int) -> int:
+	if str(ms.get("type", "")).trim_prefix("minecraft:") == "three_layers_feature_size":
+		if y < int(ms.get("limit", 1)):
+			return int(ms.get("lower_size", 0))
+		if y >= height - int(ms.get("upper_limit", 1)):
+			return int(ms.get("upper_size", 1))
+		return int(ms.get("middle_size", 1))
+	return int(ms.get("lower_size", 0)) if y < int(ms.get("limit", 1)) else int(ms.get("upper_size", 1))
+
+
+## Java TreeFeature.getMaxFreeTreeHeight: the first height whose minimum_size square holds a block that is not free
+## (TrunkPlacer.isFree: air, #replaceable_by_trees or #logs; a vine too unless ignore_vines) gives height - 2.
+static func _max_free_height(f: Features, c: Features.FCtx, cf: Dictionary, h: int, p: Vector3i) -> int:
+	var ms: Dictionary = cf.get("ms", {})
+	var iv := bool(cf.get("iv", false))
+	var tg: Dictionary = cf.get("tgrow", {})   # (UpwardsBranchingTrunkPlacer.validTreePos)
+	for i in h + 2:
+		var j := _size_at(ms, h, i)
+		for k in range(-j, j + 1):
+			for l in range(-j, j + 1):
+				var q := p + Vector3i(k, i, l)
+				if not _valid(f, c, q):
+					var st: int = f.get_block(c, q)
+					if st <= 0 or not (is_log_name(f.blocks.name_of(st)) or tg.has(f.blocks.st_block[st])):
+						return i - 2
+				elif not iv and f.blocks.name_of(maxi(f.get_block(c, q), 0)) == "vine":
+					return i - 2
+	return h
+
+
+## #logs (Java block tag): logs, wood, stripped variants, crimson / warped stems and hyphae.
+static func is_log_name(n: String) -> bool:
+	return n.ends_with("_log") or n.ends_with("_wood") or n.ends_with("_hyphae") or (n.ends_with("_stem") and (n.begins_with("crimson") or n.begins_with("warped") or n.begins_with("stripped_crimson") or n.begins_with("stripped_warped")))
+
+
+const HDIRS4 := [Vector3i(0, 0, -1), Vector3i(1, 0, 0), Vector3i(0, 0, 1), Vector3i(-1, 0, 0)]   # Direction.Plane.HORIZONTAL
+
+
+## Java UpwardsBranchingTrunkPlacer (mangroves): a straight trunk; every placed log below the top starts a branch with
+## place_branch_per_log_probability - a random horizontal direction, start offset max(0, length - length' - 1) from two
+## extra_branch_length samples, extra_branch_steps steps of one out and one up (a foliage attachment at each), and,
+## when the branch rose more than one block, attachments at its end and two below; the top gets one above the trunk.
+static func _upwards_trunk(f: Features, c: Features.FCtx, cf: Dictionary, tp: Dictionary, p: Vector3i, h: int, atts: Array) -> void:
+	var prob := float(tp.get("place_branch_per_log_probability", 0.5))
+	var tg: Dictionary = cf.get("tgrow", {})
+	for i in h:
+		var y := p.y + i
+		if _ub_log(f, c, cf, tg, Vector3i(p.x, y, p.z)) and i < h - 1 and c.r.next_float() < prob:
+			var dir: Vector3i = HDIRS4[c.r.next_int_bound(4)]
+			var k := f.sample_int(c, tp.get("extra_branch_length", 0))
+			var l := maxi(0, k - f.sample_int(c, tp.get("extra_branch_length", 0)) - 1)
+			var steps := f.sample_int(c, tp.get("extra_branch_steps", 1))
+			var top := y + l
+			var bx := p.x
+			var bz := p.z
+			while l < h and steps > 0:
+				if l >= 1:
+					var m := y + l
+					top = m
+					bx += dir.x
+					bz += dir.z
+					if _ub_log(f, c, cf, tg, Vector3i(bx, m, bz)):
+						top += 1
+					atts.append([Vector3i(bx, m, bz), 0, false])
+				l += 1
+				steps -= 1
+			if top - y > 1:
+				atts.append([Vector3i(bx, top, bz), 0, false])
+				atts.append([Vector3i(bx, top - 2, bz), 0, false])
+		if i == h - 1:
+			atts.append([Vector3i(p.x, y + 1, p.z), 0, false])
+
+
+## TrunkPlacer.placeLog with UpwardsBranchingTrunkPlacer.validTreePos (air / #replaceable_by_trees / can_grow_through).
+static func _ub_log(f: Features, c: Features.FCtx, cf: Dictionary, tg: Dictionary, q: Vector3i) -> bool:
+	if not _valid(f, c, q):
+		var st: int = f.get_block(c, q)
+		if st <= 0 or not tg.has(f.blocks.st_block[st]):
+			return false
+	var s: int = f.provide(c, cf["trunk"], q)
+	if s > 0 and f.blocks.has_prop(s, "axis"):
+		s = f.blocks.with_prop(s, "axis", "y")
+	f.set_block(c, q, s, 0)
+	c.tree_logs.append(q)
+	return true
+
+
+## Java MangroveRootPlacer.placeRoots: every block from the origin up to the trunk origin must take a root; then the
+## block under the trunk origin plus, per horizontal direction (N, E, S, W), a simulated root path from the side block
+## (any blocked path cancels the tree) and the side block itself; all of them placed afterwards (placeRoot).
+static func _mangrove_roots(f: Features, c: Features.FCtx, rp: Dictionary, o: Vector3i, t: Vector3i) -> bool:
+	var q := o
+	while q.y < t.y:
+		if not _root_ok(f, c, rp, q):
+			return false
+		q.y += 1
+	var pos: Array = [t + Vector3i(0, -1, 0)]
+	for d in HDIRS4:
+		var lst: Array = []
+		if not _sim_roots(f, c, rp, t + d, d, t, lst, 0):
+			return false
+		pos.append_array(lst)
+		pos.append(t + d)
+	for r in pos:
+		_place_root(f, c, rp, r)
+	return true
+
+
+## MangroveRootPlacer.simulateRoots: max_root_length steps (or more roots than that) fail the path.
+static func _sim_roots(f: Features, c: Features.FCtx, rp: Dictionary, p: Vector3i, d: Vector3i, t: Vector3i, lst: Array, length: int) -> bool:
+	var mx: int = rp["len"]
+	if length == mx or lst.size() > mx:
+		return false
+	for np in _potential_roots(c, rp, p, d, t):
+		if not _root_ok(f, c, rp, np):
+			continue
+		lst.append(np)
+		if not _sim_roots(f, c, rp, np, d, t, lst, length + 1):
+			return false
+	return true
+
+
+## MangroveRootPlacer.potentialRootPositions: by the 3D taxicab distance i to the trunk origin and max_root_width w -
+## w - 3 < i <= w: down, plus out-and-down at random_skew_chance; i > w: down; closer: down at the skew chance, else
+## out or down (nextBoolean).
+static func _potential_roots(c: Features.FCtx, rp: Dictionary, p: Vector3i, d: Vector3i, t: Vector3i) -> Array:
+	var below := p + Vector3i(0, -1, 0)
+	var side := p + d
+	var i := absi(p.x - t.x) + absi(p.y - t.y) + absi(p.z - t.z)
+	var w: int = rp["width"]
+	var sk: float = rp["skew"]
+	if i > w - 3 and i <= w:
+		return [below, side + Vector3i(0, -1, 0)] if c.r.next_float() < sk else [below]
+	if i > w:
+		return [below]
+	if c.r.next_float() < sk:
+		return [below]
+	return [side] if c.r.next_bool() else [below]
+
+
+## MangroveRootPlacer.canPlaceRoot: TreeFeature.validTreePos or can_grow_through.
+static func _root_ok(f: Features, c: Features.FCtx, rp: Dictionary, q: Vector3i) -> bool:
+	if _valid(f, c, q):
+		return true
+	var st: int = f.get_block(c, q)
+	return st > 0 and (rp["grow"] as Dictionary).has(f.blocks.st_block[st])
+
+
+## MangroveRootPlacer.placeRoot: muddy roots in muddy_roots_in blocks; else RootPlacer.placeRoot - the root where it
+## can go, then the above-root block (moss carpet) at its chance where the block above is air. Both through
+## getPotentiallyWaterloggedState (waterlogged = water fluid there).
+static func _place_root(f: Features, c: Features.FCtx, rp: Dictionary, q: Vector3i) -> void:
+	var st: int = f.get_block(c, q)
+	if st > 0 and (rp["muddy_in"] as Dictionary).has(f.blocks.st_block[st]):
+		f.set_block(c, q, _wl_state(f, st, f.provide(c, rp["muddy"], q)), 0)
+		return
+	if not _root_ok(f, c, rp, q):
+		return
+	f.set_block(c, q, _wl_state(f, st, f.provide(c, rp["prov"], q)), 0)
+	var ap: float = rp["above_p"]
+	if ap >= 0.0:
+		var a := q + Vector3i(0, 1, 0)
+		if c.r.next_float() < ap:
+			var ast: int = f.get_block(c, a)
+			if ast == 0 or (ast > 0 and (f.blocks.st_flags[ast] & BlockRegistry.F_AIR) != 0):
+				f.set_block(c, a, _wl_state(f, ast, f.provide(c, rp["above"], a)), 0)
+
+
+## RootPlacer.getPotentiallyWaterloggedState: a state with WATERLOGGED gets it from the water fluid at its spot (`cur`).
+static func _wl_state(f: Features, cur: int, s: int) -> int:
+	if s <= 0 or not f.blocks.has_prop(s, "waterlogged"):
+		return s
+	var fl: int = f.blocks.st_flags[cur] if cur > 0 else 0
+	var wet := ((fl & BlockRegistry.F_LIQUID) != 0 and (fl & BlockRegistry.F_LAVA) == 0) or (fl & BlockRegistry.F_WATERLOGGED) != 0
+	return f.blocks.with_prop(s, "waterlogged", "true" if wet else "false")
 
 
 static func _foliage_height(f: Features, c: Features.FCtx, fp: Dictionary, ftype: String, h: int) -> int:
@@ -289,10 +490,15 @@ static func _foliage(f: Features, c: Features.FCtx, cf: Dictionary, fp: Dictiona
 				_row(f, c, cf, base2, radius + 2, -1, false, "dark_oak")
 				_row(f, c, cf, base2, radius + 1, 0, false, "dark_oak")
 		"random_spread":
+			# Java RandomSpreadFoliagePlacer.createFoliage: per attempt nextInt(r) - nextInt(r) on x, y, z (radius / foliage height)
 			var cnt2 := int(fp.get("leaf_placement_attempts", 50))
+			var rr := maxi(radius, 1)
+			var hh := maxi(fh, 1)
 			for n in cnt2:
-				var q := at + Vector3i(c.r.next_int_bound(radius * 2 + 1) - radius, c.r.next_int_bound(fh + 1) - fh / 2, c.r.next_int_bound(radius * 2 + 1) - radius)
-				_leaf(f, c, cf, q)
+				var qx := c.r.next_int_bound(rr) - c.r.next_int_bound(rr)
+				var qy := c.r.next_int_bound(hh) - c.r.next_int_bound(hh)
+				var qz := c.r.next_int_bound(rr) - c.r.next_int_bound(rr)
+				_leaf(f, c, cf, at + Vector3i(qx, qy, qz))
 		_:
 			for l in range(offset, offset - 3, -1):
 				_row(f, c, cf, at, maxi(radius - int(l / 2.0), 0), l, dbl, "blob")
@@ -428,9 +634,10 @@ static func _decorators(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector
 		var prob := float(d.get("probability", 1.0))
 		match t:
 			"trunk_vine":
+				# Java TrunkVineDecorator: a vine on each side with nextInt(3) > 0 (2 in 3)
 				for q in logs:
 					for dv in hd:
-						if c.r.next_int_bound(3) > 0:
+						if c.r.next_int_bound(3) == 0:
 							continue
 						var n: Vector3i = q + dv[0]
 						if _air(f, c, n):
@@ -447,10 +654,12 @@ static func _decorators(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector
 					continue
 				var y0: int = logs[0].y
 				var cocoa: int = f.blocks.default_state("cocoa")
+				# Java CocoaDecorator: Direction.Plane.HORIZONTAL order N, E, S, W; the pod at the opposite side, facing it
+				var hd_cocoa := [hd[3], hd[0], hd[2], hd[1]]
 				for q in logs:
 					if q.y - y0 > 2:
 						continue
-					for dv in hd:
+					for dv in hd_cocoa:
 						if c.r.next_float() <= 0.25:
 							# the pod sits next to the log and faces it
 							var n3: Vector3i = q + dv[0]
@@ -638,22 +847,103 @@ static func _moss_hanger(f: Features, c: Features.FCtx, q: Vector3i) -> void:
 		pos += Vector3i(0, -1, 0)
 	f.set_block(c, pos, f.blocks.with_prop(moss, "tip", "true") if f.blocks.has_prop(moss, "tip") else moss, 2)
 
+## Java FallenTreeFeature: the stump at the origin (its stump decorators), a random horizontal direction (N E S W),
+## log length - 2 logs starting 2..3 blocks away at the first spot within 1 up .. 4 down that is a valid tree position
+## over a sturdy face, placed only if the whole log fits (no gap under it longer than 2), then the log decorators.
 static func fallen(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector3i) -> bool:
-	var below: int = f.get_block(c, p + Vector3i(0, -1, 0))
-	if below <= 0 or (f.blocks.st_flags[below] & BlockRegistry.F_FULL_SHAPE) == 0 or f.get_block(c, p) != 0:
-		return false
-	_log(f, c, cf, p)
-	var length := f.sample_int(c, cf["len"])
-	var dirs := [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]
+	_fallen_log(f, c, cf, p, "y")
+	_fallen_decorate(f, c, cf.get("stump_decorators", []), [p])
+	var dirs := [Vector3i(0, 0, -1), Vector3i(1, 0, 0), Vector3i(0, 0, 1), Vector3i(-1, 0, 0)]
 	var d: Vector3i = dirs[c.r.next_int_bound(4)]
-	var start := p + d * (2 + c.r.next_int_bound(2))
-	for k in length:
-		var q := start + d * k
-		var bl: int = f.get_block(c, q + Vector3i(0, -1, 0))
-		if f.get_block(c, q) != 0 or bl <= 0 or (f.blocks.st_flags[bl] & BlockRegistry.F_COLLIDE) == 0:
+	var length := f.sample_int(c, cf["len"]) - 2
+	var q := p + d * (2 + c.r.next_int_bound(2))
+	q.y += 1
+	for i in 6:
+		if _valid(f, c, q) and _over_solid(f, c, q):
 			break
-		_log(f, c, cf, q, "x" if d.x != 0 else "z")
+		q.y -= 1
+	var gap := 0
+	for j in length:
+		var t := q + d * j
+		if not _valid(f, c, t):
+			return true
+		if not _over_solid(f, c, t):
+			gap += 1
+			if gap > 2:
+				return true
+		else:
+			gap = 0
+	var placed: Array = []
+	for j2 in length:
+		var t2 := q + d * j2
+		_fallen_log(f, c, cf, t2, "x" if d.x != 0 else "z")
+		placed.append(t2)
+	_fallen_decorate(f, c, cf.get("log_decorators", []), java_hashset_order(placed))
 	return true
+
+
+static func _fallen_log(f: Features, c: Features.FCtx, cf: Dictionary, p: Vector3i, axis: String) -> void:
+	var s: int = f.provide(c, cf["trunk"], p)
+	if s > 0 and f.blocks.has_prop(s, "axis"):
+		s = f.blocks.with_prop(s, "axis", axis)
+	f.set_block(c, p, s, 0)
+
+
+static func _over_solid(f: Features, c: Features.FCtx, p: Vector3i) -> bool:
+	var b: int = f.get_block(c, p + Vector3i(0, -1, 0))
+	return b > 0 and (f.blocks.st_flags[b] & (BlockRegistry.F_COLLIDE | BlockRegistry.F_FULL_SHAPE)) == (BlockRegistry.F_COLLIDE | BlockRegistry.F_FULL_SHAPE)
+
+
+## Iteration order of a java.util.HashSet<BlockPos> holding these positions (inserted in this order, < 13 entries:
+## the 16-bucket table, bucket = spread(hashCode) & 15, insertion order inside a bucket).
+static func java_hashset_order(ps: Array) -> Array:
+	var buckets: Array = []
+	buckets.resize(16)
+	for i in 16:
+		buckets[i] = []
+	for p in ps:
+		var v: Vector3i = p
+		var h := (((v.y + v.z * 31) & 0xFFFFFFFF) * 31 + v.x) & 0xFFFFFFFF
+		var sp := h ^ (h >> 16)
+		(buckets[sp & 15] as Array).append(v)
+	var out: Array = []
+	for b in buckets:
+		out.append_array(b)
+	return out
+
+
+## TreeDecorator.Context for fallen trees: trunk_vine (2 / 3 per side: west, east, north, south) and attached_to_logs
+## (logs shuffled, per log a random direction, probability, air there -> the provider's block).
+static func _fallen_decorate(f: Features, c: Features.FCtx, decs: Array, logs: Array) -> void:
+	for d in decs:
+		var t := str(d.get("type", "")).trim_prefix("minecraft:")
+		match t:
+			"trunk_vine":
+				var hd := [[Vector3i(-1, 0, 0), "east"], [Vector3i(1, 0, 0), "west"], [Vector3i(0, 0, -1), "south"], [Vector3i(0, 0, 1), "north"]]
+				for q in logs:
+					for dv in hd:
+						if c.r.next_int_bound(3) == 0:
+							continue
+						var n: Vector3i = q + dv[0]
+						if _air(f, c, n):
+							_hanging_vine(f, c, n, dv[1], false)
+			"attached_to_logs":
+				if not d.has("_prov"):
+					continue
+				var prob := float(d.get("probability", 1.0))
+				var dirs: Array = d.get("directions", ["up"])
+				var sh := logs.duplicate()
+				for i in range(sh.size() - 1, 0, -1):
+					var j := c.r.next_int_bound(i + 1)
+					var tmp = sh[i]
+					sh[i] = sh[j]
+					sh[j] = tmp
+				var dv3 := {"down": Vector3i(0, -1, 0), "up": Vector3i(0, 1, 0), "north": Vector3i(0, 0, -1), "south": Vector3i(0, 0, 1), "west": Vector3i(-1, 0, 0), "east": Vector3i(1, 0, 0)}
+				for q in sh:
+					var dir: Vector3i = dv3.get(str(dirs[c.r.next_int_bound(dirs.size())]).trim_prefix("minecraft:"), Vector3i(0, 1, 0))
+					var tgt: Vector3i = q + dir
+					if c.r.next_float() <= prob and _air(f, c, tgt):
+						f.set_block(c, tgt, f.provide(c, d["_prov"], tgt), 0)
 
 
 ## Java HugeRedMushroomFeature / HugeBrownMushroomFeature (AbstractHugeMushroomFeature.place):

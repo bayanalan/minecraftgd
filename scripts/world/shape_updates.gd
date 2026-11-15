@@ -14,6 +14,7 @@ const K_STAIRS := 4
 const K_GATE := 5
 const K_SOIL := 6       # dirt_path, farmland
 const K_EXCEPT := 7     # Java Block.isExceptionForConnection: never connects by a sturdy side
+const K_SNOWY := 8      # SnowyDirtBlock (grass block, podzol, mycelium): snowy = #snow above
 
 const SIDES := ["north", "south", "west", "east"]
 const SIDE_OFF := [Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(1, 0, 0)]
@@ -55,6 +56,8 @@ static func _k(bid: int) -> int:
 		k = K_STAIRS
 	elif n == "dirt_path" or n == "farmland":
 		k = K_SOIL
+	elif n in ["grass_block", "podzol", "mycelium"]:
+		k = K_SNOWY
 	elif n in ["barrier", "carved_pumpkin", "jack_o_lantern", "melon", "pumpkin"] or n.ends_with("shulker_box") or (vanilla and Tags.has_block("leaves", n)) or n.ends_with("_leaves"):
 		k = K_EXCEPT
 	_kind[bid] = k
@@ -178,6 +181,9 @@ static func computed(world, p: Vector3i, st: int) -> int:
 		K_STAIRS:
 			if b.has_prop(st, "shape"):
 				st = b.with_prop(st, "shape", _stairs_shape(world, p, st))
+		K_SNOWY:
+			if b.has_prop(st, "snowy"):
+				st = b.with_prop(st, "snowy", "true" if is_snow(world.state_at(p.x, p.y + 1, p.z)) else "false")
 	return st
 
 
@@ -213,6 +219,14 @@ static func _can_take(world, p: Vector3i, st: int, face: String) -> bool:
 	return not _is_stairs(n) or b.get_prop(n, "facing") != b.get_prop(st, "facing") or b.get_prop(n, "half") != b.get_prop(st, "half")
 
 
+## Java #snow (snow layers, snow block, powder snow).
+static func is_snow(st: int) -> bool:
+	if st <= 0:
+		return false
+	var n := Res.blocks.name_of(st)
+	return n == "snow" or n == "snow_block" or n == "powder_snow"
+
+
 static func _relevant(st: int) -> bool:
 	return st > 0 and ((Res.blocks.st_flags[st] & BlockRegistry.F_COLLIDE) != 0 or kind_of(st) != K_NONE)
 
@@ -220,9 +234,26 @@ static func _relevant(st: int) -> bool:
 ## A gameplay block change at p (old -> st): fix the block itself, then its six neighbours. Changes between
 ## non-colliding, non-connecting states (water flowing, plants) cannot affect any connection and return at once.
 static func on_changed(world, p: Vector3i, old: int, st: int) -> void:
+	var b := Res.blocks
+	# SnowyDirtBlock.updateShape (UP): the block below follows whether #snow sits on it
+	if is_snow(old) != is_snow(st):
+		var qd: int = world.state_at(p.x, p.y - 1, p.z)
+		if kind_of(qd) == K_SNOWY and b.has_prop(qd, "snowy"):
+			var nqd := b.with_prop(qd, "snowy", "true" if is_snow(st) else "false")
+			if nqd != qd:
+				world.set_block(p.x, p.y - 1, p.z, nqd, false)
+	# AttachedStemBlock.updateShape (wiki Melon Seeds: a stem grows another fruit once its fruit is removed): a stem attached
+	# to the melon / pumpkin that left p becomes a grown stem again
+	if old > 0 and st != old:
+		var on := b.name_of(old)
+		if (on == "melon" or on == "pumpkin") and b.name_of(maxi(st, 0)) != on:
+			for i in 4:
+				var q0: Vector3i = p + SIDE_OFF[i]
+				var qs0: int = world.state_at(q0.x, q0.y, q0.z)
+				if qs0 > 0 and b.name_of(qs0) == "attached_" + on + "_stem" and b.get_prop(qs0, "facing") == OPP[SIDES[i]]:
+					world.set_block(q0.x, q0.y, q0.z, b.with_prop(b.default_state(on + "_stem"), "age", "7"))
 	if not (_relevant(old) or _relevant(st)):
 		return
-	var b := Res.blocks
 	if st > 0 and kind_of(st) != K_NONE and kind_of(st) != K_SOIL and kind_of(st) != K_EXCEPT:
 		var ns := computed(world, p, st)
 		if ns != st:
@@ -234,7 +265,7 @@ static func on_changed(world, p: Vector3i, old: int, st: int) -> void:
 		if qs <= 0:
 			continue
 		var k := kind_of(qs)
-		if k == K_NONE or k == K_EXCEPT:
+		if k == K_NONE or k == K_EXCEPT or k == K_SNOWY:
 			continue
 		if k == K_SOIL:
 			if d.y == -1 and is_solid(st) and not b.name_of(st).ends_with("_fence_gate"):

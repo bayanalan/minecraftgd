@@ -3,8 +3,8 @@
 ## processors) plus template-based simple structures and approximate legacy-piece structures (StructuresLegacy).
 ## Starts are computed once per (structure set, start chunk) in a shared thread-safe cache; every chunk places only
 ## the parts of pieces inside itself during its feature stage, per generation step, before that step's features.
-## Terrain adaptation: Java Beardifier from rigid pool pieces (beard_pieces -> native density); jigsaw junctions are
-## not recorded (their 0.4-weighted beards around connections are missing).
+## Terrain adaptation: Java Beardifier from rigid pool pieces and the jigsaw junctions between pieces (beard_pieces ->
+## native density).
 ## APPROXIMATIONS: noise-based ground height uses the density column without
 ## aquifers (sea level used for water); pool aliases other than direct are ignored.
 class_name Structures
@@ -391,8 +391,9 @@ func spawn_override(x: int, y: int, z: int, category: String, below_name: String
 			return ov.get("spawns", [])
 	return null
 
-## /locate: nearest start of the named structure within max_r chunks (placement + biome stub check only).
-func locate(name: String, cx: int, cz: int, max_r: int = 100) -> Dictionary:
+## /locate: nearest start of the named structure within max_r units of its set's spacing (placement + biome stub check only). skip:
+## "name cx cz" keys of starts to pass over (explorer maps skip structures earlier maps found: ExplorerMaps).
+func locate(name: String, cx: int, cz: int, max_r: int = 100, skip: Dictionary = {}) -> Dictionary:
 	if name == "stronghold":
 		var s := nearest_stronghold(cx, cz)
 		return {"chunk": s} if s.x < (1 << 28) else {}
@@ -405,13 +406,25 @@ func locate(name: String, cx: int, cz: int, max_r: int = 100) -> Dictionary:
 				has = true
 		if not has:
 			continue
-		var cand: Array = _candidates(st, cx, cz, max_r)
-		cand.sort_custom(func(a, b): return (a - Vector2i(cx, cz)).length_squared() < (b - Vector2i(cx, cz)).length_squared())
-		for sc in cand:
-			var d: int = (sc - Vector2i(cx, cz)).length_squared()
+		# wiki /locate (Java): "the horizontal search range is 201x201 units of the Structure's spacing" (mansions
+		# +-128,000 blocks); explorer maps search the same way (wiki Explorer Map)
+		var pl: Dictionary = st["placement"]
+		var spacing := maxi(int(pl.get("spacing", 1)), 1) if str(pl.get("type", "")).trim_prefix("minecraft:") == "random_spread" else 1
+		var cand: Array = _candidates(st, cx, cz, max_r * spacing)
+		# nearest first: distance keys sorted natively (a lambda sort over the ~40000 candidates took ~0.5 s)
+		var keys := PackedInt64Array()
+		keys.resize(cand.size())
+		var c0 := Vector2i(cx, cz)
+		for ki in cand.size():
+			var cv: Vector2i = cand[ki]
+			keys[ki] = ((cv - c0).length_squared() << 20) | ki
+		keys.sort()
+		for kk in keys:
+			var sc: Vector2i = cand[kk & 0xFFFFF]
+			var d: int = kk >> 20
 			if d >= bd:
 				break
-			if _choose(st, sc) == name:
+			if _choose(st, sc) == name and (skip.is_empty() or not skip.has("%s %d %d" % [name, sc.x, sc.y])):
 				bd = d
 				best = {"chunk": sc}
 				break
@@ -530,6 +543,11 @@ func _make_start(st: Dictionary, sc: Vector2i) -> Dictionary:
 
 
 func biome_id_at(x: int, y: int, z: int) -> int:
+	if not gen.end_biomes and gen.single_biome < 0 and gen.native_tg >= 0 and Native.density_ok and Native.inst.has_method("tg_biome_at"):
+		# native multi-noise lookup (the stub biome checks of /locate and structure starts; GDScript climate took ms each)
+		var nb: int = int(Native.inst.tg_biome_at(gen.native_tg, x, y, z)[0])
+		if nb >= 0:
+			return nb
 	var ctx := DensityFunctions.Ctx.new(gen.dfc.node_count())
 	if gen.end_biomes:
 		return gen.end_biome_at(ctx, x >> 4, z >> 4)
@@ -976,7 +994,7 @@ func _jigsaw_stub(cfg: Dictionary, sc: Vector2i, r: RandomSources.LegacyRandom) 
 	if cfg.has("project_start_to_heightmap"):
 		k = pos.y + first_free_height(ci, cj, str(cfg["project_start_to_heightmap"]).begins_with("OCEAN"))
 	var dy: int = k - (box[0].y + 1)   # Java: piece.move(0, k - (minY + groundLevelDelta), 0), delta = 1
-	var piece := {"el": el, "pos": ppos + Vector3i(0, dy, 0), "rot": rot, "box": [box[0] + Vector3i(0, dy, 0), box[1] + Vector3i(0, dy, 0)]}
+	var piece := {"el": el, "pos": ppos + Vector3i(0, dy, 0), "rot": rot, "box": [box[0] + Vector3i(0, dy, 0), box[1] + Vector3i(0, dy, 0)], "gld": _el_gld(el)}
 	var m := k + off.y
 	return {"piece": piece, "center": Vector3i(ci, m, cj), "ci": ci, "cj": cj, "m": m}
 
@@ -1154,7 +1172,25 @@ func _try_children(cfg: Dictionary, pieces: Array, piece: Dictionary, free: Dict
 					var hpa: PackedInt32Array = shape["hp"]
 					hpa.append_array([b4[0].x, b4[0].y, b4[0].z, b4[1].x, b4[1].y, b4[1].z])
 					shape["hp"] = hpa
-					var np := {"el": el2, "pos": p6, "rot": rot2, "box": b4}
+					# Java: a rigid child's ground level is its parent's shifted by the connection's step (k2 = j3 - k1);
+					# both pieces record a JigsawJunction (the beardifier blends terrain toward it, weight 0.4)
+					var j3 := int(piece.get("gld", 1))
+					var k2 := j3 - pp if rigid2 else _el_gld(el2)
+					var l2: int
+					if rigid:
+						l2 = i + j
+					elif rigid2:
+						l2 = q + o
+					else:
+						if k == -1:
+							k = first_free_height(jpos.x, jpos.z)
+						l2 = k + pp / 2
+					if not piece.has("junctions"):
+						piece["junctions"] = PackedInt32Array()
+					var pjn: PackedInt32Array = piece["junctions"]
+					pjn.append_array([target_pos.x, l2 - j + j3, target_pos.z])
+					piece["junctions"] = pjn
+					var np := {"el": el2, "pos": p6, "rot": rot2, "box": b4, "gld": k2, "junctions": PackedInt32Array([jpos.x, l2 - o + k2, jpos.z])}
 					pieces.append(np)
 					if depth + 1 <= max_depth:
 						queue.append([np, shape, depth + 1, int(jb2["place"])])
@@ -1362,6 +1398,113 @@ static func _blackstone(blocks: BlockRegistry, st: int) -> int:
 # ------------------------------------------------------------------ chunk placement
 
 ## Place all structure pieces of `step` that intersect the origin chunk (called from Features.compute).
+## Surface structure parts of the 8 neighbour chunks of the region, placed into this origin's private view only (writes,
+## block entities, entities and post-processing discarded). Java places a piece's part during its chunk's decoration;
+## a neighbour decorated afterwards sees it, so its trees fail TreeFeature's free-space checks and leaves only fill
+## air (the clearing around villages, temples, igloos ...). Neighbour origins here otherwise read pristine terrain and
+## grew trees through the pieces (the parts inside the piece's own chunk then overwrote them: legacy village templates
+## ignore air, so leaves and trunks stayed inside the houses).
+const NEIGHBOUR_VIEW_STEP := 4   # SURFACE_STRUCTURES
+
+
+static var _nview: Dictionary = {}   # "dim|seed|cx,cz" -> PackedInt32Array [x, y, z, state]* (that chunk's part)
+static var _nscan: Dictionary = {}   # "dim|seed|cx,cz" -> _scan_at result of that chunk
+static var _nvm := Mutex.new()
+
+
+func place_neighbour_view(c: Features.FCtx, origin: Chunk, step: int) -> void:
+	if step != NEIGHBOUR_VIEW_STEP or by_step[step].is_empty() or old_scan:
+		return
+	var nw0 := c.writes.size()
+	for dz in [-1, 0, 1]:
+		for dx in [-1, 0, 1]:
+			if dx == 0 and dz == 0:
+				continue
+			if not c.has.is_empty() and c.has[(dz + 1) * 3 + dx + 1] == 0:
+				continue
+			var ncx: int = origin.cx + dx
+			var ncz: int = origin.cz + dz
+			var key := "%s|%d|%d,%d" % [gen.dimension, gen.seed, ncx, ncz]
+			_nvm.lock()
+			var cached = _nview.get(key)
+			_nvm.unlock()
+			if cached != null:
+				var cw: PackedInt32Array = cached
+				if c.flat.is_empty():
+					for k in range(0, cw.size(), 4):
+						f.set_block(c, Vector3i(cw[k], cw[k + 1], cw[k + 2]), cw[k + 3])
+					continue
+				# (inline Features.set_block without the write record; unchanged blocks skipped)
+				var flat: PackedInt32Array = c.flat
+				var fx0 := c.fx0
+				var fz0 := c.fz0
+				var hl_on := not c.hl.is_empty()
+				for k in range(0, cw.size(), 4):
+					var lx := cw[k] - fx0
+					var lz := cw[k + 2] - fz0
+					var y := cw[k + 1]
+					if lx < 0 or lx >= 48 or lz < 0 or lz >= 48 or y < -64 or y >= 320:
+						continue
+					var ci := (lz >> 4) * 3 + (lx >> 4)
+					if c.has[ci] == 0:
+						continue
+					var idx := ci * 98304 + ((y + 64) << 8) + ((lz & 15) << 4) + (lx & 15)
+					var st := cw[k + 3]
+					if flat[idx] == st:
+						continue
+					flat[idx] = st
+					if hl_on and c.hstate[ci] == 2:
+						f._hl_update(c, lx, y, lz, ci, st)
+				continue
+			# first origin to need this chunk's part: place it here (view only) and share the blocks
+			var nmin := Vector3i(ncx * 16, gen.gen_min_y, ncz * 16)
+			var nmax := nmin + Vector3i(15, gen.gen_depth, 15)
+			var found: Dictionary = _scan_cached(ncx, ncz).get(step, {})
+			var out := PackedInt32Array()
+			if not found.is_empty():
+				var nw1 := c.writes.size()
+				var be_keep := c.block_entities
+				var en_keep := c.entities
+				var pp_keep := c.postproc
+				c.block_entities = {}
+				c.entities = []
+				c.postproc = PackedInt32Array()
+				_place_found(c, found, by_step[step], step, Features.decoration_seed(gen.seed, ncx * 16, ncz * 16), nmin, nmax)
+				c.block_entities = be_keep
+				c.entities = en_keep
+				c.postproc = pp_keep
+				for k in range(nw1, c.writes.size(), 5):
+					out.append_array([c.writes[k], c.writes[k + 1], c.writes[k + 2], c.writes[k + 3]])
+			if gen.aborted:
+				break
+			_nvm.lock()
+			if _nview.size() > 3000:
+				_nview.clear()
+			_nview[key] = out
+			_nvm.unlock()
+	c.writes.resize(nw0)
+
+
+## _scan_at of a chunk, shared by every origin (the own pass and the 8 neighbour views read the same result).
+func _scan_cached(cx: int, cz: int) -> Dictionary:
+	var key := "%s|%d|%d,%d" % [gen.dimension, gen.seed, cx, cz]
+	_nvm.lock()
+	var v = _nscan.get(key)
+	_nvm.unlock()
+	if v != null:
+		return v
+	var nmin := Vector3i(cx * 16, gen.gen_min_y, cz * 16)
+	var res := _scan_at(cx, cz, nmin, nmin + Vector3i(15, gen.gen_depth, 15))
+	if gen.aborted:
+		return res
+	_nvm.lock()
+	if _nscan.size() > 3000:
+		_nscan.clear()
+	_nscan[key] = res
+	_nvm.unlock()
+	return res
+
+
 func place_step(c: Features.FCtx, origin: Chunk, step: int, deco: int) -> void:
 	var names: Array = by_step[step]
 	if names.is_empty():
@@ -1373,7 +1516,7 @@ func place_step(c: Features.FCtx, origin: Chunk, step: int, deco: int) -> void:
 		return
 	# one scan of every structure set per chunk, shared by all steps (results are pure, same order as per-step scans)
 	if c.struct_scan.is_empty():
-		c.struct_scan = _scan(origin, cmin, cmax)
+		c.struct_scan = _scan_cached(origin.cx, origin.cz)
 	var found: Dictionary = c.struct_scan.get(step, {})
 	_place_found(c, found, names, step, deco, cmin, cmax)
 
@@ -1385,10 +1528,11 @@ const ADAPT := {"beard_thin": 1, "beard_box": 2, "bury": 3, "encapsulate": 4}
 
 ## Java Beardifier.forStructuresInChunk: structures with a terrain adaptation whose start references this chunk (its
 ## box covers the chunk column); their rigid pool pieces within 12 blocks of the chunk ->
-## [min x, y, z, max x, y, z, adaptation, ground level delta]* (delta: 1 for template elements, 0 feature / empty).
-## Legacy (approximate) structures are not included.
+## [min x, y, z, max x, y, z, adaptation, ground level delta]* (the delta the jigsaw placer gave each piece; 0 for
+## non-pool pieces), then the pieces' jigsaw junctions near the chunk as [x, ground y, z, 0, 0, 0, 5, 0]*.
 func beard_pieces(cx: int, cz: int) -> PackedInt32Array:
 	var out := PackedInt32Array()
+	var jout := PackedInt32Array()
 	var x0 := cx * 16
 	var z0 := cz * 16
 	for st in sets:
@@ -1410,11 +1554,24 @@ func beard_pieces(cx: int, cz: int) -> PackedInt32Array:
 				if pb[1].x < x0 - 12 or pb[0].x > x0 + 15 + 12 or pb[1].z < z0 - 12 or pb[0].z > z0 + 15 + 12:
 					continue
 				var el: Dictionary = pc["el"]
+				var jn = pc.get("junctions")
+				if jn != null:
+					var jp: PackedInt32Array = jn
+					for q in range(0, jp.size(), 3):
+						if jp[q] > x0 - 12 and jp[q + 2] > z0 - 12 and jp[q] < x0 + 15 + 12 and jp[q + 2] < z0 + 15 + 12:
+							jout.append_array([jp[q], jp[q + 1], jp[q + 2], 0, 0, 0, 5, 0])
 				if str(el.get("proj", "rigid")) != "rigid":
 					continue
-				var delta := 0 if str(el.get("t", "")) in ["feature", "empty", "java"] else 1   # StructurePiece (non-pool): Rigid(box, adaptation, 0)
+				# StructurePiece (non-pool, "java"): Rigid(box, adaptation, 0)
+				var delta := 0 if str(el.get("t", "")) == "java" else int(pc.get("gld", _el_gld(el)))
 				out.append_array([pb[0].x, pb[0].y, pb[0].z, pb[1].x, pb[1].y, pb[1].z, ad, delta])
+	out.append_array(jout)
 	return out
+
+
+## StructurePoolElement.getGroundLevelDelta (template elements 1; feature / empty 0).
+static func _el_gld(el: Dictionary) -> int:
+	return 0 if str(el.get("t", "")) in ["feature", "empty", "java"] else 1
 
 
 ## Java Beardifier.compute for one block (GDScript reference of the native version in terrain.cpp).
@@ -1446,6 +1603,9 @@ static func beard_at(pieces: PackedInt32Array, x: int, y: int, z: int) -> float:
 			d += _bury(float(dx), float(dyb) / 2.0, float(dz))
 		elif ad == 4:
 			d += _bury(float(dx) / 2.0, float(maxi(0, maxi(pieces[o + 1] - y, y - pieces[o + 4]))) / 2.0, float(dz) / 2.0) * 0.8
+		elif ad == 5:   # JigsawJunction
+			var jy := y - pieces[o + 1]
+			d += _beard(x - pieces[o], jy, z - pieces[o + 2], jy) * 0.4
 	return d
 
 
@@ -1478,11 +1638,15 @@ func prefetch(cx: int, cz: int) -> void:
 
 
 func _scan(origin: Chunk, cmin: Vector3i, cmax: Vector3i) -> Dictionary:
+	return _scan_at(origin.cx, origin.cz, cmin, cmax)
+
+
+func _scan_at(cx: int, cz: int, cmin: Vector3i, cmax: Vector3i) -> Dictionary:
 	var by: Dictionary = {"_": true}
 	var prof_on := f.profiling
 	for st in sets:
 		var tset := Time.get_ticks_usec() if prof_on else 0
-		for sc in _candidates(st, origin.cx, origin.cz):
+		for sc in _candidates(st, cx, cz):
 			if gen.aborted:
 				return by
 			var res := _start(st, sc)
@@ -1510,7 +1674,7 @@ func _place_found(c: Features.FCtx, found: Dictionary, names: Array, step: int, 
 		var nm2: String = names[idx]
 		if not found.has(nm2):
 			continue
-		c.r = RandomSources.Xoroshiro.from_seed(deco + idx + 10000 * step)
+		c.r = RandomSources.WorldgenXoro.seeded(deco + idx + 10000 * step)
 		var tpl := Time.get_ticks_usec() if prof_on else 0
 		for res in found[nm2]:
 			_place_start(c, res, cmin, cmax)
@@ -1551,7 +1715,7 @@ func _place_step_old(c: Features.FCtx, origin: Chunk, step: int, deco: int) -> v
 		var nm2: String = names[idx]
 		if not found.has(nm2):
 			continue
-		c.r = RandomSources.Xoroshiro.from_seed(deco + idx + 10000 * step)
+		c.r = RandomSources.WorldgenXoro.seeded(deco + idx + 10000 * step)
 		var tpl := Time.get_ticks_usec() if prof_on else 0
 		for res in found[nm2]:
 			_place_start(c, res, cmin, cmax)
@@ -1695,7 +1859,15 @@ func _place_element(c: Features.FCtx, el: Dictionary, pos: Vector3i, rot: int, c
 		"single":
 			var tpl := _el_template(el)
 			if tpl != null:
-				tpl.place(f, c, pos, rot, el["procs"], bool(el["legacy"]), el["proj"] == "terrain_matching", cmin, cmax, 0, int(el.get("mirror", 0)), Vector3i.ZERO, str(el.get("markers", "")), not bool(el.get("noents", false)))
+				var pv: Vector3i = el.get("pivot", Vector3i.ZERO)
+				tpl.place(f, c, pos, rot, el["procs"], bool(el["legacy"]), el["proj"] == "terrain_matching", cmin, cmax, 0, int(el.get("mirror", 0)), pv, str(el.get("markers", "")), not bool(el.get("noents", false)))
+				if str(el.get("loc", "")) == "igloo/top":
+					# IglooPiece.postProcess: the floor hatch (template (3, 0, 5)) becomes snow unless air or a ladder is below
+					var hq := pos + StructureTemplate.transform(Vector3i(3, 0, 5), rot, pv)
+					if hq.x >= cmin.x and hq.x <= cmax.x and hq.z >= cmin.z and hq.z <= cmax.z:
+						var bs := f.get_block(c, hq + Vector3i(0, -1, 0))
+						if bs > 0 and not f.blocks.name_of(bs) in ["ladder", "cave_air", "void_air"]:
+							f.set_block(c, hq, f.blocks.default_state("snow_block"))
 		"list":
 			for s in el["subs"]:
 				_place_element(c, s, pos, rot, cmin, cmax)

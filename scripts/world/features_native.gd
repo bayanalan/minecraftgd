@@ -104,7 +104,7 @@ func build(fe: Features) -> Dictionary:
 	var tables := _state_tables()
 	var h: int = int(Native.inst.fx_config([I, F, M, BS, b.st_flags, b.st_block, tables[0], tables[1], tables[2], tables[3],
 		PackedInt32Array([BlockRegistry.F_LIQUID, BlockRegistry.F_WATERLOGGED, BlockRegistry.F_COLLIDE, BlockRegistry.F_REPLACEABLE,
-		BlockRegistry.F_FULL_SHAPE, BlockRegistry.F_OPAQUE, BlockRegistry.F_LAVA, fe.gen.gen_min_y, fe.gen.gen_depth, BlockRegistry.F_LEAVES]), fe.simplex_info.p, tables[4], tables[5]])[0])
+		BlockRegistry.F_FULL_SHAPE, BlockRegistry.F_OPAQUE, BlockRegistry.F_LAVA, fe.gen.gen_min_y, fe.gen.gen_depth, BlockRegistry.F_LEAVES, BlockRegistry.F_TREE_REPL]), fe.simplex_info.p, tables[4], tables[5]])[0])
 	return {"handle": h, "ids": ids, "count": ids.size(), "of": fe.feature_biomes.size(), "why": why_hist}
 
 
@@ -445,7 +445,7 @@ func emit_cf(cf: Dictionary) -> int:
 		"ore", "scattered_ore":
 			var tg: Array = []
 			for x in cf["targets"]:
-				tg.append([emit_rt(x[0]), int(x[1])])
+				tg.append([emit_rt(x[0]), int(x[1]), int(x[2])])
 			var nd := [1 if t == "ore" else 2, int(cf["size"]), _fl(float(cf["discard"])), tg.size()]
 			for x in tg:
 				nd.append_array(x)
@@ -514,7 +514,7 @@ func emit_cf(cf: Dictionary) -> int:
 				nd7.append(b.with_prop(bst, dn, "true") if bst > 0 and b.has_prop(bst, dn) else -1)
 			return _node(nd7)
 		"block_pile":
-			return _node([13, emit_pv(cf["prov"])])
+			return _node([13, emit_pv(cf["prov"]), b.block_id("dirt_path")])
 		"underwater_magma":
 			return _node([14, int(cf["range"]), int(cf["radius"]), _fl(float(cf["prob"])), b.block_id("water"), b.default_state("magma_block")])
 		"vines":
@@ -569,6 +569,31 @@ func emit_cf(cf: Dictionary) -> int:
 				return _node([0])
 			var nd11 := [23, emit_pv(cf["trunk"]), emit_ip(cf["len"]), ax.size() / 4]
 			nd11.append_array(ax)
+			# stump trunk_vine flag + vine states for the -x / +x / -z / +z sides, then attached_to_logs decorators
+			var vine2 := b.default_state("vine")
+			var sv := 0
+			for sd in cf.get("stump_decorators", []):
+				var stt := str(sd.get("type", "")).trim_prefix("minecraft:")
+				if stt == "trunk_vine":
+					sv = 1
+				else:
+					ok = false   # (unsupported stump decorator: GDScript)
+			nd11.append(sv)
+			for fc2 in ["east", "west", "south", "north"]:
+				nd11.append(b.with_prop(vine2, fc2, "true") if vine2 >= 0 else -1)
+			var atts: Array = []
+			for ld in cf.get("log_decorators", []):
+				if str(ld.get("type", "")).trim_prefix("minecraft:") == "attached_to_logs" and ld.has("_prov"):
+					atts.append(ld)
+				else:
+					ok = false   # (shelf_mushroom etc.: GDScript)
+			nd11.append(atts.size())
+			var dcode := {"down": 0, "up": 1, "north": 2, "south": 3, "west": 4, "east": 5}
+			for ad in atts:
+				var ds: Array = ad.get("directions", ["up"])
+				nd11.append_array([_fl(float(ad.get("probability", 1.0))), emit_pv(ad["_prov"]), ds.size()])
+				for dn3 in ds:
+					nd11.append(int(dcode.get(str(dn3).trim_prefix("minecraft:"), 1)))
 			return _node(nd11)
 		"huge_brown_mushroom", "huge_red_mushroom":
 			# + #dirt / #mushroom_grow_block masks and the cap state per face bitmask (up 1, north 2, south 4, east 8, west 16)
@@ -708,7 +733,7 @@ func _axis_table(pv: Dictionary) -> PackedInt32Array:
 
 
 const TRUNKS := {"straight_trunk_placer": 0, "dark_oak_trunk_placer": 1, "giant_trunk_placer": 2, "mega_jungle_trunk_placer": 3,
-	"forking_trunk_placer": 4, "bending_trunk_placer": 4, "upwards_branching_trunk_placer": 4, "cherry_trunk_placer": 4, "fancy_trunk_placer": 5}
+	"forking_trunk_placer": 4, "bending_trunk_placer": 4, "upwards_branching_trunk_placer": 6, "cherry_trunk_placer": 4, "fancy_trunk_placer": 5}
 const FOLIAGES := {"blob": 0, "cherry": 1, "bush": 2, "spruce": 3, "pine": 4, "mega_pine": 5, "acacia": 6, "fancy": 7, "jungle": 8, "dark_oak": 9, "random_spread": 10}
 
 
@@ -832,6 +857,24 @@ func emit_tree(cf: Dictionary) -> int:
 	nd4.append_array(ax)
 	nd4.append(decs.size())
 	nd4.append_array(decs)
+	# minimum_size (TreeFeature.getMaxFreeTreeHeight): [0 two_layers / 1 three_layers, limit, upper_limit, lower, middle, upper,
+	# min_clipped_height or -1, ignore_vines, vine block id]
+	var ms: Dictionary = cf.get("ms", {})
+	var three := str(ms.get("type", "")).trim_prefix("minecraft:") == "three_layers_feature_size"
+	nd4.append_array([1 if three else 0, int(ms.get("limit", 1)), int(ms.get("upper_limit", 1)), int(ms.get("lower_size", 0)),
+		int(ms.get("middle_size", 1)), int(ms.get("upper_size", 1)), int(ms.get("min_clipped_height", -1)), 1 if bool(cf.get("iv", false)) else 0, b.block_id("vine")])
+	# then [can_grow_through mask (UpwardsBranchingTrunkPlacer) or -1, branch probability (F), extra_branch_length,
+	# extra_branch_steps, root placer flag, root data: trunk_offset_y, root provider, can_grow_through mask, muddy_roots_in
+	# mask, muddy provider, max length, max width, skew chance (F), above chance (F) or -1, above provider]
+	nd4.append_array([_mask_blocks(cf["tgrow"]) if cf.has("tgrow") else -1, _fl(float(tp.get("place_branch_per_log_probability", 0.5))),
+		emit_ip(tp.get("extra_branch_length", 0)), emit_ip(tp.get("extra_branch_steps", 1))])
+	var rp: Dictionary = cf.get("rp", {})
+	if rp.is_empty():
+		nd4.append(0)
+	else:
+		var has_above := float(rp["above_p"]) >= 0.0
+		nd4.append_array([1, emit_ip(rp["off"]), emit_pv(rp["prov"]), _mask_blocks(rp["grow"]), _mask_blocks(rp["muddy_in"]), emit_pv(rp["muddy"]),
+			int(rp["len"]), int(rp["width"]), _fl(float(rp["skew"])), _fl(float(rp["above_p"])) if has_above else -1, emit_pv(rp["above"]) if has_above else 0])
 	return _node(nd4)
 
 
@@ -849,6 +892,28 @@ func _mask(tag: String) -> int:
 			mk[st] = 1
 	M.append_array(mk)
 	_mask_off[tag] = o
+	return o
+
+
+## Per-state mask of a block id set (Features._block_set).
+func _mask_blocks(ids: Dictionary) -> int:
+	var ks: Array = ids.keys()
+	ks.sort()
+	var key := "ids:" + str(ks)
+	if _mask_off.has(key):
+		return _mask_off[key]
+	var n := b.total_states
+	var o := M.size()
+	var mk := PackedByteArray()
+	mk.resize(n)
+	mk.fill(0)
+	for bi in ks:
+		var bid := int(bi)
+		if bid >= 0 and bid < b.block_first.size():
+			for k in b.block_count[bid]:
+				mk[b.block_first[bid] + k] = 1
+	M.append_array(mk)
+	_mask_off[key] = o
 	return o
 
 
@@ -879,7 +944,7 @@ func _state_tables() -> Array:
 		var nm := b.name_of(st)
 		if st > 0 and nm.ends_with("air"):
 			airn[st] = 1
-		if st > 0 and nm.ends_with("_log"):
+		if st > 0 and Trees.is_log_name(nm):   # #logs (TrunkPlacer.isFree, log overlap)
 			logn[st] = 1
 		var bits := 0
 		if st > 0 and nm in dirt:

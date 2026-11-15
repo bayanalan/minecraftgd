@@ -61,7 +61,7 @@ func _build_rows() -> void:
 			continue
 		var n: String = _rows[i][1]
 		var def = GameRules.SPEC[n][0]
-		var tip := Res.tr_key("gamerule.%s.description" % n, "")
+		var tip := Res.tr_key(GameRules.lang_key(n) + ".description", "")
 		tip = (tip + "\n" if tip != "" else "") + Res.tr_key("editGamerule.default", "Default: %s").replace("%s", str(def))
 		var w: Control
 		if def is bool:
@@ -101,14 +101,12 @@ func _draw_row(l: McList, i: int, r: Rect2, _hovered: bool, _sel: bool) -> void:
 	var row: Array = _rows[i]
 	if row[0] == "cat":
 		var t := Res.tr_key("gamerule.category." + str(row[1]), str(row[1]).capitalize())
-		var tw := McList.text_w(t) + 1.0
+		var tw := McList.text_w_bold(t)
 		var x := r.position.x + floorf((220.0 - tw) / 2.0) * s
-		var col := Color8(255, 255, 85)
-		l.text(Vector2(x, r.position.y + 5 * s), t, col)
-		l.text(Vector2(x + s, r.position.y + 5 * s), t, col)   # Java bold: second pass 1 px right
+		l.text_bold(Vector2(x, r.position.y + 5 * s), t, Color8(255, 255, 85))
 		return
 	var n: String = row[1]
-	var lines := _split(Res.tr_key("gamerule." + n, n), 175.0)
+	var lines := _split(Res.tr_key(GameRules.lang_key(n), n), 175.0)
 	if lines.size() == 1:
 		l.text(Vector2(r.position.x, r.position.y + 5 * s), lines[0], Color(1, 1, 1), false)
 	else:
