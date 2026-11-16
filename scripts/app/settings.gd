@@ -124,6 +124,8 @@ func _ready() -> void:
 	apply_all()
 	get_window().focus_entered.connect(_on_focus.bind(true))
 	get_window().focus_exited.connect(_on_focus.bind(false))
+	# F11 straight from the window (before any node or screen sees the event): it works on every screen like Java
+	get_window().window_input.connect(_on_window_input)
 
 
 var _focused := true
@@ -219,12 +221,27 @@ func get_v(key: String):
 	return values.get(key, default_of(key) if SPEC.has(key) else null)
 
 
-## Java KeyboardHandler: the fullscreen key (F11) toggles fullscreen on every screen (title, menus, in game).
-func _input(event: InputEvent) -> void:
+## Java KeyboardHandler: the fullscreen key (F11) toggles fullscreen on every screen (title, menus, chat, in game).
+## Handled from Window.window_input, which fires before the event reaches any node (screens with their own _input
+## used to swallow it), so nothing can block it.
+func _on_window_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo and InputMap.has_action("fullscreen") and event.is_action_pressed("fullscreen"):
-		set_v("display_mode", "windowed" if str(values["display_mode"]) != "windowed" else "borderless")
-		save()
-		get_viewport().set_input_as_handled()
+		toggle_fullscreen()
+
+
+## Windowed <-> full screen (back to the full-screen mode chosen in the options when there is one).
+func toggle_fullscreen() -> void:
+	var cur := str(values["display_mode"])
+	if cur != "windowed":
+		_last_full = cur
+		set_v("display_mode", "windowed")
+	else:
+		set_v("display_mode", _last_full)
+	if not OS.get_cmdline_user_args().has("--autoplay"):
+		save()   # (automated runs never write the player's settings)
+
+
+var _last_full := "fullscreen"
 
 
 func set_v(key: String, v, apply := true) -> void:

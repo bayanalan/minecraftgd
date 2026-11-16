@@ -2172,6 +2172,29 @@ func _auto_run() -> void:
 				if himg != null:
 					himg.save_png("user://autoplay/screen_horse.png")
 				close_screen()
+	if autoplay.has("keytest"):   # --keytest=1: F11 through the real input path (Input.parse_input_event), window mode before / after
+		for ki in 4:
+			if ki == 2:
+				var kcs = load("res://scripts/ui/chat_screen.gd").new()
+				kcs.world = self
+				open_screen(kcs)
+			elif ki == 3:
+				close_screen()
+				open_screen(load("res://scripts/ui/options_menu.gd").new())
+			for fw in 10:
+				await get_tree().process_frame
+			var m0 := DisplayServer.window_get_mode()
+			var kd := InputEventKey.new()
+			kd.physical_keycode = KEY_F11
+			kd.keycode = KEY_F11
+			kd.pressed = true
+			Input.parse_input_event(kd)
+			var ku := kd.duplicate()
+			ku.pressed = false
+			Input.parse_input_event(ku)
+			for fi in 30:
+				await get_tree().process_frame
+			print("[keytest] F11 #%d (%s): window mode %d -> %d, display_mode %s" % [ki, "no screen" if screen == null else str(screen.get_script().resource_path.get_file()), m0, DisplayServer.window_get_mode(), str(Settings.get_v("display_mode"))])
 	if autoplay.has("cam"):
 		var cp: PackedStringArray = str(autoplay["cam"]).split(",")
 		player.mode = Player.Mode.CREATIVE if autoplay.has("survival") else Player.Mode.SPECTATOR

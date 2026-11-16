@@ -52,6 +52,9 @@ BUG BATCH 2026-11-15 (user list of 26; fix all before stopping - see memory proj
 - [x] Campfire smoke: Java CampfireBlockEntity.particleTick every tick (11 % chance of 2-3 cosy / signal smoke, y 0..2
       above, quad x3, 80-129 / 280-329 ticks, fade over the last 60, random fixed sprite); animateTick only adds lava
       (1 in 5); every campfire gets its block entity (structures, commands)
+- [x] F11 fullscreen on every screen: handled from Window.window_input (before any node: menus / chat / options
+      with their own _input used to swallow it), toggles windowed <-> the chosen full-screen mode; automated runs never
+      save it (--keytest=1 probe: in game, chat, options all toggle)
 - [~] Alt-tab back: "fullscreen" is now Godot's non-exclusive full screen (exclusive D3D12 windows sometimes never
       reactivated; no FPS difference measured), a minimised window is restored and the mouse recaptured on focus in -
       needs an in-game check
