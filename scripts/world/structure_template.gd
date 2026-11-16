@@ -574,6 +574,8 @@ static func _block_entity(c: Features.FCtx, blocks: BlockRegistry, wp: Vector3i,
 	elif data is Dictionary and data.get("SpawnData") is Dictionary:
 		var sent = (data["SpawnData"] as Dictionary).get("entity", {})
 		c.block_entities[wp] = {"id": "spawner", "mob": str(sent.get("id", "minecraft:pig")).trim_prefix("minecraft:") if sent is Dictionary else "pig"}
+	elif st > 0 and blocks.name_of(st).ends_with("campfire"):
+		c.block_entities[wp] = {"id": blocks.name_of(st)}   # (village / ruin campfires: their block entity ticks the smoke)
 
 
 static func _capped_any(procs: Array) -> bool:

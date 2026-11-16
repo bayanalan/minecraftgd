@@ -59,6 +59,7 @@ func _ready() -> void:
 		test_vanilla_fluids_fire()
 		test_vanilla_waterlogging()
 		test_vanilla_gravity_support()
+		test_vanilla_support_breaking()
 		test_vanilla_snow_weather()
 		test_vanilla_breaking()
 		test_vanilla_structure_ports()
@@ -66,6 +67,7 @@ func _ready() -> void:
 		test_vanilla_player_blocks()
 		test_vanilla_sensors()
 		test_vanilla_redstone_blocks()
+		preload("res://scenes/tests/redstone_tests.gd").new().run(self)   # redstone vanilla matrix
 		test_vanilla_growth()
 		test_vanilla_mob_behaviors()
 		test_vanilla_mob_leftovers()
@@ -964,6 +966,98 @@ func test_vanilla_enchanting() -> void:
 	ok("brewing stand brews in 400 ticks", Potions.potion_of(ItemStack.from_dict(be["items"][0])) == "awkward" and ItemStack.from_dict(be["items"][3]).is_empty() and int(be["fuel"]) == 19)
 
 
+## Java RedStoneWireBlock shapes / signal rules (wiki Redstone Dust): crosses, lines, climbing, cuts, dot toggle,
+## pointing, per-power colours.
+func _test_redstone_wire_shapes() -> void:
+	var b := Res.blocks
+	var wire := b.default_state("redstone_wire")
+	var stone := b.default_state("stone")
+	var w := RsWorld.new()
+	for x in range(-3, 8):
+		for z in range(-3, 4):
+			w.blocks[Vector3i(x, -1, z)] = stone
+	# a lone dust is a cross; one neighbour makes a line along it
+	w.blocks[Vector3i(0, 0, 0)] = wire
+	RedstoneWire.update_around(w, Vector3i(0, 0, 0), true)
+	ok("redstone dust: alone = cross", RedstoneWire.is_cross(w.state_at(0, 0, 0)))
+	w.blocks[Vector3i(1, 0, 0)] = wire
+	RedstoneWire.update_around(w, Vector3i(1, 0, 0), true)
+	var s0 := w.state_at(0, 0, 0)
+	ok("redstone dust: two in a row = east-west line", b.get_prop(s0, "east") == "side" and b.get_prop(s0, "west") == "side" and b.get_prop(s0, "north") == "none" and b.get_prop(s0, "south") == "none")
+	# a corner: dust at (0, 0, 1) turns the first into an L (east + south)
+	w.blocks[Vector3i(0, 0, 1)] = wire
+	RedstoneWire.update_around(w, Vector3i(0, 0, 1), true)
+	s0 = w.state_at(0, 0, 0)
+	ok("redstone dust: corner", b.get_prop(s0, "east") == "side" and b.get_prop(s0, "south") == "side" and b.get_prop(s0, "west") == "none" and b.get_prop(s0, "north") == "none")
+	# climbing: a block east of the line's end with dust on top -> up; a solid block above the lower dust cuts it
+	var w2 := RsWorld.new()
+	for x in range(-3, 8):
+		w2.blocks[Vector3i(x, -1, 0)] = stone
+	w2.blocks[Vector3i(1, 0, 0)] = stone
+	w2.blocks[Vector3i(0, 0, 0)] = wire
+	w2.blocks[Vector3i(1, 1, 0)] = wire
+	RedstoneWire.update_around(w2, Vector3i(0, 0, 0), true)
+	RedstoneWire.update_around(w2, Vector3i(1, 1, 0), true)
+	ok("redstone dust: climbs a block (east = up)", b.get_prop(w2.state_at(0, 0, 0), "east") == "up")
+	ok("redstone dust: the upper dust points down to it (west = side)", b.get_prop(w2.state_at(1, 1, 0), "west") == "side")
+	w2.blocks[Vector3i(-3, 0, 0)] = b.with_prop(b.default_state("lever"), "powered", "true")
+	w2.blocks[Vector3i(-2, 0, 0)] = wire
+	w2.blocks[Vector3i(-1, 0, 0)] = wire
+	RedstoneWire.update_around(w2, Vector3i(-2, 0, 0), true)
+	RedstoneWire.update_around(w2, Vector3i(-1, 0, 0), true)
+	Redstone.on_changed(w2, Vector3i(-3, 0, 0))
+	ok("redstone dust: power climbs (15 .. 12 on top)", b.get_prop(w2.state_at(0, 0, 0), "power") == "13" and b.get_prop(w2.state_at(1, 1, 0), "power") == "12")
+	w2.blocks[Vector3i(0, 1, 0)] = stone   # conductive block above the lower dust: the climb is cut
+	RedstoneWire.update_around(w2, Vector3i(0, 1, 0), false)
+	Redstone.on_changed(w2, Vector3i(0, 1, 0))
+	ok("redstone dust: a block above cuts the climb", b.get_prop(w2.state_at(0, 0, 0), "east") != "up" and b.get_prop(w2.state_at(1, 1, 0), "power") == "0")
+	# glass passes power up but not down
+	var w3 := RsWorld.new()
+	for x in range(-3, 8):
+		w3.blocks[Vector3i(x, -1, 0)] = stone
+	w3.blocks[Vector3i(1, 0, 0)] = b.default_state("glass")
+	w3.blocks[Vector3i(0, 0, 0)] = wire
+	w3.blocks[Vector3i(1, 1, 0)] = wire
+	w3.blocks[Vector3i(-1, 0, 0)] = b.default_state("redstone_block")
+	RedstoneWire.update_around(w3, Vector3i(0, 0, 0), true)
+	RedstoneWire.update_around(w3, Vector3i(1, 1, 0), true)
+	Redstone.on_changed(w3, Vector3i(-1, 0, 0))
+	ok("redstone dust: power goes up onto glass", b.get_prop(w3.state_at(1, 1, 0), "power") == "14")
+	w3.blocks[Vector3i(-1, 0, 0)] = stone
+	w3.blocks[Vector3i(2, 1, 0)] = b.default_state("redstone_block")
+	Redstone.on_changed(w3, Vector3i(-1, 0, 0))
+	Redstone.on_changed(w3, Vector3i(2, 1, 0))
+	ok("redstone dust: power never goes down from glass", b.get_prop(w3.state_at(1, 1, 0), "power") == "15" and b.get_prop(w3.state_at(0, 0, 0), "power") == "0")
+	# dot toggle: a lone cross becomes a dot, back to a cross; a dot powers only the block below
+	var w4 := RsWorld.new()
+	w4.blocks[Vector3i(0, -1, 0)] = stone
+	w4.blocks[Vector3i(0, 0, 0)] = wire
+	RedstoneWire.update_around(w4, Vector3i(0, 0, 0), true)
+	RedstoneWire.toggle(w4, Vector3i(0, 0, 0), w4.state_at(0, 0, 0))
+	ok("redstone dust: right-click cross -> dot", RedstoneWire.is_dot(w4.state_at(0, 0, 0)))
+	var pw := b.with_prop(w4.state_at(0, 0, 0), "power", "9")
+	ok("redstone dust: a dot powers below, not the sides", RedstoneWire.signal_to(w4, Vector3i(0, 0, 0), pw, Vector3i(0, -1, 0)) == 9 and RedstoneWire.signal_to(w4, Vector3i(0, 0, 0), pw, Vector3i(1, 0, 0)) == 0)
+	RedstoneWire.toggle(w4, Vector3i(0, 0, 0), w4.state_at(0, 0, 0))
+	ok("redstone dust: right-click dot -> cross", RedstoneWire.is_cross(w4.state_at(0, 0, 0)))
+	# a lamp beside a line that does not point at it stays off
+	var w5 := RsWorld.new()
+	for x in range(-3, 8):
+		for z in range(-2, 3):
+			w5.blocks[Vector3i(x, -1, z)] = stone
+	w5.blocks[Vector3i(-1, 0, 0)] = b.default_state("redstone_block")
+	for x in range(0, 4):
+		w5.blocks[Vector3i(x, 0, 0)] = wire
+	w5.blocks[Vector3i(4, 0, 0)] = stone
+	for x in range(0, 4):
+		RedstoneWire.update_around(w5, Vector3i(x, 0, 0), true)
+	w5.blocks[Vector3i(2, 0, 1)] = b.default_state("redstone_lamp")
+	Redstone.on_changed(w5, Vector3i(-1, 0, 0))
+	Redstone.on_changed(w5, Vector3i(2, 0, 1))
+	ok("redstone dust: a line passing a lamp does not light it", b.get_prop(w5.state_at(2, 0, 1), "lit") != "true" and b.get_prop(w5.state_at(2, 0, 0), "power") == "13")
+	# colours per power (wiki Block colors, Redstone tints JE)
+	ok("redstone dust: colour per power level", b.st_tint_color[b.with_prop(wire, "power", "0")] == 0x4C0000 and b.st_tint_color[b.with_prop(wire, "power", "15")] == 0xFF3200 and b.st_tint_color[b.with_prop(wire, "power", "8")] == 0xB70000)
+
+
 func test_vanilla_redstone() -> void:
 	var b := Res.blocks
 	var w := RsWorld.new()
@@ -975,9 +1069,21 @@ func test_vanilla_redstone() -> void:
 	for x in range(1, 4):
 		w.blocks[Vector3i(x, 0, 0)] = b.default_state("redstone_wire")
 	w.blocks[Vector3i(4, 0, 0)] = b.default_state("redstone_lamp")
+	for x in range(1, 4):
+		RedstoneWire.update_around(w, Vector3i(x, 0, 0), true)   # (placement shape, as WorldManager.set_block does)
 	Redstone.on_changed(w, Vector3i(0, 0, 0))
 	ok("redstone dust decays", b.get_prop(w.state_at(1, 0, 0), "power") == "15" and b.get_prop(w.state_at(3, 0, 0), "power") == "13")
 	ok("redstone lamp lights", b.get_prop(w.state_at(4, 0, 0), "lit") == "true")
+	_test_redstone_wire_shapes()
+	# creative search "#": item tags whose path contains the text (Java CreativeModeInventoryScreen.updateVisibleTags)
+	var CS = load("res://scripts/ui/creative_screen.gd")
+	var fl: Dictionary = {}
+	for vt in CS.tag_matches("flowers"):
+		fl.merge(vt[1])
+	var lg: Dictionary = {}
+	for vt2 in CS.tag_matches("minecraft:logs"):
+		lg.merge(vt2[1])
+	ok("creative search #flowers / #minecraft:logs", fl.has("dandelion") and fl.has("poppy") and fl.has("sunflower") and lg.has("oak_log") and not fl.has("stone") and CS.tag_matches("other_mod:logs").is_empty())
 	# repeater: input from the east (facing east), outputs west into a lamp after its scheduled tick
 	var w2 := RsWorld.new()
 	w2.blocks[Vector3i(1, 0, 0)] = b.default_state("redstone_block")
@@ -994,10 +1100,15 @@ func test_vanilla_redstone() -> void:
 	w3.blocks[Vector3i(0, 0, 0)] = pis
 	w3.blocks[Vector3i(1, 0, 0)] = stone
 	w3.blocks[Vector3i(0, 1, 0)] = b.default_state("redstone_block")
-	Redstone.scheduled(w3, Vector3i(0, 0, 0), pis)
+	Pistons.reset()
+	Pistons.queue_event(Vector3i(0, 0, 0))   # (the block event; its moving blocks finish 2 ticks later)
+	Pistons.tick(w3)
+	Pistons.finish_all(w3)
 	ok("piston extends and pushes", b.name_of(w3.state_at(1, 0, 0)) == "piston_head" and w3.state_at(2, 0, 0) == stone)
 	w3.blocks[Vector3i(0, 1, 0)] = 0
-	Redstone.scheduled(w3, Vector3i(0, 0, 0), w3.state_at(0, 0, 0))
+	Pistons.queue_event(Vector3i(0, 0, 0))
+	Pistons.tick(w3)
+	Pistons.finish_all(w3)
 	ok("sticky piston pulls back", w3.state_at(1, 0, 0) == stone and w3.state_at(2, 0, 0) == 0)
 	# obsidian blocks a push
 	var w4 := RsWorld.new()
@@ -1005,7 +1116,8 @@ func test_vanilla_redstone() -> void:
 	w4.blocks[Vector3i(0, 0, 0)] = pis2
 	w4.blocks[Vector3i(0, 1, 0)] = b.default_state("obsidian")
 	w4.blocks[Vector3i(1, 0, 0)] = b.default_state("redstone_block")
-	Redstone.scheduled(w4, Vector3i(0, 0, 0), pis2)
+	Pistons.queue_event(Vector3i(0, 0, 0))
+	Pistons.tick(w4)
 	ok("piston cannot push obsidian", b.get_prop(w4.state_at(0, 0, 0), "extended") == "false")
 
 
@@ -1408,6 +1520,51 @@ func test_vanilla_block_entity_renders() -> void:
 			if m is ShaderMaterial:
 				pot_tex.append(m)
 	ok("decorated pot: sherd sides use their pottery pattern materials", pot != null and pot_tex.has(EntityRenderer.material("entity/decorated_pot/angler_pottery_pattern")) and pot_tex.has(EntityRenderer.material("entity/decorated_pot/skull_pottery_pattern")))
+	# 2026-11-15 batch: blank enchanting book, item icons / held models, lantern placement
+	var book_tex := false
+	if et != null:
+		for mi in BERender._meshes(et):
+			var bm2 = (mi as MeshInstance3D).material_override
+			book_tex = book_tex or (bm2 is ShaderMaterial and bool((bm2 as ShaderMaterial).get_shader_parameter("has_tex")))
+	ok("enchanting table: the book uses the 26.3 texture (entity/enchantment/enchanting_table_book)", book_tex and EntityRenderer.texture("entity/enchantment/enchanting_table_book") != null)
+	var it := Res.items
+	ok("special item models only for items/<name>.json minecraft:special (chest, banner, skull, pot; not enchanting table / shelf / bell)",
+		BERender.special_item(it.id("chest")) and BERender.special_item(it.id("white_banner")) and BERender.special_item(it.id("skeleton_skull")) and BERender.special_item(it.id("decorated_pot"))
+		and not BERender.special_item(it.id("enchanting_table")) and not BERender.special_item(it.id("oak_shelf")) and not BERender.special_item(it.id("bell")))
+	var wm := EntityRenderer.item_block_mesh(it.id("cobblestone_wall"))
+	var wab: AABB = wm.get_aabb() if wm != null else AABB()
+	ok("held wall: the wall_inventory model (post + a full-length wall), not the lone default-state post", wm != null and is_equal_approx(wab.size.z, 1.0) and is_equal_approx(wab.size.x, 0.5), str(wab))
+	# (the wall's default state has no geometry of its own: the hand / frame / ground paths fell back to the extruded icon)
+	var wn := HeldItems.item_node(ItemStack.named("cobblestone_wall", 1), "fixed", false)
+	var wmi: MeshInstance3D = wn.get_child(0) as MeshInstance3D if wn != null and wn.get_child_count() > 0 else null
+	ok("wall in hand / frame / on the ground: HeldItems.item_node draws that mesh", wmi != null and wmi.mesh == wm)
+	if wn != null:
+		wn.free()
+	var shm := EntityRenderer.item_block_mesh(it.id("oak_shelf"))
+	ok("held shelf: its shelf_inventory model", shm != null and shm.get_faces().size() > 0)
+	var sgm := EntityRenderer.item_block_mesh(it.id("white_stained_glass"))
+	ok("held stained glass: blended (translucent item material), glass stays cutout", sgm != null and sgm.surface_get_material(0) == Res.mat_item_block_translucent
+		and EntityRenderer.item_block_mesh(it.id("glass")).surface_get_material(0) == Res.mat_item_block)
+	var pane_em: Array = ItemIcons.extruded_model("item/white_stained_glass_pane")
+	var stick_em: Array = ItemIcons.extruded_model("item/stick")
+	ok("held stained glass pane: translucent flat item material; a stick keeps the cutout one", pane_em.size() == 2 and stick_em.size() == 2
+		and EntityRenderer.flat_item_material(pane_em[1]).shader == EntityRenderer.translucent_shader() and EntityRenderer.flat_item_material(stick_em[1]).shader != EntityRenderer.translucent_shader())
+	var lw := MockWorld.new()
+	var lp := Player.new()
+	lp.pitch = 30.0
+	var lan := b.default_state("copper_lantern")
+	lw.grid[Vector3i(0, 67, 0)] = b.STONE
+	lw.grid[Vector3i(4, 70, 0)] = b.default_state("oak_fence")
+	lw.grid[Vector3i(6, 70, 0)] = b.default_state("oak_fence_gate")
+	var l_under := Interaction.lantern_placement(lw, Vector3i(0, 66, 0), lan, Vector3i(0, -1, 0), lp)
+	var l_top := Interaction.lantern_placement(lw, Vector3i(0, 64, 0), lan, Vector3i(0, 1, 0), lp)
+	var l_side := Interaction.lantern_placement(lw, Vector3i(0, 66, 0), lan, Vector3i(1, 0, 0), lp)
+	var l_fence := Interaction.lantern_placement(lw, Vector3i(4, 69, 0), lan, Vector3i(0, -1, 0), lp)
+	var l_air := Interaction.lantern_placement(lw, Vector3i(9, 69, 0), lan, Vector3i(0, -1, 0), lp)
+	var l_gate := Interaction.lantern_placement(lw, Vector3i(6, 69, 0), lan, Vector3i(0, -1, 0), lp)
+	ok("lantern placement (Java LanternBlock): under a block / fence it hangs, on the floor it stands, side click falls back to the surviving direction, nothing to hold it or a fence gate: not placed",
+		l_under > 0 and b.get_prop(l_under, "hanging") == "true" and l_top > 0 and b.get_prop(l_top, "hanging") == "false" and l_side > 0 and b.get_prop(l_side, "hanging") == "true"
+		and l_fence > 0 and b.get_prop(l_fence, "hanging") == "true" and l_air == -1 and l_gate == -1, "%d %d %d %d %d %d" % [l_under, l_top, l_side, l_fence, l_air, l_gate])
 	for n in [ep, eg, sp, et, pot]:
 		if n != null:
 			n.free()
@@ -1803,10 +1960,12 @@ func test_vanilla_redstone_blocks() -> void:
 	wp.blocks[Vector3i(2, 0, 0)] = b.default_state("dirt")
 	wp.blocks[Vector3i(0, 1, 1)] = b.default_state("redstone_block")
 	Redstone._extend(wp, Vector3i(0, 0, 0), pis)
+	Pistons.finish_all(wp)   # (moving blocks: 2 ticks)
 	var moved := b.name_of(wp.state_at(2, 0, 0)) == "slime_block" and wp.state_at(2, 1, 0) == stone and b.name_of(wp.state_at(3, 0, 0)) == "dirt"
 	var stayed := b.name_of(wp.state_at(1, 0, 1)) == "honey_block" and b.name_of(wp.state_at(1, -1, 0)) == "obsidian" and b.name_of(wp.state_at(1, 0, -1)) == "orange_glazed_terracotta"
 	ok("slime piston: carries stuck blocks; honey, obsidian and glazed terracotta stay", moved and stayed and b.name_of(wp.state_at(1, 0, 0)) == "piston_head")
 	Redstone._retract(wp, Vector3i(0, 0, 0), wp.state_at(0, 0, 0), true)
+	Pistons.finish_all(wp)
 	ok("sticky piston pulls the slime structure back (with the block stuck to its far side)", b.name_of(wp.state_at(1, 0, 0)) == "slime_block" and wp.state_at(1, 1, 0) == stone and b.name_of(wp.state_at(2, 0, 0)) == "dirt" and wp.state_at(3, 0, 0) == 0)
 	var wq := RsWorld.new()
 	wq.blocks[Vector3i(0, 0, 0)] = b.with_prop(b.default_state("piston"), "facing", "east")
@@ -2375,6 +2534,233 @@ func test_vanilla_waterlogging() -> void:
 	var chained := cmt._can_update(ck, now, true)
 	ok("remesh pipeline: held until the tick's last slice, then at once; a relight's remesh is not throttled again", held_wait and released and throttled and chained,
 		"%s %s %s %s" % [held_wait, released, throttled, chained])
+
+
+class SupEnts extends MockEntities:
+	var items: Array = []
+
+	func spawn_item(_p, s, _c = false) -> void:
+		items.append(s)
+
+
+## A GravWorld (set_block -> BlockUpdates.fluids_changed -> Support) that keeps the items dropped.
+class SupWorld extends GravWorld:
+	func _init() -> void:
+		entities = SupEnts.new()
+
+
+func _sup_world() -> SupWorld:
+	BlockUpdates.reset()
+	var w := SupWorld.new()
+	w.rng.seed = 77
+	return w
+
+
+func _drops(w: SupWorld, item: String) -> int:
+	var n := 0
+	for s in (w.entities as SupEnts).items:
+		if (s as ItemStack).name() == item:
+			n += (s as ItemStack).count
+	return n
+
+
+## Java canSurvive / updateShape (Support): whatever hangs on, stands on or leans on a block breaks with its drops when
+## that block goes - from any side; both halves of doors / tall plants / beds go together with one item; snow drops
+## nothing without a player (wiki Snow); face support follows Java isFaceSturdy (FULL / CENTER / RIGID); placement
+## picks the wall or standing form like StandingAndWallBlockItem; snow layers stack; the pose keeps standing when a
+## door closes into the player (Player.updatePlayerPose).
+func test_vanilla_support_breaking() -> void:
+	var b := Res.blocks
+	var stone := b.STONE
+	# face support table
+	var slab := b.default_state("oak_slab")
+	var fence := b.default_state("oak_fence")
+	var hopper := b.default_state("hopper")
+	var chain := b.default_state("iron_chain") if b.block_id("iron_chain") >= 0 else b.default_state("chain")
+	ok("support faces: stone full; bottom slab only below, top slab on top; fence / chain hold centre only; hopper rim (rigid) not centre; leaves none; 8 snow layers full, 3 not; soul sand full",
+		Support.sturdy(stone, Support.F_UP) and Support.sturdy(stone, Support.F_NORTH) and not Support.sturdy(slab, Support.F_UP) and Support.sturdy(slab, Support.F_DOWN)
+		and Support.sturdy(b.with_prop(slab, "type", "top"), Support.F_UP) and Support.sturdy(fence, Support.F_UP, Support.T_CENTER) and not Support.sturdy(fence, Support.F_UP)
+		and Support.sturdy(chain, Support.F_DOWN, Support.T_CENTER) and Support.sturdy(hopper, Support.F_UP, Support.T_RIGID) and not Support.sturdy(hopper, Support.F_UP, Support.T_CENTER)
+		and not Support.sturdy(b.default_state("oak_leaves"), Support.F_UP, Support.T_CENTER) and Support.sturdy(b.with_prop(b.default_state("snow"), "layers", "8"), Support.F_UP)
+		and not Support.sturdy(b.with_prop(b.default_state("snow"), "layers", "3"), Support.F_UP) and Support.sturdy(b.default_state("soul_sand"), Support.F_UP))
+	# wall torch on the side of a block, a torch on top of it (the user's report: a torch stayed in the air)
+	var w := _sup_world()
+	w.blocks[Vector3i(0, 1, 0)] = stone
+	w.blocks[Vector3i(1, 1, 0)] = b.state_of("wall_torch", {"facing": "east"})
+	w.blocks[Vector3i(0, 2, 0)] = b.default_state("torch")
+	w.blocks[Vector3i(-1, 1, 0)] = b.state_of("ladder", {"facing": "west"})
+	w.blocks[Vector3i(0, 1, -1)] = b.state_of("oak_wall_sign", {"facing": "north"})
+	w.set_block(0, 1, 0, 0)
+	ok("support: wall torch, torch on top, ladder and wall sign break with their block and drop", w.state_at(1, 1, 0) == 0 and w.state_at(0, 2, 0) == 0
+		and w.state_at(-1, 1, 0) == 0 and w.state_at(0, 1, -1) == 0 and _drops(w, "torch") == 2 and _drops(w, "ladder") == 1 and _drops(w, "oak_sign") == 1,
+		"%d %d %d %d torches %d" % [w.state_at(1, 1, 0), w.state_at(0, 2, 0), w.state_at(-1, 1, 0), w.state_at(0, 1, -1), _drops(w, "torch")])
+	# doors: the block under it, or either half
+	var dl := b.state_of("oak_door", {"facing": "north", "half": "lower"})
+	for case in ["floor", "upper", "lower"]:
+		w = _sup_world()
+		w.blocks[Vector3i(0, 0, 0)] = stone
+		w.blocks[Vector3i(0, 1, 0)] = dl
+		w.blocks[Vector3i(0, 2, 0)] = b.with_prop(dl, "half", "upper")
+		w.blocks[Vector3i(1, 1, 0)] = stone   # an unrelated neighbour change first: nothing happens
+		w.set_block(1, 1, 0, 0)
+		var kept := w.state_at(0, 1, 0) == dl
+		var at: int = {"floor": 0, "upper": 2, "lower": 1}[case]
+		w.set_block(0, at, 0, 0)
+		ok("support: door - %s removed: no floating half left, one door dropped" % case, kept and w.state_at(0, 1, 0) == 0 and w.state_at(0, 2, 0) == 0 and _drops(w, "oak_door") == (0 if case == "lower" else 1) + (0 if case != "lower" else 0),
+			"kept %s lower %d upper %d doors %d" % [kept, w.state_at(0, 1, 0), w.state_at(0, 2, 0), _drops(w, "oak_door")])
+	# beds: a bed's head goes with its foot (the head's loot drops the bed); the same bed beside it stays
+	w = _sup_world()
+	var foot := b.state_of("red_bed", {"facing": "south", "part": "foot"})
+	w.blocks[Vector3i(0, 1, 0)] = foot
+	w.blocks[Vector3i(0, 1, 1)] = b.with_prop(foot, "part", "head")
+	w.blocks[Vector3i(1, 1, 0)] = foot
+	w.blocks[Vector3i(1, 1, 1)] = b.with_prop(foot, "part", "head")
+	w.set_block(0, 1, 0, 0)
+	ok("support: a bed's head goes with its foot (one bed), the bed beside it stays", w.state_at(0, 1, 1) == 0 and _drops(w, "red_bed") == 1 and w.state_at(1, 1, 0) == foot and w.state_at(1, 1, 1) != 0)
+	# tall plants
+	w = _sup_world()
+	w.blocks[Vector3i(0, 0, 0)] = b.default_state("grass_block")
+	var rb := b.state_of("rose_bush", {"half": "lower"})
+	w.blocks[Vector3i(0, 1, 0)] = rb
+	w.blocks[Vector3i(0, 2, 0)] = b.with_prop(rb, "half", "upper")
+	w.set_block(0, 0, 0, stone)
+	ok("support: a rose bush on a block turned to stone breaks whole, one rose bush", w.state_at(0, 1, 0) == 0 and w.state_at(0, 2, 0) == 0 and _drops(w, "rose_bush") == 1, str(_drops(w, "rose_bush")))
+	var tg := b.state_of("tall_grass", {"half": "lower"})
+	w.blocks[Vector3i(4, 1, 0)] = tg
+	w.blocks[Vector3i(4, 2, 0)] = b.with_prop(tg, "half", "upper")
+	var tg_up := b.with_prop(tg, "half", "upper")
+	var with_lower := Loot.block_drops(tg_up, ItemStack.named("shears"), w, Vector3i(4, 2, 0)).size()
+	w.blocks.erase(Vector3i(4, 1, 0))
+	var without := Loot.block_drops(tg_up, ItemStack.named("shears"), w, Vector3i(4, 2, 0)).size()
+	ok("loot: a tall grass half drops only while its other half is there (location_check)", with_lower > 0 and without == 0, "%d %d" % [with_lower, without])
+	var young := Loot.block_drops(b.default_state("wheat"), ItemStack.new(), null, Vector3i.ZERO)
+	var young_names := []
+	for s in young:
+		young_names.append("%s x%d" % [(s as ItemStack).name(), (s as ItemStack).count])
+	var door_up := Loot.block_drops(b.with_prop(dl, "half", "upper"), ItemStack.new(), null, Vector3i.ZERO)
+	var wall_t := Loot.block_drops(b.state_of("wall_torch", {"facing": "east"}), ItemStack.new(), null, Vector3i.ZERO)
+	ok("loot: 26.3 match_block - unripe wheat drops one seed only, a door's upper half nothing; a wall torch drops a torch (dropsLike)",
+		young_names == ["wheat_seeds x1"] and door_up.is_empty() and wall_t.size() == 1 and (wall_t[0] as ItemStack).name() == "torch", "%s / %d / %d" % [str(young_names), door_up.size(), wall_t.size()])
+	# lanterns (no pickaxe needed when nobody mines them), buttons, levers, cocoa
+	w = _sup_world()
+	w.blocks[Vector3i(0, 3, 0)] = stone
+	w.blocks[Vector3i(0, 2, 0)] = b.state_of("lantern", {"hanging": "true"})
+	w.blocks[Vector3i(3, 0, 0)] = stone
+	w.blocks[Vector3i(3, 1, 0)] = b.state_of("lantern", {"hanging": "false"})
+	w.blocks[Vector3i(6, 1, 0)] = stone
+	w.blocks[Vector3i(6, 1, 1)] = b.state_of("stone_button", {"face": "wall", "facing": "south"})
+	w.blocks[Vector3i(6, 2, 0)] = b.state_of("lever", {"face": "floor", "facing": "north"})
+	w.blocks[Vector3i(9, 1, 0)] = b.default_state("jungle_log")
+	w.blocks[Vector3i(9, 1, 1)] = b.state_of("cocoa", {"facing": "north"})
+	for q in [Vector3i(0, 3, 0), Vector3i(3, 0, 0), Vector3i(6, 1, 0), Vector3i(9, 1, 0)]:
+		w.set_block(q.x, q.y, q.z, 0)
+	ok("support: hanging / standing lanterns, a wall button, a floor lever and cocoa drop off", w.state_at(0, 2, 0) == 0 and w.state_at(3, 1, 0) == 0 and w.state_at(6, 1, 1) == 0
+		and w.state_at(6, 2, 0) == 0 and w.state_at(9, 1, 1) == 0 and _drops(w, "lantern") == 2 and _drops(w, "stone_button") == 1 and _drops(w, "lever") == 1 and _drops(w, "cocoa_beans") >= 1,
+		"lanterns %d button %d lever %d cocoa %d" % [_drops(w, "lantern"), _drops(w, "stone_button"), _drops(w, "lever"), _drops(w, "cocoa_beans")])
+	# redstone dust, repeater, rail, carpet, pressure plate, candle on a row of stone
+	w = _sup_world()
+	var row := ["redstone_wire", "repeater", "rail", "white_carpet", "stone_pressure_plate", "candle"]
+	for i in row.size():
+		w.blocks[Vector3i(i, 0, 5)] = stone
+		w.blocks[Vector3i(i, 1, 5)] = b.default_state(row[i])
+	for i in row.size():
+		w.set_block(i, 0, 5, 0)
+	var left := []
+	for i in row.size():
+		if w.state_at(i, 1, 5) != 0:
+			left.append(row[i])
+	ok("support: dust, repeater, rail, carpet, pressure plate and candle break without the block below and drop", left.is_empty() and _drops(w, "redstone") == 1 and _drops(w, "repeater") == 1
+		and _drops(w, "rail") == 1 and _drops(w, "white_carpet") == 1 and _drops(w, "stone_pressure_plate") == 1 and _drops(w, "candle") == 1, "left %s" % str(left))
+	# vines: the vine on the wall goes, and the vine hanging from it
+	w = _sup_world()
+	w.blocks[Vector3i(0, 5, 0)] = stone
+	w.blocks[Vector3i(0, 5, 1)] = b.state_of("vine", {"north": "true"})
+	w.blocks[Vector3i(0, 4, 1)] = b.state_of("vine", {"north": "true"})
+	w.set_block(0, 5, 0, 0)
+	ok("support: a vine loses its wall, the vine hanging below it goes too", w.state_at(0, 5, 1) == 0 and w.state_at(0, 4, 1) == 0)
+	# snow: support gone / water -> nothing; mined with a shovel -> one snowball per layer (26.3 loot: match_block)
+	w = _sup_world()
+	w.blocks[Vector3i(0, 0, 0)] = stone
+	var snow3 := b.with_prop(b.default_state("snow"), "layers", "3")
+	w.blocks[Vector3i(0, 1, 0)] = snow3
+	w.set_block(0, 0, 0, 0)
+	var s5 := b.with_prop(b.default_state("snow"), "layers", "5")
+	var shovel_drops := Loot.block_drops(s5, ItemStack.named("iron_shovel"), null, Vector3i.ZERO)
+	var sb_n := 0
+	for s in shovel_drops:
+		if (s as ItemStack).name() == "snowball":
+			sb_n += (s as ItemStack).count
+	ok("snow: breaks without its block and drops nothing; 5 layers mined with a shovel give 5 snowballs, without a player nothing (wiki Snow)",
+		w.state_at(0, 1, 0) == 0 and _drops(w, "snowball") == 0 and sb_n == 5 and Loot.block_drops(s5, null, w, Vector3i(0, 1, 0)).is_empty(), "snowballs %d" % sb_n)
+	w = _sup_world()
+	w.floor_at(-1, 4, stone)
+	w.blocks[Vector3i(0, 0, 0)] = b.WATER
+	w.blocks[Vector3i(1, 0, 0)] = snow3
+	BlockUpdates.schedule(w, Vector3i(0, 0, 0), 1)
+	w.run(12)
+	ok("snow: water flowing into a snow layer washes it away without snowballs (wiki Snow)", b.name_of(w.state_at(1, 0, 0)) == "water" and _drops(w, "snowball") == 0, b.state_string(w.state_at(1, 0, 0)))
+	# sugar cane (Java: scheduled tick) loses its sand
+	w = _sup_world()
+	w.blocks[Vector3i(8, 0, 8)] = b.default_state("sand")
+	w.blocks[Vector3i(9, 0, 8)] = b.WATER
+	w.blocks[Vector3i(8, 1, 8)] = b.default_state("sugar_cane")
+	w.blocks[Vector3i(8, 2, 8)] = b.default_state("sugar_cane")
+	w.set_block(8, 0, 8, 0)
+	w.run(4)
+	ok("support: sugar cane goes block by block when its sand is removed (scheduled ticks), both drop", w.state_at(8, 1, 8) == 0 and w.state_at(8, 2, 8) == 0 and _drops(w, "sugar_cane") == 2, str(_drops(w, "sugar_cane")))
+	# placement: a torch clicked onto the side of leaves stands on the floor instead (StandingAndWallBlockItem)
+	w = _sup_world()
+	w.blocks[Vector3i(0, 0, 0)] = stone
+	w.blocks[Vector3i(1, 1, 0)] = b.default_state("oak_leaves")
+	w.blocks[Vector3i(1, 1, 2)] = stone
+	var pl := Player.new()
+	pl.yaw = -90.0   # looking east
+	pl.pitch = 30.0
+	var wt := b.state_of("wall_torch", {"facing": "west"})
+	var on_leaves := Support.placement(w, wt, Vector3i(0, 1, 0), Vector3i(-1, 0, 0), pl, false)
+	var on_stone := Support.placement(w, wt, Vector3i(0, 1, 2), Vector3i(-1, 0, 0), pl, false)
+	var mid_air := Support.placement(w, wt, Vector3i(0, 5, 0), Vector3i(-1, 0, 0), pl, false)
+	ok("placement: a torch on the side of leaves stands on the floor; on stone it hangs on the wall; in the air nowhere",
+		on_leaves > 0 and b.name_of(on_leaves) == "torch" and on_stone > 0 and b.name_of(on_stone) == "wall_torch" and b.get_prop(on_stone, "facing") == "west" and mid_air == -1,
+		"%s / %s / %d" % [b.state_string(maxi(on_leaves, 0)), b.state_string(maxi(on_stone, 0)), mid_air])
+	# snow layers stack (Java SnowLayerBlock.canBeReplaced): up to 8, then a new layer on top; other blocks only replace one layer
+	var bw := _bucket_world()
+	bw.blocks[Vector3i(0, 0, 0)] = b.default_state("snow")
+	for i in 7:
+		_bucket_use(bw, "snow", Vector3i(0, 0, 0))
+	var eight := b.get_prop(bw.state_at(0, 0, 0), "layers")
+	_bucket_use(bw, "snow", Vector3i(0, 0, 0))
+	var above := bw.state_at(0, 1, 0)
+	bw.blocks[Vector3i(3, 0, 0)] = snow3
+	_bucket_use(bw, "stone", Vector3i(3, 0, 0))
+	bw.blocks[Vector3i(6, 0, 0)] = b.default_state("snow")
+	_bucket_use(bw, "stone", Vector3i(6, 0, 0))
+	ok("snow: a snow item adds layers up to 8, then starts a layer above; stone replaces one layer but goes on top of three",
+		eight == "8" and above > 0 and b.name_of(above) == "snow" and b.get_prop(above, "layers") == "1" and bw.state_at(3, 0, 0) == snow3 and bw.state_at(3, 1, 0) == stone and bw.state_at(6, 0, 0) == stone,
+		"layers %s above %s / %s %s / %s" % [eight, b.state_string(maxi(above, 0)), b.state_string(bw.state_at(3, 0, 0)), b.state_string(bw.state_at(3, 1, 0)), b.state_string(bw.state_at(6, 0, 0))])
+	# Player.updatePlayerPose: a door closed into the player keeps them standing; a 1-block gap still makes them crawl
+	var mw := MockWorld.new()
+	mw.floor_y = 64
+	mw.grid[Vector3i(0, 64, 0)] = b.state_of("oak_door", {"facing": "north", "half": "lower", "open": "false"})
+	mw.grid[Vector3i(0, 65, 0)] = b.state_of("oak_door", {"facing": "north", "half": "upper", "open": "false"})
+	var dp := Player.new()
+	dp.mode = Player.Mode.SURVIVAL
+	dp.pos = Vector3(0.5, 64, 0.75)   # the closed door's 3 px slab (z 13..16 px) reaches into the player
+	dp.prev_pos = dp.pos
+	dp.on_ground = true
+	for i in 5:
+		dp.tick(mw)
+	var door_pose := not dp.crawling and not dp.sneaking
+	mw.grid[Vector3i(5, 65, 5)] = stone
+	var cp := Player.new()
+	cp.mode = Player.Mode.SURVIVAL
+	cp.pos = Vector3(5.5, 64, 5.5)
+	cp.prev_pos = cp.pos
+	cp.on_ground = true
+	for i in 3:
+		cp.tick(mw)
+	ok("pose: a door closed into the player keeps them standing (no forced crouch / crawl); a 1-block gap still crawls", door_pose and cp.crawling,
+		"door crawl %s sneak %s / gap crawl %s" % [dp.crawling, dp.sneaking, cp.crawling])
 
 
 func test_vanilla_gravity_support() -> void:

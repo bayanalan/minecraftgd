@@ -577,6 +577,21 @@ static func _holds(c: Chunk, id: String) -> bool:
 
 
 const TICKED_KINDS := ["furnace", "blast_furnace", "smoker", "brewing_stand", "hopper", "campfire", "soul_campfire"]
+static var _campfire_st := PackedByteArray()
+
+
+## Every campfire has a block entity (Java CampfireBlockEntity: cooking and the smoke): created for campfires set by
+## commands / structures / anything else that is not the player placement path.
+static func ensure_campfire(world, p: Vector3i, st: int) -> void:
+	var b := Res.blocks
+	if _campfire_st.size() != b.total_states:
+		_campfire_st.resize(b.total_states)
+		for s0 in range(1, b.total_states):
+			_campfire_st[s0] = 1 if b.names[b.st_block[s0]].ends_with("campfire") else 0
+	if st <= 0 or st >= _campfire_st.size() or _campfire_st[st] == 0:
+		return
+	if get_data(world, p).is_empty():
+		set_data(world, p, {"id": b.name_of(st)})
 
 
 static func tick_furnaces(world) -> void:
@@ -656,6 +671,8 @@ static func campfire_step(world, p: Vector3i, d: Dictionary) -> bool:
 	if st <= 0:
 		return false
 	var lit := Res.blocks.get_prop(st, "lit") == "true"
+	if lit:
+		Particles.campfire_tick(p, Res.blocks.get_prop(st, "signal_fire") == "true")
 	var items: Array = d.get("items", [])
 	var cook: Array = d.get("cook", [0, 0, 0, 0])
 	var changed := false

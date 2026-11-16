@@ -383,7 +383,7 @@ static func _complete_domains(props: Dictionary) -> void:
 		elif is_wall and (vals.has("low") or vals.has("tall")):
 			props[k] = ["none", "low", "tall"]
 		elif is_wire and (vals.has("side") or vals.has("up")):
-			props[k] = ["up", "side", "none"]
+			props[k] = ["none", "side", "up"]   # (Java default: NONE)
 
 
 static func _collect_when(w, props: Dictionary) -> void:
@@ -448,6 +448,12 @@ static func extra_props(name: String, info: Dictionary, props: Dictionary) -> vo
 			extra = {"age": _range(26)}
 	if name.ends_with("_sapling") or name == "mangrove_propagule" or name == "bamboo":
 		extra["stage"] = ["0", "1"]   # (bamboo: 1 = stopped growing)
+	# Java DoorBlock / TrapDoorBlock / FenceGateBlock POWERED (no model reads it: without it redstone never opened them)
+	if name.ends_with("_door") or name.ends_with("_trapdoor") or name.ends_with("_fence_gate"):
+		extra["powered"] = ["false", "true"]
+	if name == "moving_piston":
+		extra["facing"] = ["north", "east", "south", "west", "up", "down"]   # Java MovingPistonBlock FACING / TYPE
+		extra["type"] = ["normal", "sticky"]
 	# block-entity-rendered blocks: their blockstate JSON is a single particle-only variant
 	var four := ["north", "south", "west", "east"]
 	if name == "chest" or name == "trapped_chest" or name.ends_with("copper_chest"):
@@ -722,6 +728,8 @@ func _add_state(b: int, name: String, info: Dictionary, bs: Dictionary, sp: Dict
 			shape_boxes = PackedFloat32Array([0, 0, 0, 1, (layers - 1) / 8.0, 1]) if layers > 1 else PackedFloat32Array()
 		elif name.ends_with("_door") and sp.get("open", "false") == "true":
 			pass
+		elif name == "moving_piston":
+			shape_boxes = PackedFloat32Array()   # (the moving block's own box travels with it: Pistons pushes entities)
 		if shape_boxes.size() > 0:
 			flags |= F_COLLIDE
 		# full collision cube (Java isCollisionShapeFullBlock): any box covering the unit cube - multi-element cube models
@@ -809,7 +817,8 @@ func _add_state(b: int, name: String, info: Dictionary, bs: Dictionary, sp: Dict
 	st_model.append(mi)
 	st_shape.append(_shape_index(shape_boxes))
 	st_outline.append(_shape_index(outline_boxes))
-	st_tint_color.append(_const_tint(name))
+	# redstone dust: one tint per power level (wiki Block colors, Redstone tints) - every level used to share one colour
+	st_tint_color.append(RedstoneWire.COLORS[clampi(int(sp.get("power", "0")), 0, 15)] if name == "redstone_wire" else _const_tint(name))
 	st_level.append(int(sp.get("level", "0")) if liquid != "" else 0)
 
 

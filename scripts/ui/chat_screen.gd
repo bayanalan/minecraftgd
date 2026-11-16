@@ -192,7 +192,7 @@ func _draw_input(font: Font, w: float, h: float) -> void:
 	while vis.length() > 0 and font.get_string_size(vis, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x > maxw:
 		vis = vis.substr(0, vis.length() - 1)
 	var x := 4.0
-	var base := h - 10.0 + 7.0
+	var base := h - 12.0 + 7.0   # glyph top at h - 12 (Java EditBox unbordered: text y = getY()), baseline 7 below
 	var tc := Color8(0xE0, 0xE0, 0xE0)
 	var sc := Color8(0x38, 0x38, 0x38)
 	_overlay.draw_string(font, Vector2(x + 1, base + 1), vis, HORIZONTAL_ALIGNMENT_LEFT, -1, 8, sc)
@@ -204,14 +204,14 @@ func _draw_input(font: Font, w: float, h: float) -> void:
 		if b > a:
 			var sx := x + font.get_string_size(vis.substr(0, a), HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
 			var sw := font.get_string_size(vis.substr(a, b - a), HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
-			_overlay.draw_rect(Rect2(sx, h - 11.0, sw, 11.0), Color8(0xDF, 0xDF, 0xFF))
+			_overlay.draw_rect(Rect2(sx, h - 13.0, sw, 11.0), Color8(0xDF, 0xDF, 0xFF))   # (Java: text y - 1 .. y + 10)
 			_overlay.draw_string(font, Vector2(sx, base), vis.substr(a, b - a), HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color8(0x1F, 0x1F, 0xFF))
 	if ((Time.get_ticks_msec() - _focus_ms) / 300) % 2 == 0 and edit.has_focus():
 		if cc >= txt.length():
 			_overlay.draw_string(font, Vector2(cx + 1, base + 1), "_", HORIZONTAL_ALIGNMENT_LEFT, -1, 8, sc)
 			_overlay.draw_string(font, Vector2(cx, base), "_", HORIZONTAL_ALIGNMENT_LEFT, -1, 8, tc)
 		else:
-			_overlay.draw_rect(Rect2(cx, h - 11.0, 1.0, 11.0), Color8(0xD0, 0xD0, 0xD0))
+			_overlay.draw_rect(Rect2(cx, h - 13.0, 1.0, 11.0), Color8(0xD0, 0xD0, 0xD0))
 
 
 func _draw_suggestions() -> void:
@@ -245,7 +245,7 @@ func _draw_suggestions() -> void:
 		var sel_s := str(cands[_sel])
 		if edit.caret_column == edit.text.length() and sel_s.to_lower().begins_with(typed.to_lower()) and sel_s.length() > typed.length():
 			var gx := 4.0 + font.get_string_size(edit.text.substr(_disp), HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x
-			_overlay.draw_string(font, Vector2(gx, h - 10.0 + 7.0), sel_s.substr(typed.length()), HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color8(0x80, 0x80, 0x80))
+			_overlay.draw_string(font, Vector2(gx, h - 12.0 + 7.0), sel_s.substr(typed.length()), HORIZONTAL_ALIGNMENT_LEFT, -1, 8, Color8(0x80, 0x80, 0x80))
 	elif not _hidden and str(_sug[2]) != "" and edit.text.begins_with("/"):
 		var u := str(_sug[2])
 		var uw := font.get_string_size(u, HORIZONTAL_ALIGNMENT_LEFT, -1, 8).x

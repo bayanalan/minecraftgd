@@ -252,6 +252,39 @@ static func placement_state(base: int, hit: Dictionary, p: Player) -> int:
 	return st
 
 
+## Java LanternBlock.getStateForPlacement: of the nearest looking directions (BlockPlaceContext: the clicked face's
+## opposite first, then Direction.orderedByNearest - UP before DOWN while looking up) the vertical ones in order, the
+## first whose attachment survives (canSurvive: Block.canSupportCenter of the block above for hanging=true, below for a
+## standing lantern). Clicking a block's underside hangs the lantern from it. -1 when neither survives (not placed).
+static func lantern_placement(world, dest: Vector3i, st: int, n: Vector3i, p: Player) -> int:
+	var b := Res.blocks
+	var dirs: Array = [1, -1] if p.pitch < 0.0 else [-1, 1]   # Java: xRot < 0 (looking up) -> UP nearest
+	if n.y != 0:
+		dirs = [-n.y, n.y]
+	for dy in dirs:
+		var q: Vector3i = dest + Vector3i(0, dy, 0)
+		if can_support_center(world.state_at(q.x, q.y, q.z), dy > 0):
+			return b.with_prop(st, "hanging", "true" if dy > 0 else "false")
+	return -1
+
+
+## Java Block.canSupportCenter(level, pos, face): the block's support (collision) shape covers the 2 x 2 px centre
+## (Block.box(7, 0, 7, 9, 10, 9)) on that face - full blocks, slabs, fences, walls, chains, ... Fence gates
+## (#unstable_bottom_center) never hold anything under them. bottom_face: the block's DOWN face (something hangs below).
+static func can_support_center(st: int, bottom_face: bool) -> bool:
+	var b := Res.blocks
+	if st <= 0 or (b.st_flags[st] & BlockRegistry.F_COLLIDE) == 0:
+		return false
+	if bottom_face and Tags.has_block("unstable_bottom_center", b.name_of(st)):
+		return false
+	var sh := b.get_shape(st)
+	for i in range(0, sh.size(), 6):
+		var on_face: bool = sh[i + 1] <= 0.001 if bottom_face else sh[i + 4] >= 0.999
+		if on_face and sh[i] <= 7.001 / 16.0 and sh[i + 2] <= 7.001 / 16.0 and sh[i + 3] >= 8.999 / 16.0 and sh[i + 5] >= 8.999 / 16.0:
+			return true
+	return false
+
+
 ## Wall variants: torch -> wall_torch etc. when clicking a side face.
 static func wall_variant(item_name: String, n: Vector3i) -> String:
 	if n.y != 0:
@@ -268,6 +301,19 @@ static func wall_variant(item_name: String, n: Vector3i) -> String:
 	if item_name.ends_with("_coral_fan"):
 		return item_name.trim_suffix("_coral_fan") + "_coral_wall_fan"
 	return ""
+
+
+## BlockBehaviour.canBeReplaced for placing `place`: #replaceable blocks, except SnowLayerBlock - only a single layer
+## (wiki Snow: "two layers and thicker does not get replaced"), never by snow itself.
+static func snow_replaceable(st: int, place: int) -> bool:
+	var b := Res.blocks
+	if st <= 0:
+		return st == 0
+	if (b.st_flags[st] & BlockRegistry.F_REPLACEABLE) == 0:
+		return false
+	if b.has_prop(st, "layers") and b.name_of(st) == "snow":
+		return b.get_prop(st, "layers") == "1" and (place <= 0 or b.st_block[place] != b.st_block[st])
+	return true
 
 
 static func use_item_on(world, held: ItemStack, hit: Dictionary) -> bool:
@@ -408,8 +454,28 @@ static func use_item_on(world, held: ItemStack, hit: Dictionary) -> bool:
 				world.set_block(pos.x, pos.y, pos.z, blocks.with_prop(target_st, ap, str(int(blocks.get_prop(target_st, ap)) + 1)))
 				_after_place(world, p, target_st, pos)
 				return true
+	# Java SnowLayerBlock.canBeReplaced / getStateForPlacement (wiki Snow: 1 - 8 layers): a snow item used on a snow
+	# layer's top face, or on a face in front of a snow layer, adds a layer to it (8 layers: no more)
+	if blocks.st_block[place] == blocks.block_id("snow") and blocks.has_prop(place, "layers"):
+		var sp0: Vector3i = pos if (blocks.st_block[target_st] == blocks.st_block[place] and n.y > 0) else pos + n
+		var ss0: int = world.state_at(sp0.x, sp0.y, sp0.z)
+		if ss0 > 0 and blocks.st_block[ss0] == blocks.st_block[place] and int(blocks.get_prop(ss0, "layers")) < 8:
+			var sl := blocks.with_prop(ss0, "layers", str(int(blocks.get_prop(ss0, "layers")) + 1))
+			if blocks.st_flags[sl] & BlockRegistry.F_COLLIDE:
+				# Level.isUnobstructed: the taller layer must not reach into the player or a mob
+				var ssh := blocks.get_shape(sl)
+				for sb in range(0, ssh.size(), 6):
+					var smin := Vector3(sp0) + Vector3(ssh[sb], ssh[sb + 1], ssh[sb + 2])
+					var smax := Vector3(sp0) + Vector3(ssh[sb + 3], ssh[sb + 4], ssh[sb + 5])
+					var spm := p.aabb_min()
+					var spx := p.aabb_max()
+					if (not p.is_spectator() and spm.x < smax.x and spx.x > smin.x and spm.y < smax.y and spx.y > smin.y and spm.z < smax.z and spx.z > smin.z) or _entity_obstructs(world, smin, smax):
+						return false
+			world.set_block(sp0.x, sp0.y, sp0.z, sl)
+			_after_place(world, p, sl, sp0)
+			return true
 	var dest := pos
-	if not (blocks.st_flags[target_st] & BlockRegistry.F_REPLACEABLE) or blocks.name_of(target_st) == blocks.name_of(place):
+	if not snow_replaceable(target_st, place) or blocks.name_of(target_st) == blocks.name_of(place):
 		dest = pos + n
 		# slab merging
 		if blocks.name_of(target_st).ends_with("_slab") and blocks.name_of(target_st) == blocks.name_of(place) and blocks.get_prop(target_st, "type") != "double":
@@ -419,7 +485,7 @@ static func use_item_on(world, held: ItemStack, hit: Dictionary) -> bool:
 				_after_place(world, p, place, pos)
 				return true
 	var cur: int = world.state_at(dest.x, dest.y, dest.z)
-	if cur < 0 or not (blocks.st_flags[cur] & BlockRegistry.F_REPLACEABLE):
+	if cur < 0 or not snow_replaceable(cur, place):
 		if cur >= 0 and blocks.name_of(cur).ends_with("_slab") and blocks.name_of(cur) == blocks.name_of(place) and blocks.get_prop(cur, "type") != "double":
 			world.set_block(dest.x, dest.y, dest.z, blocks.with_prop(blocks.with_prop(cur, "type", "double"), "waterlogged", "false"))
 			_after_place(world, p, place, dest)
@@ -435,20 +501,21 @@ static func use_item_on(world, held: ItemStack, hit: Dictionary) -> bool:
 		pass
 	st = placement_state(st, hit, p)
 	# support checks for plants/torches
-	var below: int = world.state_at(dest.x, dest.y - 1, dest.z)
 	var bname := blocks.name_of(st)
-	if (bname.ends_with("_sapling") or bname in ["short_grass", "fern", "poppy", "dandelion", "tall_grass"] or bname.ends_with("_tulip")) and not (below >= 0 and blocks.name_of(below) in ["grass_block", "dirt", "podzol", "coarse_dirt", "farmland", "moss_block", "mud", "rooted_dirt", "mycelium"]):
-		return false
-	if bname in ["wheat", "carrots", "potatoes", "beetroots"] and not (below >= 0 and blocks.name_of(below) == "farmland"):
-		return false
-	if bname == "torch" and not (below >= 0 and blocks.st_flags[below] & BlockRegistry.F_COLLIDE):
-		return false
-	if bname == "tripwire_hook":
-		# Java TripWireHookBlock.canSurvive: hangs on the side of a solid block (behind its facing)
-		var hb: Vector3i = dest - (Tripwires.H4.get(blocks.get_prop(st, "facing"), Vector3i.ZERO) as Vector3i)
-		var hbs: int = world.state_at(hb.x, hb.y, hb.z)
-		if hbs <= 0 or (blocks.st_flags[hbs] & BlockRegistry.F_COLLIDE) == 0:
+	if blocks.has_prop(st, "hanging") and (bname == "lantern" or bname == "soul_lantern" or bname.ends_with("copper_lantern")):
+		st = lantern_placement(world, dest, st, n, p)
+		if st < 0:
 			return false
+	# Java getStateForPlacement + canPlace for every block with a support rule (Support.placement): torches / signs /
+	# banners / coral fans try the wall and the standing form along the nearest looking directions, buttons / levers
+	# every face, ladders / tripwire hooks / cocoa the horizontal ones, vines / lichen the first holding face; doors and
+	# tall plants need a replaceable block above, beds at the head; plants their 26.3 #supports_* soil, crops light 8
+	if Support.kind_of(st) != Support.K_NONE:
+		st = Support.placement(world, st, dest, n, p, dest == pos)
+		if st < 0:
+			return false
+		bname = blocks.name_of(st)
+	st = Redstone.placed_state(world, dest, st)   # (doors / trapdoors / fence gates placed with power come open)
 	# getStateForPlacement: waterlogged = the fluid there is a water SOURCE (Fluids.WATER: a water source block, or
 	# seagrass / bubble columns being replaced); flowing water leaves the block dry (wiki Waterlogging)
 	if cur > 0 and can_place_water(st) and ((blocks.st_flags[cur] & (BlockRegistry.F_LIQUID | BlockRegistry.F_LAVA)) == BlockRegistry.F_LIQUID and blocks.st_level[cur] == 0 or (blocks.st_flags[cur] & BlockRegistry.F_WATERLOGGED) != 0):
@@ -482,14 +549,18 @@ static func use_item_on(world, held: ItemStack, hit: Dictionary) -> bool:
 	if pair_q.y != -9999:
 		world.set_block(pair_q.x, pair_q.y, pair_q.z, pair_st)
 	# two-block structures
-	if blocks.has_prop(st, "half") and blocks.get_prop(st, "half") == "lower":
-		if world.state_at(dest.x, dest.y + 1, dest.z) == 0:
+	if blocks.has_prop(st, "half") and blocks.get_prop(st, "half") == "lower" and bname != "pitcher_crop":
+		# DoorBlock / DoublePlantBlock.setPlacedBy: the upper half replaces what is above (checked replaceable; a
+		# planted pitcher pod is a single block until age 3 - PitcherCropBlock)
+		var ua: int = world.state_at(dest.x, dest.y + 1, dest.z)
+		if ua == 0 or (ua > 0 and (blocks.st_flags[ua] & BlockRegistry.F_REPLACEABLE) != 0):
 			world.set_block(dest.x, dest.y + 1, dest.z, blocks.with_prop(st, "half", "upper"))
 	if bname.ends_with("_bed") and blocks.has_prop(st, "part"):
 		var f := blocks.get_prop(st, "facing")
 		var off := {"north": Vector3i(0, 0, -1), "south": Vector3i(0, 0, 1), "west": Vector3i(-1, 0, 0), "east": Vector3i(1, 0, 0)}.get(f, Vector3i.ZERO)
 		var hp: Vector3i = dest + off
-		if world.state_at(hp.x, hp.y, hp.z) == 0:
+		var hs0: int = world.state_at(hp.x, hp.y, hp.z)
+		if hs0 == 0 or (hs0 > 0 and (blocks.st_flags[hs0] & BlockRegistry.F_REPLACEABLE) != 0):
 			world.set_block(hp.x, hp.y, hp.z, blocks.with_prop(st, "part", "head"))
 	_after_place(world, p, st, dest)
 	return true
@@ -870,9 +941,10 @@ static func use_block(world, hit: Dictionary) -> bool:
 			var os: int = world.state_at(other.x, other.y, other.z)
 			if os > 0 and blocks.name_of(os) == name:
 				world.set_block(other.x, other.y, other.z, blocks.with_prop(os, "open", "false" if open else "true"))
-		var snd := "block.wooden_door" if name.ends_with("_door") else ("block.wooden_trapdoor" if name.ends_with("_trapdoor") else "block.fence_gate")
-		Audio.play(snd + (".close" if open else ".open"), Vector3(pos), "Blocks")
+		Redstone.play_door_sound(pos, name, not open)   # (per wood / metal set: cherry, bamboo, nether, copper ...)
 		return true
+	if name == "redstone_wire" and p.mode != Player.Mode.ADVENTURE:
+		return RedstoneWire.toggle(world, pos, st)   # Java Edition: an isolated cross <-> dot
 	if name == "lever":
 		var pw := blocks.get_prop(st, "powered") == "true"
 		world.set_block(pos.x, pos.y, pos.z, blocks.with_prop(st, "powered", "false" if pw else "true"))
@@ -882,7 +954,7 @@ static func use_block(world, hit: Dictionary) -> bool:
 	if name.ends_with("_button"):
 		if blocks.get_prop(st, "powered") != "true":
 			world.set_block(pos.x, pos.y, pos.z, blocks.with_prop(st, "powered", "true"))
-			BlockUpdates.schedule(world, pos, 30 if name.contains("wood") or Tags.has_block("wooden_buttons", name) else 20)
+			Redstone.schedule_tick(world, pos, 30 if name.contains("wood") or Tags.has_block("wooden_buttons", name) else 20)
 			Redstone.on_changed(world, pos)
 			Audio.play("block.%s_button.click_on" % Sensors.set_type(name), Vector3(pos) + Vector3(0.5, 0.5, 0.5), "Blocks")   # (BlockSetType sounds)
 		return true
@@ -996,19 +1068,14 @@ static func use_block(world, hit: Dictionary) -> bool:
 static func on_block_broken(world, pos: Vector3i, st: int) -> void:
 	var blocks := Res.blocks
 	var name := blocks.name_of(st)
-	# double blocks
-	if blocks.has_prop(st, "half") and (blocks.get_prop(st, "half") == "lower" or blocks.get_prop(st, "half") == "upper"):
-		var other := pos + (Vector3i(0, 1, 0) if blocks.get_prop(st, "half") == "lower" else Vector3i(0, -1, 0))
-		var os: int = world.state_at(other.x, other.y, other.z)
-		if os > 0 and blocks.name_of(os) == name:
-			world.set_block(other.x, other.y, other.z, 0)
-	if name.ends_with("_bed"):
-		for d in [Vector3i(1, 0, 0), Vector3i(-1, 0, 0), Vector3i(0, 0, 1), Vector3i(0, 0, -1)]:
-			var q: Vector3i = pos + d
-			var qs: int = world.state_at(q.x, q.y, q.z)
-			if qs > 0 and blocks.name_of(qs) == name:
-				world.set_block(q.x, q.y, q.z, 0)
-				break
+	# (the other half of a door / tall plant / bed went with the set_block that removed this one: Support, Java
+	# updateShape -> destroyBlock, with its drops - the loot tables give one item between the two halves)
+	# wiki Piston Head: an extended piston and its head are one block - breaking the head breaks the piston (dropping it,
+	# none in creative), breaking the piston removes the head (Java PistonHeadBlock.onRemove / playerWillDestroy)
+	if name == "piston_head":
+		Pistons.head_broken(world, pos, st)
+	elif (name == "piston" or name == "sticky_piston") and blocks.get_prop(st, "extended") == "true":
+		Pistons.base_broken(world, pos, st)
 	BlockEntities.on_removed(world, pos, st)
 	# wiki String: cutting tripwire with shears disarms it (no pulse); any other break pulses its hooks
 	Tripwires.on_removed(world, pos, st, world.player != null and world.player.inventory.held().name() == "shears")

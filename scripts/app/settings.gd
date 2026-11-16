@@ -7,7 +7,7 @@ extends Node
 signal changed(key: String)
 
 const PATH := "user://settings.cfg"
-const SCHEMA := 3
+const SCHEMA := 4
 
 # key: [default, min/choices, max]
 const SPEC := {
@@ -18,8 +18,8 @@ const SPEC := {
 	"show_fps": ["off", ["off", "fps", "fps_lows"]],
 	"terrain_renderer": ["rd", ["rd", "godot"]],   # takes effect when a world is loaded
 	"background_fps": [30, [15, 30, 60]],
-	"render_distance": [12, 2, 32],
-	"simulation_distance": [6, 5, 32],   # wiki: Options (minimum 5, values as Render Distance)
+	"render_distance": [16, 2, 32],   # user default: 16 render / 12 simulation
+	"simulation_distance": [12, 5, 32],   # wiki: Options (minimum 5, values as Render Distance)
 	"lod_distance": [0, 0, 64],
 	"fov": [70.0, 30.0, 110.0],
 	"graphics": ["fancy", ["fast", "fancy", "fabulous"]],
@@ -135,6 +135,9 @@ var in_menu := true
 func _on_focus(focused: bool) -> void:
 	_focused = focused
 	_apply_rate()
+	if focused and DisplayServer.get_name() != "headless" and DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_MINIMIZED:
+		# back from alt-tab while still minimised: restore the chosen mode
+		apply_key("display_mode")
 
 
 func set_in_menu(v: bool) -> void:
@@ -198,6 +201,10 @@ func load_settings() -> void:
 		values["max_fps"] = 0
 	if schema < 3:
 		values["adv_leaf_cull"] = false   # leaf culling became opt-in (vanilla: every face between leaves is drawn)
+	if schema < 4:
+		# the defaults became 16 render / 12 simulation (2026-11-15): settings saved with the old ones move once
+		values["render_distance"] = 16
+		values["simulation_distance"] = 12
 
 
 func save() -> void:
@@ -253,7 +260,9 @@ func apply_key(key: String) -> void:
 			match str(values["display_mode"]):
 				"windowed": DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
 				"borderless": DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
-				"fullscreen": DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_EXCLUSIVE_FULLSCREEN)
+				# full screen without exclusive mode: alt-tab back into an exclusive D3D12 window sometimes never reactivated it
+				# (no FPS difference measured between the two)
+				"fullscreen": DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
 		"vsync", "max_fps":
 			_apply_rate()
 		"show_fps":

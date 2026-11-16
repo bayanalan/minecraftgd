@@ -40,7 +40,123 @@ Assets: local MC 26.3 jar (read through the indexed JarAssetReader; private cach
 
 ## OPEN BUGS - remaining (fixed bugs and completed work: fixed.md)
 Screenshots: c:\Users\Gerbilicious_Dude\Pictures\Screenshots\Screenshot 2026-11-12 <time>.png
+BUG BATCH 2026-11-15 (user list of 26; fix all before stopping - see memory project-bug-batch-2026-11-15):
+- [x] Default distances: render 16 / simulation 12 (settings schema 4 moves saved settings once)
+- [x] Chat input text 2 GUI px too low (drawn at h - 10; Java EditBox unbordered draws at h - 12; selection / caret / ghost
+      text moved with it)
+- [x] Creative search "#text": item tags whose path contains the text ("#ns:path" too), their items in creative order,
+      matching tags listed under the item name in dark purple (Java CreativeModeInventoryScreen.updateVisibleTags)
+- [x] Rain / snow fell through glass, panes, fences, iron bars...: the weather used the light heightmap (opacity > 0);
+      now Java MOTION_BLOCKING (legacy-solid except cobweb / bamboo sapling, or fluid) via Chunk.motion_top (lazy per
+      column, reset by block changes) for columns, splashes, the rain-above sound and isRainingAt
+- [x] Campfire smoke: Java CampfireBlockEntity.particleTick every tick (11 % chance of 2-3 cosy / signal smoke, y 0..2
+      above, quad x3, 80-129 / 280-329 ticks, fade over the last 60, random fixed sprite); animateTick only adds lava
+      (1 in 5); every campfire gets its block entity (structures, commands)
+- [~] Alt-tab back: "fullscreen" is now Godot's non-exclusive full screen (exclusive D3D12 windows sometimes never
+      reactivated; no FPS difference measured), a minimised window is restored and the mouse recaptured on focus in -
+      needs an in-game check
+- [x] Water in ice glitch (dark water patches / see-through walls on frozen lakes): Java draws water under / beside ice
+      (ice is noOcclusion) but sorts translucent quads back to front; TerrainRD drew a group's translucent direction
+      buckets in fixed order, so sloped water tops under the ice (bucket "other") and a hole's +-Z water sides came after
+      the ice tops, in front of them. Translucent buckets now draw in a camera-side order (above the group: sloped,
+      vertical, +Y, -Y; below: +Y, vertical, sloped, -Y). Render-checked (ice sheet over water with holes, 4 views)
+- [x] Stained glass / ice / slime / honey icons were opaque bricks of colour: block icons blend translucent block items
+      (native icon_raster: texture index + 0.5 = translucent, straight-alpha "over"; GDScript fallback the same)
+- [x] Panes "bricks of colour" in hand: flat items with translucent pixels use a blended entity shader variant
+      (EntityRenderer.flat_item_material; Java translucent item sheet) in hand / third person / on the ground / in
+      frames; translucent block items in hand / dropped / falling use voxel_item_translucent
+- [x] Shelves had no icon, the enchanting table icon was its floating book: BERender.item_node only for items whose
+      items/<name>.json is minecraft:special (they went through the block-entity renderer: empty shelf, lone book)
+- [x] Walls broken in hand: a wall's default state has no geometry, so hand / ground / frame paths fell back to the
+      extruded GUI icon turned 45 deg (an edge-on striped sliver). Block items now draw the item's own model
+      (EntityRenderer.item_block_mesh: *_inventory models of walls, fences, buttons, shelves; else the default state)
+      whenever the item model is a block model. Render-checked (wall in hand, in a frame, dropped)
+- [x] Enchanting table book blank: 26.3 moved the texture to entity/enchantment/enchanting_table_book.png
+- [x] Lanterns "don't connect": every lantern was placed standing (floating under ceilings). Java LanternBlock
+      placement: the vertical nearest looking directions (clicked face's opposite first), hanging=true when the block
+      above supports its centre (Block.canSupportCenter; fence gates never), else standing on a centre support, else
+      not placed (Interaction.lantern_placement). Breaking the support is Support.can_survive's (support.gd)
+- [x] Item frames: a stretched leather box -> Java ItemFrameRenderer: block/(glow_)item_frame(_map) model rotated per
+      facing (all 6), the item at 0.4375 turned 45 deg per rotation, half size with its FIXED display (blocks 3D),
+      maps 128 px over the whole face; glow frames light their item fully. /summon item_frame <pos> {Facing,Item,
+      ItemRotation} added. Render-checked (wall / floor / ceiling / side frames, sword, block, rotated pane, bow)
+- [x] Floating top half of a door after breaking the block under it / torches staying when the block behind them goes /
+      "every supported block must break": scripts/world/support.gd (Java canSurvive + updateShape). Every notified
+      set_block hands its 6 neighbours with a rule (byte per block id, no scans) to Support; the rule re-checks only the
+      side Java reads (torches / signs / plates / candles below, wall torches / ladders / hooks / wall signs / banners /
+      coral fans / amethyst behind, buttons / levers / lanterns / bells their attachment, cocoa its log; dust, diodes,
+      rails, plants, carpets, snow any side) and a failed block goes like Level.destroyBlock: loot without tool / entity,
+      break particles + sound, its water stays. Doors / tall plants / beds: the half left alone is destroyed with drops
+      (one item from the loot tables; creative breaks drop nothing - preventDropFromBottomPart). Vines / glow lichen lose
+      faces first; sugar cane, cactus, bamboo, chorus, kelp / weeping / twisting / cave vines, pale hanging moss,
+      dripstone (stalactites fall) and scaffolding (distance 0-7, falls / breaks at 7) use 1-2 tick scheduled ticks like
+      Java. Face support = Java isFaceSturdy FULL / CENTER / RIGID rasterised from collision shapes (leaves give none,
+      soul sand / mud full, snow by layers). Placement uses the same rules (StandingAndWallBlockItem wall / standing
+      fallback along the nearest looking directions, buttons / levers every face, ladders / hooks / cocoa / vines /
+      lichen / bells / dripstone / wall hanging signs, doors + tall plants need a replaceable block above, crops light 8).
+      Loot fixes found on the way: 26.3 "match_block" condition was never evaluated (both door halves rolled a door, crops
+      at age 0 dropped wheat, snow always 1 snowball), location_check (tall grass halves), wall torches / signs / banners
+      / heads / coral wall fans have no 26.3 table (dropsLike: standing form - they dropped nothing), requiresCorrectTool
+      only for players (a lantern losing its ceiling drops). 20 tests + render check (door / torches / lantern / ladders
+      popped with their items, no floating halves)
+- [x] Door / trapdoor / lever click spam and fast Escape: every right-click press now acts at once (Java handleKeybinds:
+      clicks ignore rightClickDelay; the 4-tick cooldown dropped clicks), holding repeats every 4 ticks (new: blocks /
+      doors repeated nothing before); Escape closes a screen whose LineEdit / TextEdit has focus on the first press
+      (WorldManager._input, Java Screen.keyPressed - the LineEdit ate the first Escape) and a sign keeps its text on
+      Escape (Java onClose -> onDone)
+- [x] Closing a door into the player forced a crawl: Java Player.updatePlayerPose keeps the pose while even the 0.6-tall
+      swimming box is blocked (door collision itself = Java DoorBlock 3 px shapes, already tested); test added
+- [x] Snow layers stack like Java (SnowLayerBlock.canBeReplaced): a snow item on a layer's top face, or on a face in
+      front of a layer, adds a layer up to 8 (then a new layer above); other blocks replace only a single layer
+      (wiki Snow), entity / player obstruction checked
+- [x] Water on snow layers: vanilla drops NOTHING (wiki Snow: "breaks and drops nothing if water or lava flows into its
+      space"; 26.3 loot snow.json needs an entity) - water now washes layers away dropless; a shovel still gives one
+      snowball per layer; explosions drop (own context)
+- [x] Redstone dust placed on dust "breaks instantly": placement is refused where dust cannot survive (Support K_WIRE ->
+      RedstoneWire.can_survive_on: a sturdy top or a hopper; not dust, leaves, bottom slabs, fences, bottom trapdoors,
+      air). RedstoneWire's sturdy-face checks (survival, placement, the UP connection) now read Support's per-state
+      isFaceSturdy table (leaves give no support, as Java), so dust and Support agree; dust on a block a piston pushes
+      away pops (Support on the moved cells). Tested (stone / glass / glowstone / soul sand / top slab / upside-down
+      stairs / hopper ok) + render-checked (dust on leaves pops, climbing dust lights a lamp)
+- [x] Levers didn't open doors: 26.3 door / trapdoor / fence gate blockstates carry no "powered" (no model reads it), so
+      redstone never saw them. The registry now adds Java's POWERED; doors read both halves' neighbours and switch
+      both halves (Java DoorBlock), trapdoors / gates open + close with power, a hand-closed powered door stays closed,
+      placement next to power comes open (getStateForPlacement), sounds per set (wooden / cherry / bamboo / nether wood /
+      iron / copper doors, trapdoors, gates; volume 1, pitch 0.9-1.0 - hand toggles too)
+- [x] Redstone like vanilla (Redstone rewrite, wiki Redstone mechanics + component pages): Java weak / strong power per
+      component (levers / buttons strong into their block, plates / detector rails / lecterns / trapped chests / sculk
+      sensors down, torches up and never into their own block, rods / hooks behind, diodes / observers their output,
+      redstone blocks / daylight detectors / targets / jukeboxes weak only) and conductors per wiki Conductivity (glass,
+      glowstone, sea lanterns, leaves, ice, honey, TNT, redstone blocks, observers, pistons, beacons, spawners, copper
+      bulbs / grates don't conduct; soul sand / mud do); dust ignores dust while computing (weakly powered blocks power
+      lamps, not dust); a lever on a block now powers dust 2 blocks away (updates reach 2); repeaters extend short pulses
+      to their delay, lock only from diodes; comparators keep their output for 2 ticks, take any source as side input;
+      torches read only their own block (a torch on a redstone block is off); quasi-connectivity for pistons / dispensers
+      / droppers; copper bulbs toggle per pulse (were inert); trapped chests output their viewers; shelves react;
+      BlockUpdates support ticks no longer run components early (a neighbour change released buttons / cut repeater
+      delays: Redstone.schedule_tick remembers each component's own tick); more blocks break when pushed (pumpkins,
+      melons, leaves, cactus, cake, carpets, repeaters, ladders, heads ...). 80+ tests (scenes/tests/redstone_tests.gd: every source, strong / weak
+      matrix, dust, repeater delays 1-4 / extension / lock, comparator compare / subtract / container / through-block,
+      observer pulse, torch inversion + burnout, buttons 20 / 30, doors / trapdoors / gates, QC, hoppers, note blocks,
+      TNT, bulbs, rails, pistons); render-checked (lever + dust lamp, torch not powering its block, doors opened by levers)
+- [x] Piston pushing not smooth: Pistons (Java PistonMovingBlockEntity): block events after the tick's scheduled ticks,
+      moved blocks sit in moving_piston cells for 2 ticks (progress 0.5 / tick, solid at the start of the 3rd), drawn by
+      one node each at the partial-tick position (head SHORT for the first / last half, retracting base shows the head
+      sliding in), kept until the terrain mesh shows the result; entities in the way are pushed (slime launches 1 / tick),
+      a pulse ending mid-push makes a sticky piston drop its block, moving cells survive save / reload (block entity +
+      scheduled tick; saves finish moves first). Nothing runs while nothing moves. Render-checked mid-move
+      (--pistonhold=0.5 probe: push east, sticky push up) and after
+- [x] Extended piston = two blocks: breaking the head breaks the piston (drops it; creative: no drop), breaking the base
+      removes the head, a head without its piston can't stay, the head never drops (Java PistonHeadBlock)
 MERGED LIST 2026-11-14 (PROGRESS + own findings + every open GitHub issue; work top to bottom, don't stop until empty):
+- [x] Redstone dust like Java (user 2026-11-15: "needs to connect and have an on/off state proper"): dust shapes were never
+      computed (default state had every side "up") -> RedstoneWire (Java RedStoneWireBlock): side / up / none per side on
+      placement and every neighbour change (incl. dust one above / below), lone dust = cross, one neighbour = line,
+      right-click cross <-> dot, connects to sources / repeaters along their axis / observer backs; power follows Java
+      (a conductive block above cuts the climb, non-conductive blocks pass power up but never down); dust powers the
+      block below and only the blocks it points into (a passing line no longer lights lamps beside it); one colour per
+      power level (wiki Block colors, Redstone tints JE: #4C0000 .. #FF3200; all levels had shared one tint). 14 tests;
+      render-checked (lever line with a bend climbing a block into a lit lamp, dark unpowered line, dark lone cross).
 - [~] PERF + RAIN + CHUNK GEN (user 2026-11-14: x86 400-500 / 1 % 100-150, arm64 800 / 1 % 200-300 at RD16 / SD12, no
       cost for rain / snow, instant chunk gen). Done so far (2026-11-15):
       - Rain / snow: particles rebuilt once per tick and interpolated on the GPU (global mc_partial / mc_ticks; Java

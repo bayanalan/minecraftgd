@@ -332,32 +332,41 @@ static func spawn_frame(em, kind: String, cell: Vector3i, n: Vector3i, rot: int,
 	e.stack = item
 	e.persistent = true
 	e.node = Node3D.new()
+	# Java ItemFrameRenderer: from the entity position (the block centre - facing * 0.46875) back to the block centre,
+	# rotated X (horizontal: 0; up -90, down 90) then Y (horizontal: 180 - Direction.toYRot; up / down 180); there the
+	# block/item_frame (or item_frame_map) model at translate(-0.5) - its 1 px frame and back plate at model z 15..16
+	var fr := Node3D.new()
+	fr.name = "frame"
+	var xr := 0.0
+	var yr := 180.0
+	if n.y != 0:
+		xr = -90.0 * n.y
+	else:
+		yr = 180.0 - float(YROT_OF.get(n, 0.0))
+	fr.transform = Transform3D(Basis(Vector3.RIGHT, deg_to_rad(xr)) * Basis(Vector3.UP, deg_to_rad(yr)), Vector3(n) * 0.46875)
+	e.node.add_child(fr)
 	var face := MeshInstance3D.new()
-	var bm := BoxMesh.new()
-	bm.size = Vector3(0.75, 0.75, 0.0625)
-	face.mesh = bm
-	var mat := StandardMaterial3D.new()
-	mat.albedo_texture = UiKit.sprite("block/" + kind)
-	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED   # lit by light_tint() like the voxel shaders
-	face.material_override = mat
 	face.name = "face"
-	e.node.add_child(face)
-	var spr := Sprite3D.new()
-	spr.name = "item"
-	spr.pixel_size = 0.03
-	spr.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
-	spr.position = Vector3(0, 0, 0.04)
-	e.node.add_child(spr)
-	_orient(e.node, n)
+	face.position = Vector3(0, -0.5, 0)   # (model meshes are x / z centred, y from 0)
+	fr.add_child(face)
+	var it := Node3D.new()
+	it.name = "item"
+	fr.add_child(it)
 	em.add_child(e.node)
 	em.ents.append(e)
 	_refresh_frame(em, e)
 	return e
 
 
+## Java Direction.toYRot of a horizontal facing (south 0, west 90, north 180, east 270).
+const YROT_OF := {Vector3i(0, 0, 1): 0.0, Vector3i(-1, 0, 0): 90.0, Vector3i(0, 0, -1): 180.0, Vector3i(1, 0, 0): 270.0}
+
+
 ## Unshaded hanging-entity materials follow the block/sky light at their position (glow frames stay bright).
 static func light_tint(em, e) -> void:
+	if e.kind == "frame":
+		_frame_light(em, e)
+		return
 	var face: MeshInstance3D = e.node.get_node_or_null("face")
 	if face == null:
 		return
@@ -432,19 +441,62 @@ static func projectile_break(em, e, shooter) -> void:
 	em._remove(e)
 
 
+## Java ItemFrameRenderer light: the frame model takes the light at the frame (a glow frame's block light at least 5),
+## the framed item the same - a glow frame's at full brightness (getLightCoords: 0xF000F0 for items, 0xF000D2 for
+## maps). Map sprites are unshaded: modulated like paintings. Re-applied only when the light there changes.
+static func _frame_light(em, e) -> void:
+	if em.get("world") == null or em.world.get("cm") == null:
+		return
+	var na: Array = e.data.get("n", [0, 0, 1])
+	var q: Vector3 = e.pos + Vector3(0, 0.375, 0) + Vector3(na[0], na[1], na[2]) * 0.3
+	var l: int = em.world.cm.get_light(int(floor(q.x)), int(floor(q.y)), int(floor(q.z)))
+	var dk := clampf(em.world.sky_darken(), 0.2, 1.0)
+	var key := l * 1000 + int(dk * 100.0)
+	if int(e.node.get_meta("lkey", -1)) == key:
+		return
+	e.node.set_meta("lkey", key)
+	var glow: bool = e.id == "glow_item_frame"
+	var sky := float(l >> 4) / 15.0
+	var blk := float(l & 15) / 15.0
+	var fr: Node = e.node.get_node_or_null("frame")
+	if fr == null:
+		return
+	var face: MeshInstance3D = fr.get_node_or_null("face")
+	if face != null:
+		face.set_instance_shader_parameter("light", Vector2(sky, maxf(blk, 5.0 / 15.0) if glow else blk))
+	var it: Node = fr.get_node_or_null("item")
+	if it == null:
+		return
+	BERender.set_light(it, Vector2(1.0, 1.0) if glow else Vector2(sky, blk))
+	var v := 1.0 if glow else maxf(sky * dk, blk)
+	var b := 0.12 + 0.88 * v * v
+	for s in it.find_children("*", "Sprite3D", true, false):
+		(s as Sprite3D).modulate = Color(b, b, b)
+
+
 static func _refresh_frame(em, e) -> void:
-	var spr: Sprite3D = e.node.get_node("item")
-	spr.texture = ItemIcons.icon(e.stack.item) if not e.stack.is_empty() else null
-	spr.pixel_size = 0.03
-	for ch in spr.get_children():
+	var fr: Node3D = e.node.get_node("frame")
+	var it: Node3D = fr.get_node("item")
+	for ch in it.get_children():
+		it.remove_child(ch)
 		ch.queue_free()
+	e.node.remove_meta("lkey")
 	var mid := Maps.map_id(e.stack)
+	var glow: bool = e.id == "glow_item_frame"
+	var face: MeshInstance3D = fr.get_node("face")
+	face.mesh = EntityRenderer.model_mesh("block/%s%s" % ["glow_item_frame" if glow else "item_frame", "_map" if mid >= 0 else ""])
+	var rot := int(e.data.get("rot", 0))
 	if mid >= 0:
+		# Java: translate(0, 0, 0.4375), Z by rotation % 4 * 90 deg, Z 180, scale 1/128, translate(-64, -64, -1): the
+		# 128 x 128 map over the whole block face, image up = frame up, facing out of the wall (frame space +z is the
+		# wall). The banner markers are drawn on framed maps (MapDecorationType.showOnItemFrame), frame / player not.
+		var spr := Sprite3D.new()
 		spr.texture = Maps.texture(em.world, mid)
-		spr.pixel_size = 0.875 / 128.0
-		# Java ItemFrameRenderer: maps turn in 90 deg steps (rotation % 4 * 2 eighths); the banner markers are drawn on
-		# framed maps (MapDecorationType.showOnItemFrame), the frame / player markers are not
-		spr.rotation.z = -(int(e.data.get("rot", 0)) % 4) * PI / 2.0
+		spr.pixel_size = 1.0 / 128.0
+		spr.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+		spr.double_sided = false
+		spr.transform = Transform3D(Basis(Vector3.BACK, deg_to_rad(float(rot % 4) * 90.0)) * Basis(Vector3.UP, PI), Vector3(0, 0, 0.4375 - 1.0 / 128.0))
+		it.add_child(spr)
 		e.data["map_rev"] = Maps.rev(em.world, mid)
 		var k := 0
 		for d in Maps.decorations(em.world, mid):
@@ -453,14 +505,23 @@ static func _refresh_frame(em, e) -> void:
 			k += 1
 			var ds := Sprite3D.new()
 			ds.texture = UiKit.sprite(str(d[0]))
-			ds.pixel_size = 0.875 / 128.0
+			ds.pixel_size = 1.0 / 128.0
 			ds.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
 			ds.alpha_cut = SpriteBase3D.ALPHA_CUT_DISCARD
-			ds.position = Vector3(float(d[1]) / 2.0, -float(d[2]) / 2.0, 0.002 * k) * (0.875 / 128.0)
+			ds.double_sided = false
+			ds.position = Vector3(float(d[1]) / 2.0 / 128.0, -float(d[2]) / 2.0 / 128.0, 0.001 * k)
 			ds.rotation.z = -float(d[3]) * TAU / 16.0
 			spr.add_child(ds)
-		return
-	spr.rotation.z = -int(e.data.get("rot", 0)) * PI / 4.0
+	elif not e.stack.is_empty():
+		# Java: translate(0, 0, 0.4375), Z by rotation x 45 deg, scale 0.5, the item's FIXED display transform (blocks
+		# 3D at a quarter, flat items extruded at half a block)
+		var nd := HeldItems.item_node(e.stack, "fixed", false)
+		if nd != null:
+			var hold := Node3D.new()
+			hold.transform = Transform3D(Basis(Vector3.BACK, deg_to_rad(float(rot) * 45.0)).scaled_local(Vector3.ONE * 0.5), Vector3(0, 0, 0.4375))
+			hold.add_child(nd)
+			it.add_child(hold)
+	_frame_light(em, e)
 
 
 static func interact(em, e, p: Player, held: ItemStack) -> bool:

@@ -173,8 +173,8 @@ func _item_node(s: ItemStack) -> Node3D:
 	var off := Vector3.ZERO
 	var flat := false
 	var glint_mat: ShaderMaterial = null
-	if pb > 0 and (Res.blocks.st_flags[pb] & (BlockRegistry.F_CUBE | BlockRegistry.F_MODEL)) and not Res.items.model_ref[s.item].begins_with("item/"):
-		mesh = EntityRenderer.block_item_mesh(pb)
+	if pb > 0 and not Res.items.model_ref[s.item].begins_with("item/"):
+		mesh = EntityRenderer.item_block_mesh(s.item)   # (the item's model: wall / fence / shelf inventory models)
 		off = Vector3(0, -0.5, 0)
 	if mesh == null:
 		var ref := ItemRegistry.ctx_model(s.name(), "ground") if Res.mode == "vanilla" else ""
@@ -185,11 +185,7 @@ func _item_node(s: ItemStack) -> Node3D:
 			mesh = em[0]
 			if Glint.has_glint(s):
 				glint_mat = Glint.material_3d(em[1], s)
-			var sm := ShaderMaterial.new()
-			sm.shader = load("res://shaders/entity.gdshader")
-			sm.set_shader_parameter("tex", em[1])
-			sm.set_shader_parameter("has_tex", true)
-			mat = sm
+			mat = EntityRenderer.flat_item_material(em[1])   # (translucent sprites blend: stained glass panes)
 			flat = true
 	if mesh == null:
 		return root

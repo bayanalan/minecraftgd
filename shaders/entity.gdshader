@@ -3,8 +3,14 @@
 // the LEVEL lights (0.2, 1, -0.7) / (-0.2, 1, 0.7) normalised in world space (Nether: second light (-0.2, -1, 0.7)),
 // in view space for the first-person hand (Java renders it with an identity view: its lighting never turns), and the
 // ITEMS_3D lights for GUI icons (gui_items; their SubViewport camera is unrotated). Other meshes bake a shade in COLOR.
+// ENTITY_TRANSLUCENT (variant built by EntityRenderer.translucent_shader): flat items whose sprite has translucent pixels
+// (stained glass panes, bottles) blend like Java's translucent item sheet (item_entity_translucent_cull).
 shader_type spatial;
+#ifdef ENTITY_TRANSLUCENT
+render_mode unshaded, cull_back, blend_mix, depth_draw_opaque;
+#else
 render_mode unshaded, cull_disabled, depth_draw_opaque;
+#endif
 
 uniform sampler2D tex : filter_nearest;
 uniform bool has_tex = false;
@@ -56,4 +62,7 @@ void fragment() {
 	col = mix(col, vec3(1.0, 0.2, 0.2), hurt * 0.5);
 	col = mc_apply_fog(clamp(col, 0.0, 1.0), v_rel);
 	ALBEDO = mix(pow((col + 0.055) / 1.055, vec3(2.4)), col / 12.92, lessThan(col, vec3(0.04045)));
+#ifdef ENTITY_TRANSLUCENT
+	ALPHA = 1.0 - pow(1.0 - c.a, 1.5);   // sRGB-like blending in a linear target (as voxel_translucent)
+#endif
 }

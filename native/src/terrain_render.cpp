@@ -840,12 +840,7 @@ bool fn_tr_cull_all(const Args &a, void *ret) {
 					}
 				}
 				const int NB = q.nb;
-				int d = 0;
-				while (d < NB) {
-					if (!want[d] || q.cnt[d] == 0) { d++; continue; }
-					uint32_t first = q.quad_off + q.start[d];
-					uint32_t cnt = 0;
-					while (d < NB && (want[d] || q.cnt[d] == 0)) { cnt += want[d] ? q.cnt[d] : 0; d++; }
+				auto emit = [&](uint32_t first, uint32_t cnt) {
 					qdrawn += cnt;
 					if (idx16) {
 						while (cnt > 0) {
@@ -854,15 +849,46 @@ bool fn_tr_cull_all(const Args &a, void *ret) {
 							first += nq;
 							cnt -= nq;
 						}
-						continue;
+						return;
 					}
 					if (split && cnt > 1) {   // experiment (flags & 128): every command split in two (per-command GPU cost)
 						uint32_t h1 = cnt / 2;
 						cmds.push_back(h1 * 6u); cmds.push_back(1u); cmds.push_back(first * 6u); cmds.push_back(0u); cmds.push_back(0u);
 						cmds.push_back((cnt - h1) * 6u); cmds.push_back(1u); cmds.push_back((first + h1) * 6u); cmds.push_back(0u); cmds.push_back(0u);
-						continue;
+						return;
 					}
 					cmds.push_back(cnt * 6u); cmds.push_back(1u); cmds.push_back(first * 6u); cmds.push_back(0u); cmds.push_back(0u);
+				};
+				if (m == 2 && NB == 7) {
+					// translucent: the direction buckets in a back-to-front order for the camera's side of the group (Java sorts a
+					// section's translucent quads by distance; inside a bucket the mesher's y-ascending order stays). In bucket
+					// order (+X -X +Y -Y +Z -Z other) the sloped water tops under an ice sheet (other) and the side faces of a
+					// water hole in it (+-Z) were drawn after the ice tops (+Y) in front of them: dark water patches and
+					// see-through side walls on frozen lakes. Camera above the group's translucent centre: sloped surfaces, the
+					// vertical faces, then the tops (ceilings last); below it: floors, verticals, sloped undersides, then -Y.
+					static const int ORD_ABOVE[7] = {6, 0, 1, 4, 5, 2, 3};
+					static const int ORD_BELOW[7] = {2, 0, 1, 4, 5, 6, 3};
+					const int *ord = cam[1] >= t->cy[i] ? ORD_ABOVE : ORD_BELOW;
+					uint32_t pf = 0, pc = 0;
+					for (int oi = 0; oi < 7; oi++) {
+						const int dd = ord[oi];
+						if (!want[dd] || q.cnt[dd] == 0) continue;
+						const uint32_t f0 = q.quad_off + q.start[dd];
+						if (pc > 0 && pf + pc == f0) { pc += q.cnt[dd]; continue; }   // contiguous: one command
+						if (pc > 0) emit(pf, pc);
+						pf = f0;
+						pc = q.cnt[dd];
+					}
+					if (pc > 0) emit(pf, pc);
+				} else {
+					int d = 0;
+					while (d < NB) {
+						if (!want[d] || q.cnt[d] == 0) { d++; continue; }
+						uint32_t first = q.quad_off + q.start[d];
+						uint32_t cnt = 0;
+						while (d < NB && (want[d] || q.cnt[d] == 0)) { cnt += want[d] ? q.cnt[d] : 0; d++; }
+						emit(first, cnt);
+					}
 				}
 			}
 			meta[(size_t)b * 2] = (int32_t)first_cmd;

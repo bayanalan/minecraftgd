@@ -482,6 +482,7 @@ static func _render_block(st: int, model: String = "") -> Image:
 	var scale := float(SIZE)
 	var lrot := Basis(Vector3.RIGHT, deg_to_rad(float(gr[0]))) * Basis(Vector3.UP, deg_to_rad(float(gr[1]))) * Basis(Vector3.BACK, deg_to_rad(float(gr[2])))
 	var is_flat := (Res.blocks.st_flags[st] & BlockRegistry.F_MODEL) != 0 and Res.blocks.st_cull[st] == 0 and Res.blocks.st_shape[st] == 0
+	var tl := (Res.blocks.st_flags[st] & BlockRegistry.F_TRANSLUCENT) != 0
 	for q in _item_quads(st, model):
 		var pts: Array = q[0]
 		var uvs: Array = q[1]
@@ -500,7 +501,7 @@ static func _render_block(st: int, model: String = "") -> Image:
 			var r: Vector3 = rot * v + toff
 			sp.append(Vector3(SIZE / 2.0 + r.x * scale, SIZE / 2.0 - r.y * scale, r.z))
 		for tri in [[0, 1, 2], [0, 2, 3]]:
-			_raster(img, zbuf, sp[tri[0]], sp[tri[1]], sp[tri[2]], uvs[tri[0]], uvs[tri[1]], uvs[tri[2]], im, tint * sh)
+			_raster(img, zbuf, sp[tri[0]], sp[tri[1]], sp[tri[2]], uvs[tri[0]], uvs[tri[1]], uvs[tri[2]], im, tint * sh, tl)
 	return img
 
 
@@ -519,6 +520,8 @@ static func _render_block_native(st: int, model: String) -> Image:
 	var texs: Array = []
 	var tsz := PackedInt32Array()
 	var tix := {}
+	# translucent block items (stained glass, ice, slime, honey) blend: texture index + 0.5 (see native/src/icons.cpp)
+	var tl := 0.5 if (Res.blocks.st_flags[st] & BlockRegistry.F_TRANSLUCENT) != 0 else 0.0
 	for q in _item_quads(st, model):
 		if not _front(q[0], int(q[3]), rot):
 			continue
@@ -544,12 +547,14 @@ static func _render_block_native(st: int, model: String) -> Image:
 			var uv: Vector2 = uvs[k]
 			qa.append_array([sz / 2.0 + r.x * sz, sz / 2.0 - r.y * sz, r.z, uv.x, uv.y])
 		var mul: Color = (q[4] as Color) * gui_light(lrot, int(q[5]) if q.size() > 5 else int(q[3]))
-		qa.append_array([float(tix[li]), mul.r, mul.g, mul.b])
+		qa.append_array([float(tix[li]) + tl, mul.r, mul.g, mul.b])
 	var res: Array = Native.inst.icon_raster(qa, texs, tsz, sz)
 	return Image.create_from_data(sz, sz, false, Image.FORMAT_RGBA8, res[0])
 
 
-static func _raster(img: Image, zb: PackedFloat32Array, a: Vector3, b: Vector3, c: Vector3, ua: Vector2, ub: Vector2, uc: Vector2, tex: Image, mul: Color) -> void:
+## tl: translucent block item (Java translucent item sheet: stained glass, ice, slime, honey) - texels blend over what is
+## already drawn ("over" with straight alpha), others are written opaque (cutout: alpha < 0.1 discarded).
+static func _raster(img: Image, zb: PackedFloat32Array, a: Vector3, b: Vector3, c: Vector3, ua: Vector2, ub: Vector2, uc: Vector2, tex: Image, mul: Color, tl := false) -> void:
 	var minx := clampi(int(floor(minf(a.x, minf(b.x, c.x)))), 0, SIZE - 1)
 	var maxx := clampi(int(ceil(maxf(a.x, maxf(b.x, c.x)))), 0, SIZE - 1)
 	var miny := clampi(int(floor(minf(a.y, minf(b.y, c.y)))), 0, SIZE - 1)
@@ -580,4 +585,9 @@ static func _raster(img: Image, zb: PackedFloat32Array, a: Vector3, b: Vector3, 
 			zb[y * SIZE + x] = z
 			var o := col * mul
 			o.a = 1.0
+			if tl and col.a < 1.0:
+				var dst := img.get_pixel(x, y)
+				var oa := col.a + dst.a * (1.0 - col.a)
+				var orgb := (Color(o.r, o.g, o.b) * col.a + Color(dst.r, dst.g, dst.b) * dst.a * (1.0 - col.a)) / maxf(oa, 1e-6)
+				o = Color(orgb.r, orgb.g, orgb.b, oa)
 			img.set_pixel(x, y, o)

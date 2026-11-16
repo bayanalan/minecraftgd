@@ -438,27 +438,22 @@ func _update_offhand(p: Player, bob_t: Transform3D, lv: Vector2) -> void:
 		off_root.set_meta("mode", "")
 		var spec := BERender.item_node(off.item, "firstperson_lefthand", {"patterns": Banners.layers(off), "base_color": off.components.get("minecraft:base_color")}, using)
 		var pb: int = Res.items.place_block[off.item]
+		var bm: ArrayMesh = EntityRenderer.item_block_mesh(off.item) if spec == null and pb > 0 and not Res.items.model_ref[off.item].begins_with("item/") else null
 		if spec != null:
 			off_root.add_child(spec)
 			off_root.set_meta("mode", "special")
-		elif pb > 0 and (Res.blocks.st_flags[pb] & (BlockRegistry.F_CUBE | BlockRegistry.F_MODEL)) != 0 and not Res.items.model_ref[off.item].begins_with("item/"):
-			var bm := EntityRenderer.block_item_mesh(pb)
-			if bm != null:
-				var bmi := MeshInstance3D.new()
-				bmi.mesh = bm
-				bmi.position = Vector3(0, -0.5, 0)
-				off_root.add_child(bmi)
-				off_root.set_meta("mode", "block")
+		elif bm != null:
+			var bmi := MeshInstance3D.new()
+			bmi.mesh = bm
+			bmi.position = Vector3(0, -0.5, 0)
+			off_root.add_child(bmi)
+			off_root.set_meta("mode", "block")
 		else:
 			var tex := ItemIcons.icon(off.item)
 			if tex != null:
 				var emi := MeshInstance3D.new()
 				emi.mesh = extruded(tex)
-				var m := ShaderMaterial.new()
-				m.shader = load("res://shaders/entity.gdshader")
-				m.set_shader_parameter("tex", tex)
-				m.set_shader_parameter("has_tex", true)
-				emi.material_override = m
+				emi.material_override = EntityRenderer.flat_item_material(tex)
 				off_root.add_child(emi)
 				off_root.set_meta("mode", "item")
 				if Glint.has_glint(off):
@@ -518,8 +513,10 @@ func _ensure_item(s: ItemStack) -> void:
 	for c in item_root.get_children():
 		c.queue_free()
 	var pb: int = Res.items.place_block[s.item]
-	if pb > 0 and (Res.blocks.st_flags[pb] & (BlockRegistry.F_CUBE | BlockRegistry.F_MODEL)) != 0 and not Res.items.model_ref[s.item].begins_with("item/"):
-		var mesh := EntityRenderer.block_item_mesh(pb)
+	if pb > 0 and not Res.items.model_ref[s.item].begins_with("item/"):
+		# the item's model (wall / fence / shelf inventory models; a wall's default state has no geometry of its own, so
+		# walls fell through to the extruded GUI icon - an edge-on striped sliver in the hand)
+		var mesh := EntityRenderer.item_block_mesh(s.item)
 		if mesh != null:
 			var mi := MeshInstance3D.new()
 			mi.mesh = mesh
@@ -582,11 +579,7 @@ func _ensure_item(s: ItemStack) -> void:
 		return
 	var mi2 := MeshInstance3D.new()
 	mi2.mesh = em[0] if em.size() == 2 else extruded(tex)
-	var m := ShaderMaterial.new()
-	m.shader = load("res://shaders/entity.gdshader")
-	m.set_shader_parameter("tex", tex)
-	m.set_shader_parameter("has_tex", true)
-	mi2.material_override = m
+	mi2.material_override = EntityRenderer.flat_item_material(tex)   # (translucent sprites blend: stained glass panes)
 	item_root.add_child(mi2)
 	if Glint.has_glint(s):
 		var g2 := MeshInstance3D.new()   # enchantment glint over the item's own geometry

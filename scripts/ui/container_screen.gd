@@ -110,6 +110,8 @@ func build() -> void:
 				add_slot(Vector2(8 + c * 18, 18 + r * 18), _g.bind(r * 9 + c), _s.bind(r * 9 + c), 0, false, (func(st): return not st.name().ends_with("shulker_box")) if kind.ends_with("shulker_box") else Callable())
 		add_player_inventory(8, 103 + (rows - 4) * 18)
 	Audio.play("block.chest.open" if kind.contains("chest") else ("block.barrel.open" if kind == "barrel" else "block.chest.open"), Vector3(pos), "Blocks", 0.5)
+	if entity == null and kind == "trapped_chest":
+		Redstone.chest_viewers(world, pos, pos2, 1)   # wiki Trapped Chest: powered while players have it open
 
 
 func draw_background(o: Vector2) -> void:
@@ -208,4 +210,6 @@ func _commit() -> void:
 func on_close() -> void:
 	_commit()
 	Audio.play("block.chest.close", Vector3(pos), "Blocks", 0.5)
+	if entity == null and kind == "trapped_chest":
+		Redstone.chest_viewers(world, pos, pos2, -1)
 	super.on_close()

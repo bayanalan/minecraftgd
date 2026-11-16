@@ -122,8 +122,11 @@ func _refresh_items() -> void:
 			items = _tab_items.get(_tab(selected)[0], PackedInt32Array())
 		2:
 			var q := search.text.strip_edges().to_lower() if search != null else ""
+			_visible_tags = []
 			if q == "":
 				items = _all_items
+			elif q.begins_with("#"):
+				items = _tag_search(q.substr(1))
 			else:
 				var out := PackedInt32Array()
 				for i in _all_items:
@@ -133,6 +136,47 @@ func _refresh_items() -> void:
 		_:
 			items = PackedInt32Array()
 	scroll = clampi(scroll, 0, _max_scroll())
+
+
+## Java CreativeModeInventoryScreen.updateVisibleTags + the CREATIVE_TAGS search tree: "#text" matches every item tag
+## whose path contains the text ("#ns:path": namespace contains ns and path contains path); the results are the items
+## in any matching tag, in creative order, and their tooltips list the matching tags (dark purple, under the name).
+var _visible_tags: Array = []   # [tag id "minecraft:<path>", {item name: true}]
+static var _item_tag_paths := PackedStringArray()
+
+
+## The item tags a "#" query matches: [["minecraft:<path>", {item name: true}], ...].
+static func tag_matches(q: String) -> Array:
+	if _item_tag_paths.is_empty():
+		var pre := "data/minecraft/tags/item/"
+		for f in Res.list_files(pre, ".json"):
+			_item_tag_paths.append(f.substr(pre.length()).trim_suffix(".json"))
+	var ns_q := ""
+	var path_q := q.strip_edges()
+	var ci := q.find(":")
+	if ci >= 0:
+		ns_q = q.substr(0, ci).strip_edges()
+		path_q = q.substr(ci + 1).strip_edges()
+	var out: Array = []
+	for tp in _item_tag_paths:
+		if ci >= 0 and not "minecraft".contains(ns_q):
+			continue
+		if not tp.contains(path_q):
+			continue
+		out.append(["minecraft:" + tp, Tags.items(tp)])
+	return out
+
+
+func _tag_search(q: String) -> PackedInt32Array:
+	_visible_tags = tag_matches(q)
+	var names := {}
+	for vt in _visible_tags:
+		names.merge(vt[1])
+	var out := PackedInt32Array()
+	for i in _all_items:
+		if names.has(Res.items.names[i]):
+			out.append(i)
+	return out
 
 
 func _rows() -> int:
@@ -349,6 +393,10 @@ func _draw() -> void:
 		var hs: ItemStack = slots[hover]["get"].call()
 		if not hs.is_empty():
 			tip = item_tooltip(hs)
+			if _tab(selected)[8] == 2 and not _visible_tags.is_empty():
+				for vt in _visible_tags:
+					if (vt[1] as Dictionary).has(hs.name()):
+						tip.insert(1, ["#" + str(vt[0]), Color8(0xAA, 0x00, 0xAA)])   # (Java list.add(1, ...) per tag)
 			if _tab(selected)[8] == 1 and hs.name() == "paper" and slots[hover]["section"] == 4:
 				tip = [[Res.tr_key("inventory.hotbarInfo", "Save hotbar with %s+%s") % ["C", str(scroll + hover / 9 + 1)], Color.WHITE]]
 	if not tip.is_empty():

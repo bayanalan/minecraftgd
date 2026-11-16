@@ -110,6 +110,7 @@ func _setup() -> void:
 	surface.setup(str(settings_json.get("material_rule", settings_json.get("surface_rule", "minecraft:overworld"))))
 	features = Features.new(self)
 	ShapeUpdates.prime()
+	Support.prime()   # (support-rule kinds per block, built here instead of on the first block change in play)
 	features.setup()
 	carvers = Carvers.new(self)
 	if structures_enabled:

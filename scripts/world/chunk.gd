@@ -171,6 +171,61 @@ var light_partial := false            # lit while some 3x3 neighbour was not yet
 var light_halo_secs: Array = []       # 24 x (PackedByteArray 18x18x16 | int uniform), from Lighting.compute
 var light_epoch := 0
 var mesh_epoch := 0
+## Java MOTION_BLOCKING heightmap (rain / snow columns, splashes, isRainingAt): per column the y above the topmost block
+## that blocks motion (legacy-solid, except cobweb / bamboo sapling) or holds fluid; built lazily, a column is
+## forgotten when a block in it changes, all when sections are replaced. (heightmap above is the light heightmap:
+## opacity > 0 - glass, panes, fences let light through but stop rain.)
+const MB_UNKNOWN := -99999
+var mb_top := PackedInt32Array()
+static var _mbt := PackedByteArray()
+
+
+static func motion_table() -> PackedByteArray:
+	var b := Res.blocks
+	if _mbt.size() != b.total_states:
+		var t := PackedByteArray()
+		t.resize(b.total_states)
+		var cob := b.block_id("cobweb")
+		var bam := b.block_id("bamboo_sapling")
+		for s0 in range(1, b.total_states):
+			var fl: int = b.st_flags[s0]
+			var solid := (fl & BlockRegistry.F_SOLID) != 0 and b.st_block[s0] != cob and b.st_block[s0] != bam
+			t[s0] = 1 if solid or (fl & (BlockRegistry.F_LIQUID | BlockRegistry.F_WATERLOGGED)) != 0 else 0
+		_mbt = t
+	return _mbt
+
+
+func motion_top(lx: int, lz: int) -> int:
+	if mb_top.size() != 256:
+		mb_top.resize(256)
+		mb_top.fill(MB_UNKNOWN)
+	var i := lx + lz * 16
+	var v: int = mb_top[i]
+	if v != MB_UNKNOWN:
+		return v
+	var t := motion_table()
+	var col := (lz << 4) | lx
+	v = Coords.MIN_Y
+	for si in range(Coords.SECTIONS - 1, -1, -1):
+		var sec: Section = sections[si]
+		var pal := sec.pal
+		if pal.size() == 1:
+			if pal[0] > 0 and pal[0] < t.size() and t[pal[0]] == 1:
+				v = Coords.MIN_Y + si * 16 + 16
+				break
+			continue
+		var found := -1
+		for ly in range(15, -1, -1):
+			var vi := (ly << 8) | col
+			var st: int = pal[sec.wide[vi]] if sec.wide.size() > 0 else pal[sec.idx[vi]]
+			if st > 0 and st < t.size() and t[st] == 1:
+				found = ly
+				break
+		if found >= 0:
+			v = Coords.MIN_Y + si * 16 + found + 1
+			break
+	mb_top[i] = v
+	return v
 ## Collision version for caches keyed by region (Collision): a fresh value from one global sequence whenever this
 ## chunk's collision may have changed (set_block, generated / decorated sections installed), so a reloaded chunk never
 ## repeats an old value.
@@ -237,6 +292,8 @@ func set_block(lx: int, y: int, lz: int, st: int) -> int:
 			_bseq += 1
 			bepoch = _bseq
 		_snap = []
+		if mb_top.size() == 256:
+			mb_top[lx + lz * 16] = MB_UNKNOWN
 		refs_gen += 1   # an in-place write may have copied a packed array another holder shared: sec_refs must rebuild
 	if sec.rt < 0:
 		if rt_listed and not rt_dirty:
@@ -249,6 +306,7 @@ func set_block(lx: int, y: int, lz: int, st: int) -> int:
 ## Fill all sections from a full-column raw array (98304 entries, index ((y-MIN_Y)<<8)|(z<<4)|x).
 func fill_from_column(col: PackedInt32Array) -> void:
 	_snap = []
+	mb_top = PackedInt32Array()
 	if rt_listed and not rt_dirty:
 		BlockUpdates.rt_chunk_dirty(self)
 	rt_dirty = true
@@ -396,6 +454,7 @@ func adopt_decoration(shell: Chunk) -> void:
 	heightmap = shell.heightmap
 	block_entities = shell.block_entities
 	_snap = []
+	mb_top = PackedInt32Array()
 	if rt_listed and not rt_dirty:
 		BlockUpdates.rt_chunk_dirty(self)
 	rt_dirty = true
@@ -407,6 +466,7 @@ func set_sections(arr: Array) -> void:
 	_bseq += 1
 	bepoch = _bseq
 	_snap = []
+	mb_top = PackedInt32Array()
 	for s in Coords.SECTIONS:
 		var sec: Section = sections[s]
 		var e: Array = arr[s]

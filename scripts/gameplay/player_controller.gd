@@ -273,7 +273,12 @@ func tick(w) -> void:
 	var fwd := in_forward * 0.98
 	var strafe := in_strafe * 0.98
 	var want_sneak := in_sneak and not flying
-	if sneaking and not want_sneak:
+	# Java Player.updatePlayerPose: the pose only changes while the 0.6-tall swimming box fits - a door closed into the
+	# player (or a block placed into them) blocks every pose, so they keep standing instead of dropping to a crawl
+	var swim_fits := not Collision.overlaps_any(Vector3(pos.x - 0.3, pos.y, pos.z - 0.3), Vector3(pos.x + 0.3, pos.y + 0.6, pos.z + 0.3), gs, blocks)
+	if not swim_fits:
+		pass
+	elif sneaking and not want_sneak:
 		# can we stand up?
 		if not Collision.overlaps_any(Vector3(pos.x - 0.3, pos.y, pos.z - 0.3), Vector3(pos.x + 0.3, pos.y + 1.8, pos.z + 0.3), gs, blocks):
 			sneaking = false
@@ -281,8 +286,9 @@ func tick(w) -> void:
 		sneaking = want_sneak
 	# wiki Crawling (Java Player.updatePlayerPose): when neither the standing (1.8) nor the crouching (1.5) hitbox fits -
 	# a trapdoor closing above, a 1-block gap - the player crawls (0.6 tall, eyes 0.4) at the sneaking speed
-	crawling = false
-	if not flying and not fall_flying and not sleeping and vehicle == null and not (eyes_in_water and in_water) and not is_spectator():
+	if not (not flying and not fall_flying and not sleeping and vehicle == null and not (eyes_in_water and in_water) and not is_spectator()):
+		crawling = false
+	elif swim_fits:
 		crawling = Collision.overlaps_any(Vector3(pos.x - 0.3, pos.y, pos.z - 0.3), Vector3(pos.x + 0.3, pos.y + 1.5, pos.z + 0.3), gs, blocks)
 	if sneaking or crawling:
 		# sneaking_speed attribute 0.3, Swift Sneak +0.15 per level (26.3 enchantment data; wiki: Attribute)

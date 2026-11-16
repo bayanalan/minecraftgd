@@ -3,6 +3,8 @@
 //
 // icon_raster(quads, texs, sizes, size) -> [PackedByteArray rgba (size * size * 4)]
 //   quads: PackedFloat32Array, 24 floats per quad: 4 x (screen x, screen y, depth, u, v), texture index, r, g, b
+//          (texture index + 0.5: translucent quad - texels blend over the pixel like Java's translucent item sheet,
+//          straight-alpha "over"; otherwise written opaque; alpha < 26 is discarded either way)
 //   texs: Array of PackedByteArray (RGBA8 texture data), sizes: PackedInt32Array (w, h per texture)
 #include "native.h"
 #include <algorithm>
@@ -40,6 +42,7 @@ bool fn_icon_raster(const Args &a, void *ret) {
 	for (int64_t qi = 0; qi < nq; qi++) {
 		const float *Q = q + qi * 24;
 		int ti = (int)Q[20];
+		bool tl = Q[20] - (float)ti > 0.25f;
 		if (ti < 0 || ti >= nt || !tex[(size_t)ti]) continue;
 		const uint8_t *T = tex[(size_t)ti];
 		int tw = sz[ti * 2], th = sz[ti * 2 + 1];
@@ -72,10 +75,23 @@ bool fn_icon_raster(const Args &a, void *ret) {
 					if (px4[3] < 26) continue;
 					zr = z;
 					uint8_t *d = o + ((size_t)y * size + x) * 4;
-					d[0] = (uint8_t)std::clamp((int)std::lround(px4[0] * mr), 0, 255);
-					d[1] = (uint8_t)std::clamp((int)std::lround(px4[1] * mg), 0, 255);
-					d[2] = (uint8_t)std::clamp((int)std::lround(px4[2] * mb), 0, 255);
-					d[3] = 255;
+					int sr = std::clamp((int)std::lround(px4[0] * mr), 0, 255);
+					int sg = std::clamp((int)std::lround(px4[1] * mg), 0, 255);
+					int sb = std::clamp((int)std::lround(px4[2] * mb), 0, 255);
+					if (tl && px4[3] < 255) {
+						double sa = px4[3] / 255.0, da = d[3] / 255.0;
+						double oa = sa + da * (1.0 - sa);
+						double k = da * (1.0 - sa);
+						d[0] = (uint8_t)std::clamp((int)std::lround((sr * sa + d[0] * k) / oa), 0, 255);
+						d[1] = (uint8_t)std::clamp((int)std::lround((sg * sa + d[1] * k) / oa), 0, 255);
+						d[2] = (uint8_t)std::clamp((int)std::lround((sb * sa + d[2] * k) / oa), 0, 255);
+						d[3] = (uint8_t)std::clamp((int)std::lround(oa * 255.0), 0, 255);
+					} else {
+						d[0] = (uint8_t)sr;
+						d[1] = (uint8_t)sg;
+						d[2] = (uint8_t)sb;
+						d[3] = 255;
+					}
 				}
 		}
 	}

@@ -552,18 +552,9 @@ static func _is_water(st: int) -> bool:
 ## SnowLayerBlock.canSurvive: not on #cannot_support_snow_layer (ice, packed ice, barrier); always on
 ## #support_override_snow_layer (honey block, soul sand, mud); else a full top face or a full snow stack.
 static func _snow_survives(world, x: int, y: int, z: int) -> bool:
-	var below: int = world.state_at(x, y - 1, z)
-	if below <= 0:
+	if world.state_at(x, y - 1, z) <= 0:
 		return false
-	var b := Res.blocks
-	var bn := b.name_of(below)
-	if bn in ["ice", "packed_ice", "barrier"]:
-		return false
-	if bn in ["honey_block", "soul_sand", "mud"]:
-		return true
-	if bn == "snow":
-		return int(b.get_prop(below, "layers")) == 8
-	return ((b.st_cull[below] >> 1) & 1) == 1   # full top face
+	return Support.snow_survives(world, x, y, z)   # (full top COLLISION face: snow settles on leaves too)
 
 
 static func _scheduled(world, p: Vector3i) -> void:
@@ -599,6 +590,11 @@ static func _scheduled(world, p: Vector3i) -> void:
 		world.set_block(p.x, p.y, p.z, blocks.with_prop(st, "powered", "false"))
 		Redstone.on_changed(world, p)
 		Audio.play("block.%s_button.click_off" % Sensors.set_type(name), Vector3(p) + Vector3(0.5, 0.5, 0.5), "Blocks")
+		return
+	if Support.kind_of(st) != Support.K_NONE:
+		# Support rules (Java tick -> destroyBlock: drops, particles, the block's water stays; scaffolding / dripstone)
+		if Support.tick(world, p, st):
+			schedule_neighbors(world, p)
 		return
 	if not _has_support(world, p, st):
 		world.set_block(p.x, p.y, p.z, 0)
@@ -648,6 +644,8 @@ static func _support_tag(name: String) -> String:
 
 
 static func _has_support(world, p: Vector3i, st: int) -> bool:
+	if Support.kind_of(st) != Support.K_NONE:
+		return Support.can_survive(world, p, st)   # (every block with a Java canSurvive rule: support.gd)
 	var blocks := Res.blocks
 	var name := blocks.name_of(st)
 	var below: int = world.state_at(p.x, p.y - 1, p.z)
@@ -675,7 +673,12 @@ static func _has_support(world, p: Vector3i, st: int) -> bool:
 		return below > 0 and bname in ["crimson_nylium", "warped_nylium", "soul_soil", "grass_block", "dirt", "podzol", "coarse_dirt", "farmland", "moss_block", "mud", "rooted_dirt", "mycelium", "muddy_mangrove_roots", "pale_moss_block"]
 	if name in ["wheat", "carrots", "potatoes", "beetroots", "melon_stem", "pumpkin_stem", "attached_melon_stem", "attached_pumpkin_stem"]:
 		return bname == "farmland"   # (only these: big_dripleaf_stem / mushroom_stem / crimson_stem used to match "_stem")
-	if name == "torch" or name == "redstone_torch" or name == "soul_torch" or name.ends_with("_carpet") or name.ends_with("_pressure_plate") or name == "redstone_wire" or name.ends_with("rail") or name == "snow":
+	if name == "piston_head":
+		# Java PistonHeadBlock.canSurvive: its extended piston (or the moving piston it is part of) behind it
+		var hb: Vector3i = p - (Redstone.H.get(blocks.get_prop(st, "facing"), Vector3i.ZERO) as Vector3i)
+		var hbs: int = world.state_at(hb.x, hb.y, hb.z)
+		return hbs < 0 or Pistons.head_base(world, p, st) != Redstone.NONE or (hbs > 0 and blocks.name_of(hbs) == "moving_piston")
+	if name == "torch" or name == "redstone_torch" or name == "soul_torch" or name.ends_with("_carpet") or name.ends_with("_pressure_plate") or name.ends_with("rail") or name == "snow":
 		return below > 0 and (blocks.st_flags[below] & BlockRegistry.F_COLLIDE) != 0
 	if name == "sugar_cane":
 		# wiki Sugar Cane: on sugar cane, or on grass / dirt / podzol / mycelium / sand / moss / mud (26.3 #supports_sugar_cane)
@@ -1311,11 +1314,16 @@ static func fluids_changed(world, p: Vector3i) -> void:
 	if _sp_dry == -2:
 		_sp_dry = Res.blocks.block_id("sponge")
 		_sp_wet = Res.blocks.block_id("wet_sponge")
+	if Support.KIND.size() != Res.blocks.names.size():
+		Support.prime()
+	var sk := Support.KIND
 	for d in _NB7:
 		var q: Vector3i = p + d
 		var st: int = world.state_at(q.x, q.y, q.z)
 		if st <= 0:
 			continue
+		if sk[Res.blocks.st_block[st]] != 0 and d != Vector3i.ZERO:
+			Support.enqueue(q, -d)   # Java updateShape: a block with a support rule re-checks the side that changed
 		var fl := Res.blocks.st_flags[st]
 		if fl & BlockRegistry.F_LIQUID:
 			if fl & BlockRegistry.F_LAVA:
@@ -1332,6 +1340,7 @@ static func fluids_changed(world, p: Vector3i) -> void:
 			# Java FallingBlock.onPlace / updateShape: any change next to (or of) a gravity block schedules its fall check
 			# in 2 ticks - a falling block's removal reaches the one above, so columns and floating clumps come down
 			schedule(world, q, 2)
+	Support.flush(world)   # (no-op when nothing was queued or a flush is already running further up)
 	if not _sponge_q.is_empty() and not _sponging:
 		_sponging = true   # (absorbing changes neighbours of other sponges: queued, run here in order)
 		var si := 0

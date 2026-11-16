@@ -142,8 +142,8 @@ static func item_node(s: ItemStack, ctx: String, left: bool) -> Node3D:
 	var mat: Material = null
 	var off := Vector3.ZERO
 	var disp: Dictionary = {}
-	if pb > 0 and (Res.blocks.st_flags[pb] & (BlockRegistry.F_CUBE | BlockRegistry.F_MODEL)) and not Res.items.model_ref[s.item].begins_with("item/"):
-		mesh = EntityRenderer.block_item_mesh(pb)
+	if pb > 0 and not Res.items.model_ref[s.item].begins_with("item/"):
+		mesh = EntityRenderer.item_block_mesh(s.item)   # (null when neither the item nor the state has block geometry)
 		off = Vector3(0, -0.5, 0)
 		disp = ItemIcons.item_display(s.item, ctx.replace("lefthand", "righthand"))
 	if mesh == null:
@@ -154,11 +154,7 @@ static func item_node(s: ItemStack, ctx: String, left: bool) -> Node3D:
 		if em.size() != 2:
 			return null
 		mesh = em[0]
-		var sm := ShaderMaterial.new()
-		sm.shader = load("res://shaders/entity.gdshader")
-		sm.set_shader_parameter("tex", em[1])
-		sm.set_shader_parameter("has_tex", true)
-		mat = sm
+		mat = EntityRenderer.flat_item_material(em[1])   # (translucent sprites blend: stained glass panes)
 		disp = ItemIcons.model_display(ref, ctx.replace("lefthand", "righthand"))
 	var dt: Array = disp.get("translation", [0, 0, 0])
 	var dr: Array = disp.get("rotation", [0, 0, 0])

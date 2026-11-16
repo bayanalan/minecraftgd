@@ -308,6 +308,18 @@ func _dispatch(cmd: String, a: PackedStringArray, ctx: Ctx) -> int:
 				world.entities.spawn_xp(at, 1)
 				_say(ctx, "Summoned new Experience Orb")
 				return 1
+			elif id == "item_frame" or id == "glow_item_frame":
+				# Java: /summon item_frame <pos> {Facing:<0-5 down up north south west east>b,Item:{id:...},ItemRotation:<0-7>b}
+				var fnb := a[4] if a.size() >= 5 else ""
+				var fm := RegEx.create_from_string("Facing:\\s*(\\d)").search(fnb)
+				var fv := clampi(int(fm.get_string(1)), 0, 5) if fm != null else 3
+				var fn: Vector3i = [Vector3i(0, -1, 0), Vector3i(0, 1, 0), Vector3i(0, 0, -1), Vector3i(0, 0, 1), Vector3i(-1, 0, 0), Vector3i(1, 0, 0)][fv]
+				var fim := RegEx.create_from_string("Item:\\s*\\{[^}]*id:\\s*\"?(?:minecraft:)?([a-z0-9_]+)").search(fnb)
+				var fit := ItemStack.named(fim.get_string(1), 1) if fim != null and Res.items.id(fim.get_string(1)) > 0 else ItemStack.new()
+				var frm := RegEx.create_from_string("ItemRotation:\\s*(\\d)").search(fnb)
+				MiscEntities.spawn_frame(world.entities, id, Vector3i(at.floor()), fn, int(frm.get_string(1)) % 8 if frm != null else 0, fit)
+				_say(ctx, "Summoned new %s" % ("Glow Item Frame" if id == "glow_item_frame" else "Item Frame"))
+				return 1
 			elif id == "tnt":
 				MiscEntities.spawn_tnt(world.entities, at, 80)
 				_say(ctx, "Summoned new Primed TNT")

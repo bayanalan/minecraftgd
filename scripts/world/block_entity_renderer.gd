@@ -420,11 +420,14 @@ static func _portal_faces(model: Node3D, kind: String) -> void:
 	model.add_child(mi)
 
 
-## Java BookModel (entity/enchanting_table_book, 64 x 32) under EnchantTableRenderer's translate(0.5, 0.75, 0.5):
-## lids 6 x 10 px at z -1 / +1, seam, page blocks 5 x 8 x 1 and two flipping pages; the renderer adds a bob
+## Java BookModel (26.3 textures/entity/enchantment/enchanting_table_book.png, 64 x 32; older jars entity/
+## enchanting_table_book - the missing texture left the book a blank plate) under EnchantTableRenderer's translate(0.5,
+## 0.75, 0.5): lids 6 x 10 px at z -1 / +1, seam, page blocks 5 x 8 x 1 and two flipping pages; the renderer adds a bob
 ## 0.1 + sin(time * 0.1) * 0.01, turns the book by -rot about Y and tilts it 80 degrees about Z.
 static func _book_parts(inner: Node3D) -> Dictionary:
-	var tex := "entity/enchanting_table_book"
+	var tex := "entity/enchantment/enchanting_table_book"
+	if EntityRenderer.texture(tex) == null:
+		tex = "entity/enchanting_table_book"
 	var ts := Vector2(64, 32)
 	var yaw := Node3D.new()
 	yaw.position = Vector3(0, 0.85, 0)
@@ -998,7 +1001,7 @@ static func item_node(item: int, context: String, be: Dictionary = {}, using := 
 		return shield_node(context, using, be)
 	var pb: int = Res.items.place_block[item]
 	ensure_ids()
-	if pb <= 0 or not tracked(pb):
+	if pb <= 0 or not tracked(pb) or not special_item(item):
 		return null
 	var node := build(item_state(pb), be)
 	if node == null:
@@ -1009,6 +1012,34 @@ static func item_node(item: int, context: String, be: Dictionary = {}, using := 
 	holder.add_child(node)
 	holder.set_meta("special", true)
 	return holder
+
+
+## True when the item's 26.3 definition (items/<name>.json) draws a minecraft:special model (chests, shulker boxes,
+## heads, banners, decorated pots, conduits). Enchanting tables, shelves, bells, campfires and spawners are plain block /
+## item models: their block entity parts (book, shelf items, mob) are never part of the item (the enchanting table icon
+## was the floating book alone, shelves had an empty icon).
+static var _special_items: Dictionary = {}
+static func special_item(item: int) -> bool:
+	if _special_items.has(item):
+		return _special_items[item]
+	var j = Res.read_json("assets/minecraft/items/%s.json" % Res.items.names[item])
+	var r := _has_special(j.get("model") if j is Dictionary else null)
+	_special_items[item] = r
+	return r
+
+
+static func _has_special(m) -> bool:
+	if m is Dictionary:
+		if str(m.get("type", "")).trim_prefix("minecraft:") == "special":
+			return true
+		for v in m.values():
+			if (v is Dictionary or v is Array) and _has_special(v):
+				return true
+	elif m is Array:
+		for v2 in m:
+			if _has_special(v2):
+				return true
+	return false
 
 
 ## Java ShieldModel (plate 12x22x1, handle 2x6x6) under the item's special transformation scale(1,-1,-1);

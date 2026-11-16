@@ -129,6 +129,17 @@ func _input(event: InputEvent) -> void:
 
 
 func _done() -> void:
+	world.close_screen()   # (on_close saves the text)
+
+
+## Java AbstractSignEditScreen.onClose / removed: Done and Escape both close the screen and keep what was typed (the
+## sign update is sent when the screen goes) - unless the sign is gone meanwhile.
+func on_close() -> void:
+	if _saved:
+		return
+	_saved = true
+	if not Signs.is_sign(Res.blocks.name_of(maxi(world.state_at(pos.x, pos.y, pos.z), 0))):
+		return
 	var d := Signs.data(world, pos)
 	var lines: Array = []
 	for e in edits:
@@ -136,4 +147,6 @@ func _done() -> void:
 	d["front" if front else "back"] = lines
 	BlockEntities.set_data(world, pos, d)
 	Signs.mark_dirty()
-	world.close_screen()
+
+
+var _saved := false

@@ -146,6 +146,8 @@ func _ready() -> void:
 	Beacons.clear()
 	Signs.clear()
 	BERender.setup()
+	Redstone.reset()
+	Pistons.reset()
 	Maps.clear()
 	Crafting.load_all()
 	save = SaveManager.new()
@@ -509,8 +511,8 @@ func weather_at(p: Vector3) -> String:
 	var x := floori(p.x)
 	var z := floori(p.z)
 	var ch := cm.get_chunk(x >> 4, z >> 4)
-	if ch == null or ch.heightmap.is_empty() or floori(p.y) < ch.heightmap[(x & 15) + (z & 15) * 16]:
-		return "none"
+	if ch == null or ch.state < Chunk.DATA_READY or floori(p.y) < ch.motion_top(x & 15, z & 15):
+		return "none"   # (Java isRainingAt: MOTION_BLOCKING heightmap)
 	var bio := ch.biome_at(x & 15, floori(p.y), z & 15)
 	if bio < 0 or biomes.precipitation[bio] == 0:
 		return "none"
@@ -584,6 +586,7 @@ func set_block(x: int, y: int, z: int, st: int, notify := true) -> int:
 	if old >= 0 and old != st and st > 0 and Res.blocks.st_block[st] == BlockUpdates._fire_id() and (old == 0 or Res.blocks.st_block[old] != Res.blocks.st_block[st]):
 		BlockUpdates.fire_placed(self, Vector3i(x, y, z))   # FireBlock.onPlace: first tick in 30..39
 	if old >= 0 and old != st:
+		BlockEntities.ensure_campfire(self, Vector3i(x, y, z), st)
 		if weather_fx != null:
 			weather_fx.block_changed(x, z)
 		BERender.on_block_changed(Vector3i(x, y, z), old, st)
@@ -600,6 +603,9 @@ func set_block(x: int, y: int, z: int, st: int, notify := true) -> int:
 			var im := Interest.near(self, Vector3i(x, y, z), 2) | Interest.of(st) | Interest.of(old)
 			if im & Interest.OBSERVER:
 				Redstone.notify_observers(self, Vector3i(x, y, z))
+			if im & Interest.WIRE and not Interest.rs_inert_change(old, st):
+				# redstone dust shapes around the change (Java updateShape / updateIndirectNeighbourShapes)
+				RedstoneWire.update_around(self, Vector3i(x, y, z), RedstoneWire.is_wire(st) and not RedstoneWire.is_wire(old))
 			if im & (Interest.WIRE | Interest.CONSUMER) and not Interest.rs_inert_change(old, st):
 				# (a flowing-water step next to a wire network re-solved the whole network: 20 ms in an ancient city)
 				Redstone.request(self, Vector3i(x, y, z))
@@ -705,6 +711,7 @@ func _process(delta: float) -> void:
 	Signs.render(self)
 	var p1 := Time.get_ticks_usec()
 	BERender.update(self)
+	Pistons.render(self, alpha)   # (blocks moved by pistons, only while any move)
 	var p2 := Time.get_ticks_usec()
 	cm.update(player.pos, -camera.global_transform.basis.z)
 	var p3 := Time.get_ticks_usec()
@@ -4193,7 +4200,10 @@ func _tick() -> void:
 		use_cooldown -= 1
 	if auto_use > 0:
 		auto_use -= 1
-	UseItem.tick(self, player, (Input.is_action_pressed("use") and mouse_captured and screen == null) or auto_use > 0)
+	var use_held: bool = Input.is_action_pressed("use") and mouse_captured and screen == null
+	if use_held and use_cooldown == 0 and autoplay.is_empty() and not UseItem.is_using(player):
+		_use()   # Java handleKeybinds: keyUse held -> startUseItem again once rightClickDelay is back to 0 (every 4 ticks)
+	UseItem.tick(self, player, use_held or auto_use > 0)
 	# particles tick with the tick start: their render interpolation (prev -> cur by tick_accum) restarts on this frame,
 	# so a tick on a later frame showed them one step back for a frame (falling particles jittered back and forth)
 	var q_ui := Time.get_ticks_usec()
@@ -4278,6 +4288,7 @@ func _tick_step() -> void:
 			if not net_client:
 				var r0 := Time.get_ticks_usec()
 				Redstone.flush(self)
+				Pistons.tick(self)   # block events (pistons), then the moving blocks' block-entity step
 				var r0a := Time.get_ticks_usec()
 				Sensors.tick(self)
 				var r0b := Time.get_ticks_usec()
@@ -4809,6 +4820,24 @@ func _gather_input() -> void:
 		player.in_sprint = Input.is_action_pressed("sprint") or player.sprinting and player.in_forward > 0.0
 
 
+## Java Screen.keyPressed: Escape closes the screen before the focused widget sees it - a focused LineEdit / TextEdit
+## (sign lines, anvil name, book page, command block) took the first Escape to leave its own editing mode, so closing
+## needed a second press. (Screens with their own Escape handling - chat suggestions - mark it handled first.)
+func _input(event: InputEvent) -> void:
+	if screen == null or closing or not autoplay.is_empty():
+		return
+	if not (event is InputEventKey and event.pressed and not event.is_echo() and event.is_action_pressed("pause")):
+		return
+	var fo := get_viewport().gui_get_focus_owner()
+	if not (fo is LineEdit or fo is TextEdit):
+		return
+	if screen.has_method("on_escape"):
+		screen.on_escape()
+	else:
+		close_screen()
+	get_viewport().set_input_as_handled()
+
+
 func _unhandled_input(event: InputEvent) -> void:
 	if closing or not autoplay.is_empty():  # autoplay probes ignore stray OS/user input
 		return
@@ -4926,7 +4955,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event.is_action_pressed("pick_block"):
 		_pick_block()
 	if event.is_action_pressed("use"):
-		_use()
+		_use(true)
 	if event.is_action_pressed("attack"):
 		_attack()
 	if event.is_action_pressed("move_forward") and Settings.get_v("double_tap_sprint"):
@@ -4997,6 +5026,8 @@ func _exit_tree() -> void:
 
 
 func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_FOCUS_IN and screen == null and mouse_captured and DisplayServer.get_name() != "headless":
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED   # (Windows drops the capture while another window is active)
 	if what == NOTIFICATION_APPLICATION_FOCUS_OUT and autoplay.is_empty() and Settings.get_v("pause_on_lost_focus") and screen == null and not closing and cm != null and DisplayServer.get_name() != "headless":
 		open_screen(load("res://scripts/ui/pause_menu.gd").new())
 
@@ -5224,6 +5255,13 @@ func _break_block(p: Vector3i, survival: bool) -> void:
 	if blocks.st_flags[st] & BlockRegistry.F_WATERLOGGED:
 		replacement = blocks.WATER
 	var be_data: Dictionary = BlockEntities.get_data(self, p).duplicate(true)
+	if not survival:
+		Support.creative_break_partner(self, p, st)   # (creative: the other door / plant / bed half drops nothing)
+	# drops rolled while the block is still there (DoublePlantBlock.playerWillDestroy: tall grass / fern loot checks
+	# its other half); the other half then goes through Support (Java updateShape -> destroyBlock)
+	var drops: Array = []
+	if survival and gamerule("doTileDrops", true):
+		drops = Loot.block_drops(st, player.inventory.held(), self, p, be_data)
 	set_block(p.x, p.y, p.z, replacement)
 	Interaction.on_block_broken(self, p, st)
 	# Java ShulkerBoxBlock.playerWillDestroy: creative players still get a non-empty box with its contents
@@ -5237,17 +5275,17 @@ func _break_block(p: Vector3i, survival: bool) -> void:
 	entities.spawn_block_particles(p, st)
 	if survival:
 		player.exhaustion += 0.005
-		var held := player.inventory.held()
-		if gamerule("doTileDrops", true):
-			for s in Loot.block_drops(st, held, self, p, be_data):
-				entities.spawn_item(Vector3(p) + Vector3(0.5, 0.25, 0.5), s)
+		for s in drops:
+			entities.spawn_item(Vector3(p) + Vector3(0.5, 0.25, 0.5), s)
 		Interaction.damage_tool(player, 1)
 		player.stats["mined." + nm] = int(player.stats.get("mined." + nm, 0)) + 1
 
 
 ## Java Minecraft.startUseItem: entity, block, item - main hand first, offhand when the main hand does nothing.
-func _use() -> void:
-	if player.is_spectator() or use_cooldown > 0 or UseItem.is_using(player):
+## pressed: a fresh click (Java handleKeybinds: every keyUse click runs startUseItem whatever rightClickDelay is - doors,
+## trapdoors, levers can be clicked as fast as the player clicks); held repeats wait for rightClickDelay (4 ticks).
+func _use(pressed := false) -> void:
+	if player.is_spectator() or (use_cooldown > 0 and not pressed) or UseItem.is_using(player):
 		return
 	cm.mark_urgent(int(floor(player.pos.x)), int(floor(player.pos.z)))
 	use_cooldown = 4
@@ -5583,6 +5621,7 @@ var _autosave_q: Array = []
 func _begin_autosave() -> void:
 	if save == null or cm == null:
 		return
+	Pistons.finish_all(self)   # (blocks mid-move are saved where they arrive)
 	if Net.is_client():
 		Net.client_save()
 		return
@@ -5616,6 +5655,8 @@ func _finish_autosave_bg() -> void:
 func save_all() -> void:
 	if save == null or cm == null:
 		return
+	if not Net.is_client():
+		Pistons.finish_all(self)   # (blocks mid-move are saved where they arrive)
 	cm.flush_saves()
 	_autosave_q.clear()
 	if Net.is_client():

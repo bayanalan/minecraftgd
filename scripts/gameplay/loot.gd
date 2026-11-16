@@ -24,10 +24,19 @@ static func block_drops(st: int, tool: ItemStack, world, pos: Vector3i, be: Dict
 	var info: Dictionary = blocks.block_info[blocks.st_block[st]]
 	if be.is_empty() and world != null and world.get("cm") != null:
 		be = BlockEntities.get_data(world, pos)
-	var ctx := {"tool": tool, "state": st, "rng": world.rng if world != null else RandomNumberGenerator.new(), "explosion": false, "pos": pos, "block_entity": be}
-	if bool(info["requires_tool"]) and not Interaction.correct_tool(tool, st):
+	# tool == null: no player (Java Block.dropResources(state, level, pos, be) - fluids, pistons, lost support): no
+	# THIS_ENTITY in the context (snow / chorus flower tables need one: wiki Snow - "breaks and drops nothing" when water
+	# flows in or its support goes), and requiresCorrectToolForDrops is a player-mining rule only
+	# (ServerPlayerGameMode.destroyBlock -> hasCorrectToolForDrops): a lantern whose block is mined still drops.
+	var ctx := {"tool": tool, "state": st, "rng": world.rng if world != null else RandomNumberGenerator.new(), "explosion": false, "pos": pos, "block_entity": be,
+		"world": world, "no_entity": tool == null}
+	if tool != null and bool(info["requires_tool"]) and not Interaction.correct_tool(tool, st):
 		return []
 	var t = table("blocks/" + name)
+	if t == null and (name.begins_with("wall_") or name.contains("_wall_")):
+		# Java Properties.dropsLike: wall torches / signs / hanging signs / banners / heads / coral fans have no table
+		# of their own in 26.3 and drop like their standing form
+		t = table("blocks/" + (name.trim_prefix("wall_") if name.begins_with("wall_") else name.replace("_wall_", "_")))
 	if t is Dictionary:
 		return roll_table(t, ctx)
 	if Res.mode == "vanilla":
@@ -307,6 +316,41 @@ static func _entity_pred(pred, ctx: Dictionary, who: String) -> bool:
 	return true
 
 
+## BlockPredicate / match_block: "blocks" (id, list or #tag) and "state" (value or {min, max}) of the state st.
+static func _block_pred(pred: Dictionary, st: int) -> bool:
+	if st <= 0:
+		return not pred.has("blocks") and not pred.has("state")
+	var b := Res.blocks
+	var nm := b.name_of(st)
+	var bl = pred.get("blocks")
+	if bl != null:
+		var ok := false
+		var ids: Array = bl if bl is Array else [bl]
+		for x in ids:
+			var s := str(x)
+			if s.begins_with("#"):
+				ok = ok or Tags.has_block(s.substr(1).trim_prefix("minecraft:"), nm)
+			else:
+				ok = ok or s.trim_prefix("minecraft:") == nm
+		if not ok:
+			return false
+	var sp = pred.get("state")
+	if sp is Dictionary:
+		for k in sp:
+			var want = sp[k]
+			var have := b.get_prop(st, str(k))
+			if want is Dictionary:
+				if not have.is_valid_int():
+					return false
+				if (want as Dictionary).has("min") and int(have) < int(want["min"]):
+					return false
+				if (want as Dictionary).has("max") and int(have) > int(want["max"]):
+					return false
+			elif (str(int(want)) if (want is float or want is int) else str(want)) != have:
+				return false
+	return true
+
+
 static func _conds(conds: Array, ctx: Dictionary) -> bool:
 	for c in conds:
 		if not _cond(c, ctx):
@@ -398,11 +442,27 @@ static func _cond(c, ctx: Dictionary) -> bool:
 			var lvl3 := _ench(ctx.get("tool"), "looting")
 			return rng.randf() < float(c.get("chance", 0.0)) + lvl3 * float(c.get("looting_multiplier", 0.0))
 		"entity_properties":
+			# EntityPredicate.matches: a predicate (even {}) fails without the entity (block drops with no player)
+			if bool(ctx.get("no_entity", false)) and str(c.get("entity", "this")) == "this" and c.get("predicate") != null:
+				return false
 			return _entity_pred(c.get("predicate", {}), ctx, str(c.get("entity", "this")))
 		"damage_source_properties":
 			return false
-		"location_check", "weather_check", "time_check":
+		"location_check":
+			# LocationPredicate block part (tall grass / large fern: the other half must still be there), checked when
+			# the context has a world; the other location parts are not modelled
+			var lw = ctx.get("world")
+			var lpr = c.get("predicate", {})
+			if lw != null and lpr is Dictionary and (lpr as Dictionary).get("block") is Dictionary and ctx.has("pos"):
+				var lq: Vector3i = (ctx["pos"] as Vector3i) + Vector3i(int(c.get("offsetX", 0)), int(c.get("offsetY", 0)), int(c.get("offsetZ", 0)))
+				return _block_pred((lpr as Dictionary)["block"], int(lw.state_at(lq.x, lq.y, lq.z)))
 			return true
+		"weather_check", "time_check":
+			return true
+		"match_block":
+			# 26.x LootItemBlockStatePropertyCondition ("blocks" + "state"): door / bed / tall plant halves, crop ages,
+			# snow layers, slab types (it fell through to true: both door halves rolled a door)
+			return _block_pred(c, int(ctx.get("state", 0)))
 	return true
 
 

@@ -358,6 +358,19 @@ func _tint_at(st: int, p: Vector3i) -> Color:
 	return tints[i] if i < tints.size() else ItemIcons.block_tint(st)
 
 
+## Java CampfireBlockEntity.particleTick (every tick, lit campfires): 11 % chance of 2-3 smoke particles
+## (CampfireBlock.makeParticles: x / z 0.5 +- r / 3, y + r + r, speed (0, 0.07, 0); signal fires use the signal smoke).
+static func campfire_tick(p: Vector3i, signal_fire: bool) -> void:
+	if instance == null or str(Settings.get_v("particles")) == "minimal":
+		return
+	var r: RandomNumberGenerator = instance.rng
+	if r.randf() >= 0.11:
+		return
+	for i in r.randi_range(0, 1) + 2:
+		var at := Vector3(p.x + 0.5 + r.randf() / 3.0 * (1.0 if r.randi() & 1 else -1.0), p.y + r.randf() + r.randf(), p.z + 0.5 + r.randf() / 3.0 * (1.0 if r.randi() & 1 else -1.0))
+		instance._add("campfire_signal_smoke" if signal_fire else "campfire_smoke", at, Vector3(0, 0.07, 0), Color.WHITE)
+
+
 ## Spawn one particle. kind decides physics/sprites; color tints (white default).
 static func emit(kind: String, pos: Vector3, vel: Vector3 = Vector3.ZERO, color: Color = Color.WHITE, n: int = 1) -> void:
 	if instance == null or Settings.get_v("particles") == "minimal" and kind != "explosion":
@@ -398,11 +411,17 @@ func _add(kind: String, pos: Vector3, vel: Vector3, color: Color) -> void:
 			vel += Vector3(rng.randf_range(-1.0, 1.0), rng.randf_range(-1.0, 1.0), rng.randf_range(-1.0, 1.0)) * 0.05
 			grav = -0.004
 			fric = 0.9
-		"campfire_smoke":
-			life = rng.randi_range(80, 140)
-			size = 0.3 * (rng.randf() * 0.5 + 0.5)
-			vel = Vector3(rng.randf_range(-0.005, 0.005), 0.07, rng.randf_range(-0.005, 0.005))
-			fric = 0.99
+		"campfire_smoke", "campfire_signal_smoke":
+			# Java CampfireSmokeParticle: quad size x 3 (0.1 x (0.5 + 0.5 r) x 2 x 3), lifetime 80 + r(50) (signal fire
+			# 280 + r(50)), gravity 3e-6, no friction, y speed + r / 500, one random sprite of the set, white
+			life = (280 if kind == "campfire_signal_smoke" else 80) + rng.randi_range(0, 49)
+			size = 0.6 * (rng.randf() * 0.5 + 0.5)
+			vel += Vector3(0, rng.randf() / 500.0, 0)
+			grav = 3.0e-6
+			fric = 1.0
+			color = Color.WHITE
+			parts.append([kind, pos, pos, vel, 0, life, size, color, "big_smoke_%d" % rng.randi_range(0, 11), grav, fric, false, null])
+			return
 		"explosion":
 			life = 6 + rng.randi_range(0, 4)
 			size = 2.0 * (1.0 - rng.randf() * 0.5)
@@ -562,8 +581,8 @@ func _sprite(kind: String, age: int, life: int) -> String:
 			return "generic_%d" % (7 - int(t * 8.0))
 		"poof":
 			return "generic_%d" % mini(7, int(t * 8.0))
-		"campfire_smoke":
-			return "big_smoke_%d" % int(t * 12.0)
+		"campfire_smoke", "campfire_signal_smoke":
+			return ""   # (fixed random sprite, set at the spawn)
 		"explosion":
 			return "explosion_%d" % int(t * 16.0)
 		"sweep_attack":
@@ -729,7 +748,19 @@ func tick() -> void:
 		p[1] = np
 		p[3] = v * float(p[10])
 		if lf == null:
-			p[8] = _sprite(p[0], p[4], p[5])
+			var kname: String = p[0]
+			if kname.begins_with("campfire_"):
+				# Java CampfireSmokeParticle.tick: sideways jitter +-r / 5000 per tick, alpha -0.015 per tick in the last 60
+				var cv: Vector3 = p[3]
+				cv.x += rng.randf() / 5000.0 * (1.0 if rng.randi() & 1 else -1.0)
+				cv.z += rng.randf() / 5000.0 * (1.0 if rng.randi() & 1 else -1.0)
+				p[3] = cv
+				if int(p[4]) >= int(p[5]) - 60:
+					var cc: Color = p[7]
+					cc.a = maxf(0.0, cc.a - 0.015)
+					p[7] = cc
+			else:
+				p[8] = _sprite(p[0], p[4], p[5])
 		keep.append(p)
 	parts = keep
 	for sa in spawn_after:
@@ -912,7 +943,7 @@ func _rain_finish() -> void:
 	if play:
 		_rain_sound_time = 0
 		var cch: Chunk = world.cm.get_chunk(cb.x >> 4, cb.z >> 4)
-		var roof := cch != null and not cch.heightmap.is_empty() and int(cch.heightmap[(cb.x & 15) + (cb.z & 15) * 16]) > cb.y
+		var roof := cch != null and cch.motion_top(cb.x & 15, cb.z & 15) > cb.y
 		if last.y > cb.y + 1 and roof:
 			Audio.play("weather.rain.above", Vector3(last) + Vector3(0.5, 0.5, 0.5), "Weather", 0.1, 0.5)
 		else:
@@ -991,9 +1022,11 @@ func _anim_emit(b: BlockRegistry, x: int, y: int, z: int, st: int) -> void:
 		var off: Vector3 = {"north": Vector3(0, 0, 0.27), "south": Vector3(0, 0, -0.27), "west": Vector3(0.27, 0, 0), "east": Vector3(-0.27, 0, 0)}.get(f, Vector3.ZERO)
 		_add("smoke", q + Vector3(0, 0.92, 0) + off, Vector3.ZERO, Color.WHITE)
 		_add("flame" if nm == "wall_torch" else "soul_fire_flame", q + Vector3(0, 0.92, 0) + off, Vector3.ZERO, Color.WHITE)
-	elif nm.ends_with("campfire") and b.get_prop(st, "lit") == "true":
-		if rng.randf() < 0.4:
-			_add("campfire_smoke", q + Vector3(rng.randf_range(-0.3, 0.3), 0.5, rng.randf_range(-0.3, 0.3)), Vector3.ZERO, Color(0.85, 0.85, 0.85, 0.9))
+	elif nm == "campfire" and b.get_prop(st, "lit") == "true":
+		# Java CampfireBlock.animateTick (spawnParticles: the normal campfire only): 1 in 5 a lava particle (the smoke
+		# comes from the block entity every tick: Particles.campfire_tick)
+		if rng.randi_range(0, 4) == 0:
+			_add("lava", q + Vector3(0, 0.5, 0), Vector3(rng.randf() / 2.0, 5.0e-5, rng.randf() / 2.0), Color.WHITE)
 	elif nm in ["furnace", "smoker", "blast_furnace"] and b.get_prop(st, "lit") == "true":
 		if rng.randf() < 0.1:
 			var fd := str(b.get_prop(st, "facing"))
@@ -1124,7 +1157,7 @@ func _build() -> void:
 			curve = 3.0
 		elif kind == "flame" or kind == "soul_fire_flame":
 			curve = 2.0
-		elif kind == "explosion" or kind == "campfire_smoke":
+		elif kind == "explosion" or kind.begins_with("campfire_"):
 			curve = 0.0
 		var col: Color = p[7]
 		if not p[11]:

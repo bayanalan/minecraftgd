@@ -8,6 +8,40 @@ static var _tex_cache: Dictionary = {}
 static var _mat_cache: Dictionary = {}
 static var _part_mesh_cache: Dictionary = {}   # rig part geometry key -> ArrayMesh (shared)
 static var entity_shader: Shader
+static var _tl_shader: Shader
+static var _tl_tex: Dictionary = {}   # texture instance id -> sprite has translucent pixels
+
+
+## entity.gdshader with ENTITY_TRANSLUCENT defined (blended, back faces culled).
+static func translucent_shader() -> Shader:
+	if _tl_shader == null:
+		var base: Shader = load("res://shaders/entity.gdshader")
+		_tl_shader = Shader.new()
+		_tl_shader.code = base.code.replace("shader_type spatial;", "shader_type spatial;\n#define ENTITY_TRANSLUCENT")
+	return _tl_shader
+
+
+## Material of an extruded flat item (held, dropped, framed): Java draws flat items with the translucent item sheet, so a
+## sprite with translucent pixels (stained glass panes, bottles) blends; others keep the cutout entity shader (the
+## cutout one showed stained glass panes as opaque slabs of colour in the hand).
+static func flat_item_material(tex: Texture2D) -> ShaderMaterial:
+	var tl := false
+	if tex != null:
+		var k := tex.get_instance_id()
+		if _tl_tex.has(k):
+			tl = _tl_tex[k]
+		else:
+			var img := tex.get_image()
+			if img != null:
+				if img.is_compressed():
+					img.decompress()
+				tl = AtlasBuilder._classify(img) == 2
+			_tl_tex[k] = tl
+	var sm := ShaderMaterial.new()
+	sm.shader = translucent_shader() if tl else load("res://shaders/entity.gdshader")
+	sm.set_shader_parameter("tex", tex)
+	sm.set_shader_parameter("has_tex", true)
+	return sm
 
 
 static func texture(path: String) -> Texture2D:
@@ -355,6 +389,10 @@ static func block_item_mesh(state: int) -> ArrayMesh:
 			add_quad.call(pts2, quv2, q[o + 20], -1.0, ModelBaker.shade_of(q, o), q[o + 21] >= 0.0)
 	if verts.is_empty():
 		return null
+	return _item_arrays_mesh(verts, uvs, cols, cust, idx, (fl & BlockRegistry.F_TRANSLUCENT) != 0)
+
+
+static func _item_arrays_mesh(verts: PackedVector3Array, uvs: PackedVector2Array, cols: PackedColorArray, cust: PackedFloat32Array, idx: PackedInt32Array, translucent: bool) -> ArrayMesh:
 	var arr := []
 	arr.resize(Mesh.ARRAY_MAX)
 	arr[Mesh.ARRAY_VERTEX] = verts
@@ -364,5 +402,55 @@ static func block_item_mesh(state: int) -> ArrayMesh:
 	arr[Mesh.ARRAY_INDEX] = idx
 	var m := ArrayMesh.new()
 	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr, [], {}, Mesh.ARRAY_CUSTOM_RGBA_FLOAT << Mesh.ARRAY_FORMAT_CUSTOM0_SHIFT)
-	m.surface_set_material(0, Res.mat_item_block if Res.mat_item_block != null else Res.mat_cutout)
+	# Java item render types: translucent blocks (stained glass, ice, slime, honey) blend (translucent item sheet)
+	var mat: Material = Res.mat_item_block_translucent if translucent else Res.mat_item_block
+	m.surface_set_material(0, mat if mat != null else Res.mat_cutout)
 	return m
+
+
+## A block model (block/... id) as an entity mesh like block_item_mesh (x / z centred, y from 0): its baked quads with
+## the item tint on tinted faces. Cached per (model, tint, translucent); null when it has no elements.
+static var _model_mesh_cache: Dictionary = {}
+static func model_mesh(ref: String, tint: Color = Color.WHITE, translucent := false) -> ArrayMesh:
+	var key := "%s|%s|%s" % [ref, tint.to_html(), translucent]
+	if _model_mesh_cache.has(key):
+		return _model_mesh_cache[key]
+	var mesh: ArrayMesh = null
+	if Res.mode == "vanilla" and ref != "":
+		var bk: Dictionary = Res.baker.bake(ref)
+		var q: PackedFloat32Array = bk.get("quads", PackedFloat32Array())
+		if bk.get("ok", false) and q.size() >= ModelBaker.QUAD_FLOATS:
+			var verts := PackedVector3Array()
+			var uvs := PackedVector2Array()
+			var cols := PackedColorArray()
+			var cust := PackedFloat32Array()
+			var idx := PackedInt32Array()
+			for qi in q.size() / ModelBaker.QUAD_FLOATS:
+				var o := qi * ModelBaker.QUAD_FLOATS
+				var b := verts.size()
+				var tc: Color = tint if q[o + 21] >= 0.0 else Color(1, 1, 1)
+				var shade := ModelBaker.shade_of(q, o)
+				for k in 4:
+					verts.append(Vector3(q[o + k * 5], q[o + k * 5 + 1], q[o + k * 5 + 2]) - Vector3(0.5, 0.0, 0.5))
+					uvs.append(Vector2(q[o + k * 5 + 3], q[o + k * 5 + 4]))
+					cols.append(Color(tc.r, tc.g, tc.b, shade))
+					cust.append_array([q[o + 20], -1.0, 1.0, 0.0])
+				idx.append_array([b, b + 3, b + 2, b, b + 2, b + 1])
+			mesh = _item_arrays_mesh(verts, uvs, cols, cust, idx, translucent)
+	_model_mesh_cache[key] = mesh
+	return mesh
+
+
+## The mesh a block item is drawn with in hand / on the ground (block_item_mesh layout): Java renders the item's own
+## model (items/<name>.json), which for walls, fences, buttons and shelves is a separate *_inventory model - the placed
+## default state of a wall is a lone post. Other block items use their default state's mesh. Null when not a block item.
+static func item_block_mesh(item: int) -> ArrayMesh:
+	var pb: int = Res.items.place_block[item]
+	if pb <= 0:
+		return null
+	var ref: String = Res.items.model_ref[item]
+	if Res.mode == "vanilla" and ref.begins_with("block/") and ref != "block/" + Res.blocks.names[Res.blocks.st_block[pb]]:
+		var mm := model_mesh(ref, ItemIcons.block_tint(pb), (Res.blocks.st_flags[pb] & BlockRegistry.F_TRANSLUCENT) != 0)
+		if mm != null:
+			return mm
+	return block_item_mesh(pb)

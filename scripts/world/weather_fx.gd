@@ -220,7 +220,7 @@ func _compute(col: Col) -> bool:
 	var kind := 0
 	var lt := 0
 	if ch != null and not ch.heightmap.is_empty():
-		k1 = ch.heightmap[(col.x & 15) + (col.z & 15) * 16]
+		k1 = ch.motion_top(col.x & 15, col.z & 15)   # Java MOTION_BLOCKING (glass, fences, panes stop rain)
 		var yy := maxi(_cy, k1)
 		kind = _precip_at(col.x, yy, col.z)
 		if kind != 0:
