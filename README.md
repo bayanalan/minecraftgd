@@ -40,7 +40,7 @@ Recraft 2 is a work in progress. Open issues are tracked in [PROGRESS.md](PROGRE
 
 - Windows on ARM64 (native) or x86_64.
 - [Godot 4.7.2](https://godotengine.org/) (standard build) to run from source.
-- Optional: Minecraft: Java Edition **26.3** installed through the official launcher, for the vanilla assets and data.
+- Minecraft: Java Edition **26.3** installed through the official launcher, for the vanilla assets and data.
 
 ## Running
 
